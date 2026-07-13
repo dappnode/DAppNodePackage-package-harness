@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "runId": "pr-123-abcdef0-example-package",
+  "source": {
+    "repository": "dappnode/example-package",
+    "pullRequest": 123,
+    "headSha": "abcdef0123456789abcdef0123456789abcdef01"
+  },
+  "package": {
+    "dnpName": "example.dnp.dappnode.eth",
+    "candidateRef": "/ipfs/QmOrBafyCandidateReference",
+    "baselineRef": null
+  }
+}

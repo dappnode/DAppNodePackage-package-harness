@@ -1,0 +1,93 @@
+version: "2"
+fields:
+  - id: harness-api-token
+    target:
+      type: environment
+      name: HARNESS_API_TOKEN
+      service: package-harness
+    title: Harness API bearer token
+    description: >-
+      A long random token required by POST /v1/runs and GET /v1/runs/:runId.
+      Configure the same token in the submitting GitHub App.
+    secret: true
+    required: true
+
+  - id: dappmanager-mcp-url
+    target:
+      type: environment
+      name: DAPPMANAGER_MCP_URL
+      service: package-harness
+    title: Dappmanager MCP URL
+    description: >-
+      The stateless Streamable HTTP MCP endpoint of this dedicated test Dappnode.
+    required: true
+
+  - id: dappmanager-mcp-token
+    target:
+      type: environment
+      name: DAPPMANAGER_MCP_TOKEN
+      service: package-harness
+    title: Dappmanager MCP bearer token
+    description: >-
+      Bearer token authorized to use the required external read and mutation tools.
+    secret: true
+    required: true
+
+  - id: callback-url
+    target:
+      type: environment
+      name: RESULT_CALLBACK_URL
+      service: package-harness
+    title: Result callback URL
+    description: >-
+      Fixed HTTPS callback owned by the GitHub App. Jobs cannot override this URL.
+    pattern: "^https://.+$"
+    patternErrorMessage: Must be an HTTPS URL
+    required: true
+
+  - id: callback-hmac-secret
+    target:
+      type: environment
+      name: RESULT_CALLBACK_HMAC_SECRET
+      service: package-harness
+    title: Result callback HMAC secret
+    description: >-
+      Secret used to sign the exact callback JSON body with HMAC-SHA256.
+    secret: true
+    required: true
+
+  - id: nexus-api-key
+    target:
+      type: environment
+      name: NEXUS_API_KEY
+      service: package-harness
+    title: Nexus API key (optional)
+    description: >-
+      Enables one bounded advisory baseline-versus-candidate log analysis request.
+      Deterministic container results never depend on Nexus.
+    secret: true
+    required: false
+
+  - id: nexus-model
+    target:
+      type: environment
+      name: NEXUS_MODEL
+      service: package-harness
+    title: Nexus model
+    description: >-
+      Optional Nexus model identifier. The default is nexus/auto.
+    required: false
+
+  - id: destructive-acknowledgement
+    target:
+      type: environment
+      name: ALLOW_DESTRUCTIVE_PACKAGE_TESTS
+      service: package-harness
+    title: Enable destructive package tests
+    description: >-
+      Select true only on a dedicated disposable Dappnode. Runs remove the target
+      package and its volumes before and after testing.
+    enum:
+      - "true"
+    required: true
+

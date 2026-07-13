@@ -1,0 +1,49 @@
+{
+  "architectures": [
+    "linux/amd64",
+    "linux/arm64"
+  ],
+  "author": "DAppNode Association <admin@dappnode.io>",
+  "bugs": {
+    "url": "https://github.com/dappnode/DAppNodePackage-package-harness/issues"
+  },
+  "categories": [
+    "Developer tools"
+  ],
+  "description": "Runs deterministic baseline-to-candidate upgrade tests for Dappnode packages on a dedicated disposable Dappnode. It checks stable container-running state, records bounded evidence, performs advisory log analysis, cleans up the target package, and reports a signed result to a configured callback.",
+  "exposable": [
+    {
+      "description": "Authenticated package test submission and result API",
+      "name": "Package Harness API",
+      "port": 8080,
+      "serviceName": "package-harness"
+    }
+  ],
+  "keywords": [
+    "testing",
+    "packages",
+    "ci",
+    "upgrade",
+    "developer"
+  ],
+  "license": "GPL-3.0",
+  "links": {
+    "homepage": "https://github.com/dappnode/DAppNodePackage-package-harness"
+  },
+  "name": "package-harness.dnp.dappnode.eth",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dappnode/DAppNodePackage-package-harness"
+  },
+  "requirements": {
+    "minimumDappnodeVersion": "0.2.50"
+  },
+  "shortDescription": "Disposable-node upgrade tests for Dappnode package builds",
+  "type": "service",
+  "version": "0.1.0",
+  "warnings": {
+    "onInstall": "This package performs destructive install, upgrade, removal, and volume-deletion operations. Use it only on a dedicated disposable test Dappnode and explicitly acknowledge destructive testing in the setup wizard.",
+    "onRemove": "Removing the harness deletes its persisted run history. It does not automatically remove dependencies left behind by earlier package tests."
+  }
+}
+

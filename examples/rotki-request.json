@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "runId": "rotki-pr-96-3alpha-skip-build",
+  "source": {
+    "repository": "dappnode/DAppNodePackage-rotki",
+    "pullRequest": 96,
+    "headSha": "4b51635707d5c17c0f75854dbab880e194cd82e2"
+  },
+  "package": {
+    "dnpName": "rotki.dnp.dappnode.eth",
+    "candidateRef": "/ipfs/QmdDj13s2Hb72wtBkAZXF5f88KnqV3ydF9US46SdamFn86",
+    "baselineRef": null
+  }
+}
+

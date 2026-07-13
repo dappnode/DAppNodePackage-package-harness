@@ -1,0 +1,38 @@
+version: "3.5"
+services:
+  package-harness:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: package-harness.dnp.dappnode.eth:0.1.0
+    restart: unless-stopped
+    environment:
+      PORT: "8080"
+      DATA_DIR: /data
+      HARNESS_DNP_NAME: package-harness.dnp.dappnode.eth
+      HARNESS_API_TOKEN: ""
+      PACKAGE_MANAGER_MODE: mcp
+      DAPPMANAGER_MCP_URL: ""
+      DAPPMANAGER_MCP_TOKEN: ""
+      ALLOW_DESTRUCTIVE_PACKAGE_TESTS: "false"
+      RESULT_CALLBACK_URL: ""
+      RESULT_CALLBACK_HMAC_SECRET: ""
+      NEXUS_API_KEY: ""
+      NEXUS_MODEL: nexus/auto
+      RUST_LOG: dappnode_package_harness=info,tower_http=info
+    expose:
+      - "8080"
+    volumes:
+      - data:/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+volumes:
+  data: {}
+

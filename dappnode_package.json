@@ -10,11 +10,11 @@
   "categories": [
     "Developer tools"
   ],
-  "description": "Runs deterministic baseline-to-candidate upgrade tests for Dappnode packages on a dedicated disposable Dappnode. It checks stable container-running state, records bounded evidence, performs advisory log analysis, cleans up the target package, and reports a signed result to a configured callback.",
+  "description": "Polls Tropibot for deterministic baseline-to-candidate Dappnode package tests on a dedicated disposable node. It captures bounded evidence, performs advisory log analysis, cleans up the target package, and reliably delivers the result back to Tropibot.",
   "exposable": [
     {
-      "description": "Authenticated package test submission and result API",
-      "name": "Package Harness API",
+      "description": "Local health and readiness endpoints for package supervision only; jobs are polled outbound from Tropibot.",
+      "name": "Package Harness supervision",
       "port": 8080,
       "serviceName": "package-harness"
     }
@@ -46,4 +46,3 @@
     "onRemove": "Removing the harness deletes its persisted run history. It does not automatically remove dependencies left behind by earlier package tests."
   }
 }
-

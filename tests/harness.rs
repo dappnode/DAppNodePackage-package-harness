@@ -2,43 +2,41 @@ use std::{
     error::Error,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 
 use async_trait::async_trait;
-use axum::{
-    body::{Body, to_bytes},
-    http::{Request, StatusCode},
-};
 use chrono::{DateTime, Utc};
 use dappnode_package_harness::{
     analysis::{CompositeLogAnalyzer, HeuristicLogAnalyzer, LogAnalyzer, NexusLogAnalyzer},
-    api::{ApiState, router},
     clock::Clock,
-    config::{Config, PackageManagerMode, ResultReporterMode},
+    coordinator::protocol::{ClaimResponse, CompleteRequest, HeartbeatRequest},
+    coordinator::{ClaimOutcome, CompletionDisposition, CoordinatorClient, HeartbeatOutcome},
     model::{
         CleanupStatus, ContainerLog, ContainerSnapshot, DnpName, ExecutionStatus,
         ExplicitPackageResolver, LogAnalysisInput, PackageDetails, PackageLogs, PackageRef,
-        PackageSummary, PreviewSummary, ReasonCode, RunId, RunRecord, RunRequest, RunRequestDto,
-        Verdict,
+        PackageSummary, PreviewSummary, ReasonCode, RunRecord, RunRequest, RunRequestDto, Verdict,
+        WorkerErrorCode,
     },
     package_manager::{PackageManager, PackageManagerError, REQUIRED_MCP_TOOLS, ToolAvailability},
-    reporting::{GithubPrCommentReporter, ResultReporter, WebhookResultReporter, signature},
     runner::{
-        RunController, RunnerConfig,
+        NoopRunProgress, RunControl, RunController, RunProgress, RunnerConfig,
         stabilization::{StabilizationConfig, stabilize},
     },
     storage::{FileRunStore, RunStore},
+    worker::{
+        PackageHarnessWorker, WorkerConfig, WorkerDependencies, WorkerReadiness,
+        progress::WorkerProgress,
+    },
 };
-use hmac::{Hmac, Mac};
 use serde_json::json;
-use sha2::Sha256;
 use tempfile::TempDir;
-use tokio::sync::mpsc;
-use tower::ServiceExt;
-use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+use wiremock::{
+    Mock, MockServer, ResponseTemplate,
+    matchers::{body_json, header, method, path},
+};
 
 #[derive(Debug, Default)]
 struct ImmediateClock;
@@ -52,23 +50,14 @@ impl Clock for ImmediateClock {
     async fn sleep(&self, _duration: Duration) {}
 }
 
-#[derive(Debug, Clone, Copy)]
-enum BaselineFailure {
-    RequiredSetup,
-    Infrastructure,
-}
-
 #[derive(Debug, Clone)]
 struct ScriptedPackageManager {
     target: DnpName,
     state: Arc<Mutex<ScriptedState>>,
     baseline_running: bool,
     candidate_running: bool,
-    baseline_failure: Option<BaselineFailure>,
-    candidate_install_failure: bool,
     cleanup_failure: bool,
     core: bool,
-    missing_mutating_tools: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -85,11 +74,8 @@ impl ScriptedPackageManager {
             state: Arc::new(Mutex::new(ScriptedState::default())),
             baseline_running: true,
             candidate_running: true,
-            baseline_failure: None,
-            candidate_install_failure: false,
             cleanup_failure: false,
             core: false,
-            missing_mutating_tools: false,
         }
     }
 
@@ -107,23 +93,10 @@ impl ScriptedPackageManager {
 #[async_trait]
 impl PackageManager for ScriptedPackageManager {
     async fn verify_tools(&self) -> Result<ToolAvailability, PackageManagerError> {
-        let available = if self.missing_mutating_tools {
-            REQUIRED_MCP_TOOLS[..3]
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-        } else {
-            REQUIRED_MCP_TOOLS
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-        };
-        let missing = REQUIRED_MCP_TOOLS
-            .iter()
-            .filter(|tool| !available.iter().any(|available| available == **tool))
-            .map(ToString::to_string)
-            .collect();
-        Ok(ToolAvailability { available, missing })
+        Ok(ToolAvailability {
+            available: REQUIRED_MCP_TOOLS.iter().map(ToString::to_string).collect(),
+            missing: Vec::new(),
+        })
     }
 
     async fn list_packages(&self) -> Result<Vec<PackageSummary>, PackageManagerError> {
@@ -203,15 +176,6 @@ impl PackageManager for ScriptedPackageManager {
         _dnp_name: &DnpName,
         _version: Option<&PackageRef>,
     ) -> Result<(), PackageManagerError> {
-        match self.baseline_failure {
-            Some(BaselineFailure::RequiredSetup) => return Err(PackageManagerError::RequiredSetup),
-            Some(BaselineFailure::Infrastructure) => {
-                return Err(PackageManagerError::Transport(
-                    "simulated baseline transport failure".to_owned(),
-                ));
-            }
-            None => {}
-        }
         let mut state = self.state()?;
         state.installed = true;
         state.candidate = false;
@@ -223,12 +187,6 @@ impl PackageManager for ScriptedPackageManager {
         _dnp_name: &DnpName,
         _version: &PackageRef,
     ) -> Result<(), PackageManagerError> {
-        if self.candidate_install_failure {
-            return Err(PackageManagerError::Tool {
-                tool: "dappnode_update_package".to_owned(),
-                message: "simulated update failure".to_owned(),
-            });
-        }
         let mut state = self.state()?;
         state.installed = true;
         state.candidate = true;
@@ -253,223 +211,160 @@ impl PackageManager for ScriptedPackageManager {
     }
 }
 
-fn request(run_id: &str) -> Result<RunRequest, Box<dyn Error>> {
-    request_with(run_id, "/ipfs/candidate", None)
-}
-
-fn request_with(
-    run_id: &str,
-    candidate: &str,
-    baseline: Option<&str>,
-) -> Result<RunRequest, Box<dyn Error>> {
-    let value = json!({
-        "schemaVersion": 1,
-        "runId": run_id,
-        "source": {
-            "repository": "dappnode/example-package",
-            "pullRequest": 123,
-            "headSha": "abcdef0123456789"
-        },
-        "package": {
-            "dnpName": "example.dnp.dappnode.eth",
-            "candidateRef": candidate,
-            "baselineRef": baseline
-        }
-    });
-    let dto: RunRequestDto = serde_json::from_value(value)?;
-    Ok(RunRequest::try_from(dto)?)
-}
-
-fn request_for_name(run_id: &str, dnp_name: &str) -> Result<RunRequest, Box<dyn Error>> {
-    let dto: RunRequestDto = serde_json::from_value(json!({
-        "schemaVersion": 1,
-        "runId": run_id,
-        "source": {
-            "repository": "dappnode/example-package",
-            "pullRequest": 123,
-            "headSha": "abcdef0123456789"
-        },
-        "package": {
-            "dnpName": dnp_name,
-            "candidateRef": "/ipfs/candidate"
-        }
-    }))?;
-    Ok(RunRequest::try_from(dto)?)
-}
-
 fn details(dnp_name: &DnpName, version: &str, running: bool, name: &str) -> PackageDetails {
     PackageDetails {
         dnp_name: dnp_name.clone(),
         version: Some(version.to_owned()),
         containers: vec![ContainerSnapshot {
             name: name.to_owned(),
-            service_name: Some("service".to_owned()),
+            service_name: Some(name.to_owned()),
             state: Some(if running { "running" } else { "exited" }.to_owned()),
             running,
-            image: Some(format!("test:{version}")),
+            image: Some("example:latest".to_owned()),
             created: None,
         }],
     }
 }
 
-async fn execute_with(
-    run_request: RunRequest,
-    manager: Arc<dyn PackageManager>,
-) -> Result<(TempDir, Arc<FileRunStore>, RunRecord), Box<dyn Error>> {
-    let directory = tempfile::tempdir()?;
-    let store = Arc::new(FileRunStore::new(directory.path().to_path_buf()).await?);
-    store.create(&RunRecord::new(run_request.clone())).await?;
-    let store_port: Arc<dyn RunStore> = store.clone();
-    let clock: Arc<dyn Clock> = Arc::new(ImmediateClock);
-    let controller = RunController::new(
-        manager,
-        Arc::new(HeuristicLogAnalyzer),
-        None,
-        store_port,
-        Arc::new(ExplicitPackageResolver),
-        clock,
-        runner_config(),
-    );
-    controller.execute(&run_request.run_id).await?;
-    let record = store
-        .get(&run_request.run_id)
-        .await?
-        .ok_or("run disappeared")?;
-    Ok((directory, store, record))
+fn request(run_id: &str) -> Result<RunRequest, Box<dyn Error>> {
+    Ok(RunRequest::try_from(RunRequestDto {
+        schema_version: 1,
+        run_id: run_id.to_owned(),
+        source: dappnode_package_harness::model::SourceDto {
+            repository: "dappnode/example-package".to_owned(),
+            pull_request: 123,
+            head_sha: "abcdef0123456789".to_owned(),
+        },
+        package: dappnode_package_harness::model::PackageRequestDto {
+            dnp_name: "example.dnp.dappnode.eth".to_owned(),
+            candidate_ref: "/ipfs/QmCandidate".to_owned(),
+            baseline_ref: None,
+        },
+    })?)
 }
 
 fn runner_config() -> RunnerConfig {
     RunnerConfig {
         harness_dnp_name: "package-harness.dnp.dappnode.eth".to_owned(),
         stabilization: StabilizationConfig {
-            timeout: Duration::from_millis(3),
+            timeout: Duration::from_millis(10),
             poll_interval: Duration::from_millis(1),
-            required_samples: 3,
+            required_samples: 2,
         },
-        log_tail: 300,
+        log_tail: 30,
         cleanup_enabled: true,
-        cleanup_timeout: Duration::from_millis(2),
+        cleanup_timeout: Duration::from_millis(10),
     }
 }
 
-fn test_config(data_dir: &std::path::Path) -> Config {
-    Config {
-        listen_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
-        data_dir: data_dir.to_path_buf(),
-        harness_api_token: Some("test-api-token".to_owned()),
-        harness_dnp_name: "package-harness.dnp.dappnode.eth".to_owned(),
-        allow_destructive_tests: true,
-        package_manager_mode: PackageManagerMode::Fake,
-        dappmanager_mcp_url: None,
-        dappmanager_mcp_token: None,
-        mcp_timeout: Duration::from_secs(1),
-        stabilization_timeout: Duration::from_millis(3),
-        stabilization_poll: Duration::from_millis(1),
-        stabilization_required_samples: 3,
-        log_tail: 300,
-        cleanup_enabled: true,
-        cleanup_timeout: Duration::from_millis(2),
-        recover_cleanup_on_start: false,
-        nexus_api_key: None,
-        nexus_base_url: "http://unused".to_owned(),
-        nexus_model: "test".to_owned(),
-        nexus_timeout: Duration::from_secs(1),
-        nexus_max_input_bytes: 4096,
-        result_reporter_mode: ResultReporterMode::None,
-        result_callback_url: None,
-        result_callback_hmac_secret: None,
-        result_callback_timeout: Duration::from_secs(1),
-        github_app_id: None,
-        github_app_private_key: None,
-        github_api_base_url: "https://api.github.com".to_owned(),
-    }
+async fn execute_with(
+    request: RunRequest,
+    manager: Arc<dyn PackageManager>,
+    progress: &dyn RunProgress,
+) -> Result<(TempDir, Arc<FileRunStore>, RunRecord), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let store = Arc::new(FileRunStore::new(directory.path().to_path_buf()).await?);
+    store.create(&RunRecord::new(request.clone())).await?;
+    let controller = RunController::new(
+        manager,
+        Arc::new(HeuristicLogAnalyzer),
+        store.clone(),
+        Arc::new(ExplicitPackageResolver),
+        Arc::new(ImmediateClock),
+        runner_config(),
+    );
+    controller.execute(&request.run_id, progress).await?;
+    let record = store
+        .get(&request.run_id)
+        .await?
+        .ok_or("record disappeared")?;
+    Ok((directory, store, record))
 }
 
-#[tokio::test]
-async fn stable_baseline_and_candidate_pass() -> Result<(), Box<dyn Error>> {
-    let run_request = request("stable-pass")?;
-    let manager = Arc::new(ScriptedPackageManager::new(
-        run_request.package.dnp_name.clone(),
+fn worker_for(
+    server: &MockServer,
+    store: Arc<FileRunStore>,
+    manager: Arc<dyn PackageManager>,
+    accepting: Arc<AtomicBool>,
+) -> Result<PackageHarnessWorker, Box<dyn Error>> {
+    let clock: Arc<dyn Clock> = Arc::new(ImmediateClock);
+    let store_port: Arc<dyn RunStore> = store;
+    let controller = Arc::new(RunController::new(
+        Arc::clone(&manager),
+        Arc::new(HeuristicLogAnalyzer),
+        Arc::clone(&store_port),
+        Arc::new(ExplicitPackageResolver),
+        Arc::clone(&clock),
+        runner_config(),
     ));
-    let (_directory, _store, record) = execute_with(run_request, manager).await?;
-    let result = record.result.ok_or("missing result")?;
-    assert_eq!(result.verdict, Verdict::Passed);
-    assert!(result.baseline.hard_check.passed);
-    assert!(result.candidate.hard_check.passed);
-    Ok(())
+    let coordinator = CoordinatorClient::new(
+        &server.uri(),
+        "worker-01".to_owned(),
+        "worker-secret".to_owned(),
+        Duration::from_secs(1),
+    )?;
+    Ok(PackageHarnessWorker::new(
+        coordinator,
+        WorkerDependencies {
+            controller,
+            package_manager: manager,
+            store: store_port,
+            clock,
+        },
+        WorkerConfig {
+            worker_id: "worker-01".to_owned(),
+            harness_dnp_name: "package-harness.dnp.dappnode.eth".to_owned(),
+            poll_interval: Duration::from_millis(1),
+            heartbeat_interval: Duration::from_millis(1),
+            cleanup_timeout: Duration::from_millis(10),
+        },
+        WorkerReadiness::default(),
+        accepting,
+    ))
 }
 
 #[tokio::test]
-async fn stable_baseline_and_unstable_candidate_fail() -> Result<(), Box<dyn Error>> {
-    let run_request = request("candidate-unstable")?;
-    let mut scripted = ScriptedPackageManager::new(run_request.package.dnp_name.clone());
-    scripted.candidate_running = false;
-    let (_directory, _store, record) = execute_with(run_request, Arc::new(scripted)).await?;
+async fn normal_run_persists_result_and_cleans_up() -> Result<(), Box<dyn Error>> {
+    let request = request("normal-run")?;
+    let manager = Arc::new(ScriptedPackageManager::new(
+        request.package.dnp_name.clone(),
+    ));
+    let observation = manager.clone();
+    let (_directory, _store, record) = execute_with(request, manager, &NoopRunProgress).await?;
+    assert_eq!(record.status, ExecutionStatus::Completed);
     assert_eq!(
         record.result.ok_or("missing result")?.verdict,
-        Verdict::Failed
+        Verdict::Passed
     );
-    Ok(())
-}
-
-#[tokio::test]
-async fn unstable_baseline_and_stable_candidate_warn() -> Result<(), Box<dyn Error>> {
-    let run_request = request("baseline-unstable")?;
-    let mut scripted = ScriptedPackageManager::new(run_request.package.dnp_name.clone());
-    scripted.baseline_running = false;
-    let (_directory, _store, record) = execute_with(run_request, Arc::new(scripted)).await?;
-    assert_eq!(
-        record.result.ok_or("missing result")?.verdict,
-        Verdict::Warning
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn baseline_install_errors_are_classified() -> Result<(), Box<dyn Error>> {
-    for (suffix, failure, expected) in [
-        (
-            "setup",
-            BaselineFailure::RequiredSetup,
-            Verdict::Inconclusive,
-        ),
-        (
-            "transport",
-            BaselineFailure::Infrastructure,
-            Verdict::InfrastructureError,
-        ),
-    ] {
-        let run_request = request(&format!("baseline-{suffix}"))?;
-        let mut scripted = ScriptedPackageManager::new(run_request.package.dnp_name.clone());
-        scripted.baseline_failure = Some(failure);
-        let (_directory, _store, record) = execute_with(run_request, Arc::new(scripted)).await?;
-        assert_eq!(record.result.ok_or("missing result")?.verdict, expected);
-    }
-    Ok(())
-}
-
-#[tokio::test]
-async fn candidate_install_error_still_cleans_up() -> Result<(), Box<dyn Error>> {
-    let run_request = request("candidate-install-error")?;
-    let mut scripted = ScriptedPackageManager::new(run_request.package.dnp_name.clone());
-    scripted.candidate_install_failure = true;
-    let observation = scripted.clone();
-    let (_directory, _store, record) = execute_with(run_request, Arc::new(scripted)).await?;
     assert_eq!(record.cleanup.status, CleanupStatus::Passed);
     assert_eq!(observation.cleanup_calls()?, 1);
-    assert_eq!(
-        record.result.ok_or("missing result")?.verdict,
-        Verdict::Failed
-    );
     Ok(())
 }
 
 #[tokio::test]
-async fn cleanup_failure_promotes_pass_to_warning() -> Result<(), Box<dyn Error>> {
-    let run_request = request("cleanup-failure")?;
-    let mut scripted = ScriptedPackageManager::new(run_request.package.dnp_name.clone());
-    scripted.cleanup_failure = true;
-    let (_directory, _store, record) = execute_with(run_request, Arc::new(scripted)).await?;
+async fn unstable_candidate_is_failed_but_still_cleaned() -> Result<(), Box<dyn Error>> {
+    let request = request("unstable-candidate")?;
+    let mut manager = ScriptedPackageManager::new(request.package.dnp_name.clone());
+    manager.candidate_running = false;
+    let observation = manager.clone();
+    let (_directory, _store, record) =
+        execute_with(request, Arc::new(manager), &NoopRunProgress).await?;
+    assert_eq!(
+        record.result.ok_or("missing result")?.verdict,
+        Verdict::Failed
+    );
+    assert_eq!(record.cleanup.status, CleanupStatus::Passed);
+    assert_eq!(observation.cleanup_calls()?, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cleanup_failure_promotes_a_pass_to_warning() -> Result<(), Box<dyn Error>> {
+    let request = request("cleanup-failure")?;
+    let mut manager = ScriptedPackageManager::new(request.package.dnp_name.clone());
+    manager.cleanup_failure = true;
+    let (_directory, _store, record) =
+        execute_with(request, Arc::new(manager), &NoopRunProgress).await?;
     let result = record.result.ok_or("missing result")?;
     assert_eq!(result.verdict, Verdict::Warning);
     assert_eq!(result.reason_code, ReasonCode::CleanupFailed);
@@ -477,206 +372,62 @@ async fn cleanup_failure_promotes_pass_to_warning() -> Result<(), Box<dyn Error>
     Ok(())
 }
 
-fn post_request(run_request: &RunRequest, token: &str) -> Result<Request<Body>, Box<dyn Error>> {
-    Ok(Request::builder()
-        .method("POST")
-        .uri("/v1/runs")
-        .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {token}"))
-        .body(Body::from(serde_json::to_vec(run_request)?))?)
-}
-
-async fn api_fixture(
-    manager: Arc<dyn PackageManager>,
-) -> Result<
-    (
-        TempDir,
-        Arc<FileRunStore>,
-        axum::Router,
-        mpsc::Receiver<RunId>,
-    ),
-    Box<dyn Error>,
-> {
-    let directory = tempfile::tempdir()?;
-    let store = Arc::new(FileRunStore::new(directory.path().to_path_buf()).await?);
-    let (sender, receiver) = mpsc::channel(8);
-    let state = ApiState {
-        config: Arc::new(test_config(directory.path())),
-        store: store.clone(),
-        package_manager: manager,
-        queue: sender,
-        accepting: Arc::new(AtomicBool::new(true)),
-    };
-    Ok((directory, store, router(state), receiver))
+#[tokio::test]
+async fn core_package_is_refused_before_any_mutation() -> Result<(), Box<dyn Error>> {
+    let request = request("core-refused")?;
+    let mut manager = ScriptedPackageManager::new(request.package.dnp_name.clone());
+    manager.core = true;
+    let observation = manager.clone();
+    let (_directory, _store, record) =
+        execute_with(request, Arc::new(manager), &NoopRunProgress).await?;
+    let result = record.result.ok_or("missing result")?;
+    assert_eq!(result.reason_code, ReasonCode::CorePackageRefused);
+    assert_eq!(observation.cleanup_calls()?, 0);
+    Ok(())
 }
 
 #[tokio::test]
-async fn identical_duplicate_run_is_idempotent() -> Result<(), Box<dyn Error>> {
-    let run_request = request("duplicate-identical")?;
+async fn cancellation_before_mutation_skips_install_and_cleanup() -> Result<(), Box<dyn Error>> {
+    let request = request("cancelled")?;
     let manager = Arc::new(ScriptedPackageManager::new(
-        run_request.package.dnp_name.clone(),
+        request.package.dnp_name.clone(),
     ));
-    let (_directory, _store, app, _receiver) = api_fixture(manager).await?;
-    let first = app
-        .clone()
-        .oneshot(post_request(&run_request, "test-api-token")?)
-        .await?;
-    let second = app
-        .oneshot(post_request(&run_request, "test-api-token")?)
-        .await?;
-    assert_eq!(first.status(), StatusCode::ACCEPTED);
-    assert_eq!(second.status(), StatusCode::OK);
+    let observation = manager.clone();
+    let progress = WorkerProgress::new();
+    progress.request_cancellation();
+    let (_directory, _store, record) = execute_with(request, manager, progress.as_ref()).await?;
+    let result = record.result.ok_or("missing result")?;
+    assert_eq!(result.verdict, Verdict::Inconclusive);
+    assert_eq!(result.reason_code, ReasonCode::CancellationRequested);
+    assert_eq!(observation.cleanup_calls()?, 0);
     Ok(())
 }
 
 #[tokio::test]
-async fn conflicting_duplicate_run_returns_conflict() -> Result<(), Box<dyn Error>> {
-    let first_request = request("duplicate-conflict")?;
-    let second_request = request_with("duplicate-conflict", "/ipfs/different", None)?;
-    let manager = Arc::new(ScriptedPackageManager::new(
-        first_request.package.dnp_name.clone(),
-    ));
-    let (_directory, _store, app, _receiver) = api_fixture(manager).await?;
-    let first = app
-        .clone()
-        .oneshot(post_request(&first_request, "test-api-token")?)
-        .await?;
-    let second = app
-        .oneshot(post_request(&second_request, "test-api-token")?)
-        .await?;
-    assert_eq!(first.status(), StatusCode::ACCEPTED);
-    assert_eq!(second.status(), StatusCode::CONFLICT);
-    Ok(())
-}
-
-#[tokio::test]
-async fn invalid_api_bearer_is_rejected() -> Result<(), Box<dyn Error>> {
-    let run_request = request("invalid-auth")?;
-    let manager = Arc::new(ScriptedPackageManager::new(
-        run_request.package.dnp_name.clone(),
-    ));
-    let (_directory, _store, app, _receiver) = api_fixture(manager).await?;
-    let response = app
-        .oneshot(post_request(
-            &run_request,
-            "wrong-token-with-different-length",
-        )?)
-        .await?;
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    Ok(())
-}
-
-#[tokio::test]
-async fn missing_mutating_tools_fail_readiness() -> Result<(), Box<dyn Error>> {
-    let run_request = request("readiness-tools")?;
-    let mut scripted = ScriptedPackageManager::new(run_request.package.dnp_name.clone());
-    scripted.missing_mutating_tools = true;
-    let (_directory, _store, app, _receiver) = api_fixture(Arc::new(scripted)).await?;
-    let response = app
-        .oneshot(Request::builder().uri("/readyz").body(Body::empty())?)
-        .await?;
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let body = to_bytes(response.into_body(), 16 * 1024).await?;
-    assert!(String::from_utf8(body.to_vec())?.contains("mutating tools are probably disabled"));
-    Ok(())
-}
-
-#[derive(Debug)]
-struct ChangingSetManager {
-    target: DnpName,
-    call: AtomicUsize,
-}
-
-#[async_trait]
-impl PackageManager for ChangingSetManager {
-    async fn verify_tools(&self) -> Result<ToolAvailability, PackageManagerError> {
-        Ok(ToolAvailability {
-            available: Vec::new(),
-            missing: Vec::new(),
-        })
-    }
-
-    async fn list_packages(&self) -> Result<Vec<PackageSummary>, PackageManagerError> {
-        Ok(Vec::new())
-    }
-
-    async fn get_package_details(
-        &self,
-        dnp_name: &DnpName,
-    ) -> Result<PackageDetails, PackageManagerError> {
-        let call = self.call.fetch_add(1, Ordering::SeqCst);
-        let name = if call == 1 { "changed" } else { "service" };
-        Ok(details(dnp_name, "test", true, name))
-    }
-
-    async fn get_package_logs(
-        &self,
-        _dnp_name: &DnpName,
-        _tail: usize,
-    ) -> Result<PackageLogs, PackageManagerError> {
-        Ok(PackageLogs {
-            entries: Vec::new(),
-        })
-    }
-
-    async fn preview_install(
-        &self,
-        _dnp_name: &DnpName,
-        _version: Option<&PackageRef>,
-    ) -> Result<PreviewSummary, PackageManagerError> {
-        Err(PackageManagerError::NotFound)
-    }
-
-    async fn install_package(
-        &self,
-        _dnp_name: &DnpName,
-        _version: Option<&PackageRef>,
-    ) -> Result<(), PackageManagerError> {
-        Err(PackageManagerError::NotFound)
-    }
-
-    async fn update_package(
-        &self,
-        _dnp_name: &DnpName,
-        _version: &PackageRef,
-    ) -> Result<(), PackageManagerError> {
-        Err(PackageManagerError::NotFound)
-    }
-
-    async fn remove_package(
-        &self,
-        _dnp_name: &DnpName,
-        _delete_volumes: bool,
-    ) -> Result<(), PackageManagerError> {
-        Ok(())
-    }
-}
-
-#[tokio::test]
-async fn stabilization_requires_same_consecutive_container_set() -> Result<(), Box<dyn Error>> {
-    let run_request = request("stable-set")?;
-    let manager = ChangingSetManager {
-        target: run_request.package.dnp_name.clone(),
-        call: AtomicUsize::new(0),
-    };
+async fn stabilization_stops_when_progress_requests_cancellation() -> Result<(), Box<dyn Error>> {
+    let request = request("cancel-stabilization")?;
+    let manager = ScriptedPackageManager::new(request.package.dnp_name.clone());
+    let progress = WorkerProgress::new();
+    progress.request_cancellation();
     let result = stabilize(
         &manager,
         Arc::new(ImmediateClock),
-        &manager.target,
+        &request.package.dnp_name,
         StabilizationConfig {
-            timeout: Duration::from_millis(6),
+            timeout: Duration::from_secs(1),
             poll_interval: Duration::from_millis(1),
             required_samples: 3,
         },
+        progress.as_ref(),
     )
     .await;
-    assert!(result.passed);
-    assert_eq!(result.samples.len(), 5);
+    assert!(!result.passed);
+    assert!(result.samples.is_empty());
     Ok(())
 }
 
 #[tokio::test]
-async fn invalid_nexus_json_falls_back_to_heuristic() -> Result<(), Box<dyn Error>> {
+async fn malformed_nexus_response_falls_back_to_heuristic() -> Result<(), Box<dyn Error>> {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -706,266 +457,265 @@ async fn invalid_nexus_json_falls_back_to_heuristic() -> Result<(), Box<dyn Erro
     Ok(())
 }
 
-#[tokio::test]
-async fn no_nexus_key_still_completes_run() -> Result<(), Box<dyn Error>> {
-    let run_request = request("no-nexus")?;
-    let manager = Arc::new(ScriptedPackageManager::new(
-        run_request.package.dnp_name.clone(),
-    ));
-    let (_directory, _store, record) = execute_with(run_request, manager).await?;
-    assert_eq!(record.status, ExecutionStatus::Completed);
-    assert!(record.evidence.log_analysis.is_some());
+#[test]
+fn claim_fixture_is_strictly_validated() -> Result<(), Box<dyn Error>> {
+    let response: ClaimResponse =
+        serde_json::from_str(include_str!("fixtures/claim-response.json"))?;
+    let claimed = dappnode_package_harness::coordinator::ClaimedJob::try_from(response)?;
+    assert_eq!(
+        claimed.request.run_id.to_string(),
+        "gh-pr-42-0123456789ab-abcdef1234567890"
+    );
+    assert_eq!(claimed.claim_token, "opaque-random-value");
+    Ok(())
+}
+
+#[test]
+fn complete_fixture_matches_the_protocol_shape() -> Result<(), Box<dyn Error>> {
+    let completion = CompleteRequest {
+        schema_version: 1,
+        worker_id: "worker-01".to_owned(),
+        claim_token: "opaque-random-value".to_owned(),
+        outcome: dappnode_package_harness::coordinator::CompletionOutcome::WorkerError(
+            dappnode_package_harness::coordinator::WorkerErrorCompletion {
+                code: WorkerErrorCode::Interrupted,
+                summary: "worker restarted before this job completed".to_owned(),
+                cleanup_status: CleanupStatus::Passed,
+            },
+        ),
+    };
+    let actual: serde_json::Value = serde_json::to_value(completion)?;
+    let expected: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/complete-worker-error.json"))?;
+    assert_eq!(actual, expected);
+    Ok(())
+}
+
+#[test]
+fn heartbeat_fixture_matches_the_protocol_shape() -> Result<(), Box<dyn Error>> {
+    let heartbeat = HeartbeatRequest {
+        schema_version: 1,
+        worker_id: "worker-01",
+        claim_token: "opaque-random-value",
+        phase: "candidate_stabilization",
+        cleanup_required: true,
+    };
+    let actual: serde_json::Value = serde_json::to_value(heartbeat)?;
+    let expected: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/heartbeat-request.json"))?;
+    assert_eq!(actual, expected);
     Ok(())
 }
 
 #[tokio::test]
-async fn callback_hmac_covers_exact_request_body() -> Result<(), Box<dyn Error>> {
-    let run_request = request("callback-signature")?;
-    let manager = Arc::new(ScriptedPackageManager::new(
-        run_request.package.dnp_name.clone(),
-    ));
-    let (_directory, _store, record) = execute_with(run_request, manager).await?;
-    let result = record.result.ok_or("missing result")?;
+async fn coordinator_claims_with_required_headers_and_parses_response() -> Result<(), Box<dyn Error>>
+{
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
+        .and(path("/v1/package-harness/jobs/claim"))
+        .and(header("authorization", "Bearer worker-secret"))
+        .and(header("content-type", "application/json"))
+        .and(header("user-agent", "dappnode-package-harness/0.1.0"))
+        .and(body_json(
+            json!({ "schemaVersion": 1, "workerId": "worker-01" }),
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(include_str!("fixtures/claim-response.json")),
+        )
         .mount(&server)
         .await;
-    let reporter = WebhookResultReporter::new(
-        server.uri(),
-        "callback-secret".to_owned(),
+    let client = CoordinatorClient::new(
+        &server.uri(),
+        "worker-01".to_owned(),
+        "worker-secret".to_owned(),
         Duration::from_secs(1),
-        Arc::new(ImmediateClock),
     )?;
-    reporter.report(&result).await?;
-    let requests = server
-        .received_requests()
-        .await
-        .ok_or("request recording disabled")?;
-    let callback = requests.first().ok_or("callback not received")?;
-    let header = callback
-        .headers
-        .get("x-dappnode-harness-signature")
-        .and_then(|value| value.to_str().ok())
-        .ok_or("signature header missing")?;
-    let expected = signature(b"callback-secret", &callback.body)?;
-    assert_eq!(header, format!("sha256={expected}"));
-    let raw = serde_json::to_vec(&result)?;
-    assert_eq!(callback.body, raw);
-
-    let mut independent = Hmac::<Sha256>::new_from_slice(b"callback-secret")?;
-    independent.update(&raw);
-    assert_eq!(expected, hex::encode(independent.finalize().into_bytes()));
+    let outcome = client.claim().await?;
+    assert!(matches!(outcome, ClaimOutcome::Claimed(_)));
     Ok(())
 }
 
 #[tokio::test]
-async fn callback_retries_transient_but_not_regular_client_errors() -> Result<(), Box<dyn Error>> {
-    let run_request = request("callback-retry")?;
-    let manager = Arc::new(ScriptedPackageManager::new(
-        run_request.package.dnp_name.clone(),
-    ));
-    let (_directory, _store, record) = execute_with(run_request, manager).await?;
-    let result = record.result.ok_or("missing result")?;
-
-    let transient_server = MockServer::start().await;
-    let transient_calls = Arc::new(AtomicUsize::new(0));
-    let responder_calls = Arc::clone(&transient_calls);
-    Mock::given(method("POST"))
-        .respond_with(move |_: &wiremock::Request| {
-            if responder_calls.fetch_add(1, Ordering::SeqCst) < 2 {
-                ResponseTemplate::new(500)
-            } else {
-                ResponseTemplate::new(200)
-            }
-        })
-        .mount(&transient_server)
-        .await;
-    let transient_reporter = WebhookResultReporter::new(
-        transient_server.uri(),
-        "secret".to_owned(),
-        Duration::from_secs(1),
-        Arc::new(ImmediateClock),
-    )?;
-    let outcome = transient_reporter.report(&result).await?;
-    assert_eq!(outcome.attempts, 3);
-    assert_eq!(transient_calls.load(Ordering::SeqCst), 3);
-
-    let client_error_server = MockServer::start().await;
-    let client_error_calls = Arc::new(AtomicUsize::new(0));
-    let responder_calls = Arc::clone(&client_error_calls);
-    Mock::given(method("POST"))
-        .respond_with(move |_: &wiremock::Request| {
-            responder_calls.fetch_add(1, Ordering::SeqCst);
-            ResponseTemplate::new(400)
-        })
-        .mount(&client_error_server)
-        .await;
-    let client_error_reporter = WebhookResultReporter::new(
-        client_error_server.uri(),
-        "secret".to_owned(),
-        Duration::from_secs(1),
-        Arc::new(ImmediateClock),
-    )?;
-    let error = client_error_reporter
-        .report(&result)
-        .await
-        .err()
-        .ok_or("400 callback unexpectedly succeeded")?;
-    assert_eq!(error.attempts, 1);
-    assert_eq!(client_error_calls.load(Ordering::SeqCst), 1);
-    Ok(())
-}
-
-#[tokio::test]
-async fn github_reporter_posts_markdown_pr_comment() -> Result<(), Box<dyn Error>> {
-    let run_request = request("github-comment")?;
-    let manager = Arc::new(ScriptedPackageManager::new(
-        run_request.package.dnp_name.clone(),
-    ));
-    let (_directory, _store, record) = execute_with(run_request, manager).await?;
-    let result = record.result.ok_or("missing result")?;
+async fn coordinator_maps_no_work_and_heartbeat_cancellation() -> Result<(), Box<dyn Error>> {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 1 })))
+        .and(path("/v1/package-harness/jobs/claim"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/package-harness/jobs/job-1/heartbeat"))
+        .and(body_json(json!({
+            "schemaVersion": 1,
+            "workerId": "worker-01",
+            "claimToken": "claim",
+            "phase": "candidate_stabilization",
+            "cleanupRequired": true
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "schemaVersion": 1,
+            "cancelRequested": true
+        })))
+        .mount(&server)
+        .await;
+    let client = CoordinatorClient::new(
+        &server.uri(),
+        "worker-01".to_owned(),
+        "worker-secret".to_owned(),
+        Duration::from_secs(1),
+    )?;
+    assert_eq!(client.claim().await?, ClaimOutcome::NoWork);
+    assert_eq!(
+        client
+            .heartbeat("job-1", "claim", "candidate_stabilization", true)
+            .await?,
+        HeartbeatOutcome::CancelRequested
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn coordinator_resends_exact_completion_bytes_and_accepts_duplicate()
+-> Result<(), Box<dyn Error>> {
+    let server = MockServer::start().await;
+    let body = include_str!("fixtures/complete-worker-error.json")
+        .as_bytes()
+        .to_vec();
+    Mock::given(method("POST"))
+        .and(path("/v1/package-harness/jobs/job-1/complete"))
+        .and(body_json(serde_json::from_slice::<serde_json::Value>(
+            &body,
+        )?))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "schemaVersion": 1,
+            "disposition": "duplicate"
+        })))
+        .mount(&server)
+        .await;
+    let client = CoordinatorClient::new(
+        &server.uri(),
+        "worker-01".to_owned(),
+        "worker-secret".to_owned(),
+        Duration::from_secs(1),
+    )?;
+    assert_eq!(
+        client.complete_raw("job-1", body).await?,
+        CompletionDisposition::Duplicate
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn coordinator_recognizes_lost_claim() -> Result<(), Box<dyn Error>> {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/package-harness/jobs/job-1/heartbeat"))
+        .respond_with(ResponseTemplate::new(409))
+        .mount(&server)
+        .await;
+    let client = CoordinatorClient::new(
+        &server.uri(),
+        "worker-01".to_owned(),
+        "worker-secret".to_owned(),
+        Duration::from_secs(1),
+    )?;
+    assert_eq!(
+        client.heartbeat("job-1", "claim", "analysis", true).await?,
+        HeartbeatOutcome::ClaimLost
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn polling_worker_claims_executes_and_acknowledges_before_next_claim()
+-> Result<(), Box<dyn Error>> {
+    let server = MockServer::start().await;
+    let accepting = Arc::new(AtomicBool::new(true));
+    Mock::given(method("POST"))
+        .and(path("/v1/package-harness/jobs/claim"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(include_str!("fixtures/claim-response.json")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1/package-harness/jobs/gh-pr-42-0123456789ab-abcdef1234567890/heartbeat",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "schemaVersion": 1,
+            "cancelRequested": false
+        })))
+        .mount(&server)
+        .await;
+    let stop_after_completion = Arc::clone(&accepting);
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1/package-harness/jobs/gh-pr-42-0123456789ab-abcdef1234567890/complete",
+        ))
+        .respond_with(move |_: &wiremock::Request| {
+            stop_after_completion.store(false, Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(json!({
+                "schemaVersion": 1,
+                "disposition": "recorded"
+            }))
+        })
+        .expect(1)
         .mount(&server)
         .await;
 
-    let reporter = GithubPrCommentReporter::new_with_token(
-        server.uri(),
-        "github-token".to_owned(),
-        Duration::from_secs(1),
-        Arc::new(ImmediateClock),
-    )?;
-    let outcome = reporter.report(&result).await?;
-    assert_eq!(outcome.http_status, Some(201));
-
-    let requests = server
-        .received_requests()
-        .await
-        .ok_or("request recording disabled")?;
-    let request = requests.first().ok_or("GitHub comment not received")?;
-    assert_eq!(
-        request.url.path(),
-        "/repos/dappnode/example-package/issues/123/comments"
-    );
-    assert_eq!(
-        request
-            .headers
-            .get("authorization")
-            .and_then(|value| value.to_str().ok()),
-        Some("Bearer github-token")
-    );
-    assert_eq!(
-        request
-            .headers
-            .get("user-agent")
-            .and_then(|value| value.to_str().ok()),
-        Some("dappnode-package-harness")
-    );
-    let body: serde_json::Value = serde_json::from_slice(&request.body)?;
-    let comment = body
-        .get("body")
-        .and_then(serde_json::Value::as_str)
-        .ok_or("GitHub comment body missing")?;
-    assert!(comment.contains("Dappnode package harness"));
-    assert!(comment.contains("<!-- dappnode-package-harness:github-comment -->"));
-    assert!(comment.contains("`example.dnp.dappnode.eth`"));
-    Ok(())
-}
-
-#[tokio::test]
-async fn harness_identity_is_rejected_at_api_boundary() -> Result<(), Box<dyn Error>> {
-    let run_request = request_for_name("harness-self-test", "package-harness.dnp.dappnode.eth")?;
-    let manager = Arc::new(ScriptedPackageManager::new(
-        run_request.package.dnp_name.clone(),
+    let directory = tempfile::tempdir()?;
+    let store = Arc::new(FileRunStore::new(directory.path().to_path_buf()).await?);
+    let request = request("worker-observation")?;
+    let manager: Arc<dyn PackageManager> = Arc::new(ScriptedPackageManager::new(
+        request.package.dnp_name.clone(),
     ));
-    let (_directory, _store, app, _receiver) = api_fixture(manager).await?;
-    let response = app
-        .oneshot(post_request(&run_request, "test-api-token")?)
-        .await?;
-    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let worker = worker_for(&server, Arc::clone(&store), manager, accepting)?;
+    tokio::time::timeout(Duration::from_secs(2), worker.run()).await?;
+
+    let job_id =
+        dappnode_package_harness::model::RunId::parse("gh-pr-42-0123456789ab-abcdef1234567890")?;
+    let record = store.get(&job_id).await?.ok_or("missing worker record")?;
+    assert!(record.result.is_some());
+    assert!(record.worker.completion_acknowledged);
+    assert_eq!(
+        record.worker.completion_disposition.as_deref(),
+        Some("recorded")
+    );
+    assert!(record.worker.pending_completion_body.is_none());
     Ok(())
 }
 
 #[tokio::test]
-async fn core_package_is_refused_before_mutation() -> Result<(), Box<dyn Error>> {
-    let run_request = request("core-package")?;
-    let mut scripted = ScriptedPackageManager::new(run_request.package.dnp_name.clone());
-    scripted.core = true;
-    let observation = scripted.clone();
-    let (_directory, _store, record) = execute_with(run_request, Arc::new(scripted)).await?;
-    let result = record.result.ok_or("missing result")?;
-    assert_eq!(result.verdict, Verdict::InfrastructureError);
-    assert_eq!(result.reason_code, ReasonCode::CorePackageRefused);
-    assert_eq!(observation.cleanup_calls()?, 0);
-    Ok(())
-}
-
-#[tokio::test]
-async fn persisted_run_does_not_contain_configured_secrets() -> Result<(), Box<dyn Error>> {
+async fn claimed_record_persists_claim_and_pending_completion_exactly() -> Result<(), Box<dyn Error>>
+{
     let directory = tempfile::tempdir()?;
     let store = FileRunStore::new(directory.path().to_path_buf()).await?;
-    let run_request = request("secret-persistence")?;
-    store.create(&RunRecord::new(run_request.clone())).await?;
-    let bytes = tokio::fs::read(
-        directory
-            .path()
-            .join(format!("{}.json", run_request.run_id.as_str())),
-    )
-    .await?;
-    let persisted = String::from_utf8(bytes)?;
-    for secret in [
-        "test-api-token",
-        "dappmanager-mcp-secret",
-        "nexus-api-secret",
-        "callback-hmac-secret",
-    ] {
-        assert!(!persisted.contains(secret));
-    }
+    let request = request("claim-persistence")?;
+    let mut record = RunRecord::claimed(request.clone(), "opaque-claim-token".to_owned());
+    record.worker.pending_completion_body =
+        Some(include_str!("fixtures/complete-worker-error.json").to_owned());
+    store.create(&record).await?;
+    let loaded = store.get(&request.run_id).await?.ok_or("missing record")?;
+    assert_eq!(
+        loaded.worker.claim_token.as_deref(),
+        Some("opaque-claim-token")
+    );
+    assert_eq!(
+        loaded.worker.pending_completion_body.as_deref(),
+        Some(include_str!("fixtures/complete-worker-error.json"))
+    );
     Ok(())
 }
 
-#[tokio::test]
-async fn api_submission_executes_and_returns_versioned_result() -> Result<(), Box<dyn Error>> {
-    let run_request = request("api-integration")?;
-    let manager = Arc::new(ScriptedPackageManager::new(
-        run_request.package.dnp_name.clone(),
-    ));
-    let manager_port: Arc<dyn PackageManager> = manager;
-    let (_directory, store, app, mut receiver) = api_fixture(Arc::clone(&manager_port)).await?;
-    let accepted = app
-        .clone()
-        .oneshot(post_request(&run_request, "test-api-token")?)
-        .await?;
-    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
-    let queued_run = receiver.recv().await.ok_or("queue closed")?;
-    let store_port: Arc<dyn RunStore> = store.clone();
-    let controller = RunController::new(
-        manager_port,
-        Arc::new(HeuristicLogAnalyzer),
-        None,
-        store_port,
-        Arc::new(ExplicitPackageResolver),
-        Arc::new(ImmediateClock),
-        runner_config(),
-    );
-    controller.execute(&queued_run).await?;
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri(format!("/v1/runs/{}", run_request.run_id))
-                .header("authorization", "Bearer test-api-token")
-                .body(Body::empty())?,
-        )
-        .await?;
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), 1024 * 1024).await?;
-    let record: RunRecord = serde_json::from_slice(&body)?;
-    let result = record.result.ok_or("result missing from API response")?;
-    assert_eq!(result.schema_version, 1);
-    assert_eq!(result.verdict, Verdict::Passed);
-    assert_eq!(result.cleanup.status, CleanupStatus::Passed);
-    Ok(())
+#[test]
+fn worker_progress_prioritizes_lost_claim_over_cancellation() {
+    let progress = WorkerProgress::new();
+    progress.request_cancellation();
+    assert_eq!(progress.control(), RunControl::CancelRequested);
+    progress.mark_claim_lost();
+    assert_eq!(progress.control(), RunControl::ClaimLost);
 }

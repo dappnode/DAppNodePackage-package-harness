@@ -10,13 +10,15 @@ services:
       PORT: "8080"
       DATA_DIR: /data
       HARNESS_DNP_NAME: package-harness.dnp.dappnode.eth
-      HARNESS_API_TOKEN: ""
       PACKAGE_MANAGER_MODE: mcp
       DAPPMANAGER_MCP_URL: ""
       DAPPMANAGER_MCP_TOKEN: ""
       ALLOW_DESTRUCTIVE_PACKAGE_TESTS: "false"
-      RESULT_CALLBACK_URL: ""
-      RESULT_CALLBACK_HMAC_SECRET: ""
+      TROPIBOT_URL: ""
+      PACKAGE_HARNESS_WORKER_ID: ""
+      PACKAGE_HARNESS_WORKER_TOKEN: ""
+      PACKAGE_HARNESS_POLL_SECONDS: "10"
+      PACKAGE_HARNESS_HEARTBEAT_SECONDS: "20"
       NEXUS_API_KEY: ""
       NEXUS_MODEL: nexus/auto
       RUST_LOG: dappnode_package_harness=info,tower_http=info
@@ -35,4 +37,3 @@ services:
         max-file: "3"
 volumes:
   data: {}
-

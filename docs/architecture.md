@@ -1,34 +1,27 @@
 # Architecture
 
-The controller depends only on capability traits defined alongside their implementations. Axum, the MCP SDK, Reqwest, filesystem persistence, and Nexus parsing remain outside the runner.
+The harness is a one-at-a-time polling worker. The local Axum server is supervision only; package jobs and result delivery are outbound to Tropibot.
 
 ```text
-GitHub App
-    |
-    | authenticated run request
-    v
-Harness HTTP API
-    |
-    v
-Deterministic RunController
-    |
-    +--> DappmanagerPackageManager --> Dappmanager MCP
-    |
-    +--> LogAnalyzer -------------> Heuristic / Nexus
-    |
-    +--> RunStore ----------------> /data
-    |
-    +--> ResultReporter ----------> GitHub App callback
+                 claim / heartbeat / complete over HTTPS
+Tropibot  <-------------------------------------------->  Package harness
+                                                              |
+                                                              +-- RunStore → /data
+                                                              +-- RunController → Dappmanager MCP
+                                                              +-- LogAnalyzer → heuristic / Nexus
+                                                              +-- local /healthz and /readyz
 ```
 
-The Axum API validates versioned request DTOs and converts them to newtyped model values before persistence. A bounded in-process channel feeds one worker, making package mutation strictly serial. Every phase transition is persisted with a UTC timestamp.
+`CoordinatorClient` owns the three normative worker endpoints and their DTOs. It adds bearer authentication and the package version user-agent, bounds request timeouts and response bytes, previews errors, and classifies retryable failures. Golden fixtures make the camelCase JSON contract explicit.
 
-`PackageManager` exposes only package-oriented operations. The Dappmanager implementation creates a bounded official `rmcp` Streamable HTTP session for an operation, detects MCP-level errors, concatenates text content, parses its JSON in one place, normalizes containers, and closes the session. Raw `serde_json::Value` never enters the runner or model modules.
+`PackageHarnessWorker` persists a full claim before execution, then starts a heartbeat task beside the controller. The controller depends only on the narrow `RunProgress` port: it publishes its already-persisted phase and reads cancellation/claim-loss signals. No coordinator HTTP call runs in the controller or can block cleanup.
 
-The baseline and candidate use the same stabilization and capture functions. Stabilization requires a non-empty container list, every container marked `running`, and an unchanged sorted name set across the configured consecutive window. Failed calls, empty lists, non-running states, and set changes reset the window. Both attempts and stored sample history are bounded.
+`RunRecord.worker` holds the opaque claim token, mutation/cleanup flag, final worker error when no normal result exists, exact pending completion JSON, acknowledgement status, and a manual-recovery reason. The atomic file store writes a temporary file in `/data` and persists it atomically. Only one unacknowledged claimed record is allowed to proceed.
 
-Cleanup is a final-path operation once preflight authorizes the non-core target. It removes only that target with volumes, polls for absence, and compares the final package list with the preflight snapshot. A cleanup failure does not replace the original verdict, though it promotes an otherwise passing result to a warning.
+On startup the worker finds an unresolved record before it polls. It retries a pending completion first. If an active job might have changed Dappmanager, it checks the target, refuses the harness and core packages, runs bounded target-only cleanup, and sends an `interrupted` worker error. It never reruns the interrupted test. A failed cleanup, lost claim, or conflicting completion stays visible as a not-ready/manual-recovery condition.
 
-The file store uses a temporary file in the destination directory followed by an atomic persist/rename. The PoC assumes one process and uses no database or distributed lock.
+The controller’s baseline and candidate paths share stabilization and capture. Stabilization requires a non-empty, all-running container list with the same sorted names across consecutive samples. Failed detail calls, empty lists, non-running states, and container-set changes reset the streak. Evidence history, log collection, redaction, and analysis input are bounded.
 
-Nexus receives only redacted, bounded evidence in one request. Log text is explicitly untrusted data in its system instruction, no MCP tools are provided, `tool_choice` is `none`, and its typed response remains advisory. The redactor covers common authorization values, secret-bearing keys, URI credentials, private-key blocks, and long token-like strings, but is documented as defense in depth rather than perfect sanitization.
+Nexus receives only a single redacted, bounded request with no tools or conversation history. Its typed result is advisory; a failure falls back to the heuristic analyzer and no Nexus result can turn a deterministic failure into a pass.
+
+V1 deliberately does not contain leases, fencing tokens, automatic reassignment, distributed persistence, worker scheduling, object storage, or per-worker authentication. The coordinator and persistence ports keep those additions possible without changing the deterministic execution core.

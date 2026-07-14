@@ -18,6 +18,8 @@ pub enum ReasonCode {
     RequiredMcpToolsMissing,
     PersistenceFailed,
     InterruptedOnRestart,
+    CancellationRequested,
+    ClaimLost,
     UnexpectedError,
 }
 

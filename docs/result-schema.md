@@ -1,6 +1,6 @@
 # Result schema version 1
 
-Callbacks and `RunRecord.result` use `schemaVersion: 1`. Enum values are stable `snake_case` strings. Unknown future result fields should be ignored by callback consumers; request version 1 is intentionally strict and rejects unknown fields.
+`RunRecord.result` and Tropibot completion `outcome.result` use `schemaVersion: 1`. Enum values are stable `snake_case` strings. Unknown future result fields should be ignored by consumers; request version 1 is intentionally strict and rejects unknown fields.
 
 Top-level fields:
 
@@ -99,4 +99,22 @@ Representative successful result:
 }
 ```
 
-Local `GET /v1/runs/:runId` returns the surrounding persisted `RunRecord`, including request, phase history, bounded redacted capture evidence, report state, and this result. Tokens, authorization headers, and raw unredacted package logs are never schema fields.
+## Worker completion envelope
+
+Tropibot receives a normal result in this envelope:
+
+```json
+{
+  "schemaVersion": 1,
+  "workerId": "worker-01",
+  "claimToken": "opaque-random-value",
+  "outcome": {
+    "type": "result",
+    "result": {}
+  }
+}
+```
+
+If no normal result can be safely produced, the worker sends `type: "worker_error"` with one of `interrupted`, `unsupported_job`, `cleanup_failed`, `local_persistence_failed`, or `unexpected_error`, plus a bounded `summary` and `cleanupStatus`. The exact serialized envelope is stored before delivery and retried unchanged until Tropibot replies with `recorded` or `duplicate`.
+
+The persisted surrounding `RunRecord` includes request, phase history, bounded redacted capture evidence, local worker-delivery state, and this result. The opaque claim token must be retained locally to complete after restart; the Tropibot shared bearer token, Dappmanager token, Nexus key, authorization headers, and raw unredacted logs are never result-schema fields.

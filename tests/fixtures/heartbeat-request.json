@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "workerId": "worker-01",
+  "claimToken": "opaque-random-value",
+  "phase": "candidate_stabilization",
+  "cleanupRequired": true
+}

@@ -9,37 +9,32 @@ use std::{
 };
 
 use dappnode_package_harness::{
-    analysis::{
-        CompositeLogAnalyzer, HeuristicLogAnalyzer, LogAnalyzer, NexusLogAnalyzer,
-        redaction::truncate_utf8,
-    },
+    analysis::{CompositeLogAnalyzer, HeuristicLogAnalyzer, LogAnalyzer, NexusLogAnalyzer},
     api::{ApiState, router},
     clock::{Clock, TokioClock},
-    config::{Config, PackageManagerMode, ResultReporterMode},
-    model::{CleanupResult, CleanupStatus, ExecutionStatus, ExplicitPackageResolver, RunRecord},
+    config::{Config, PackageManagerMode},
+    coordinator::CoordinatorClient,
+    model::ExplicitPackageResolver,
     package_manager::{
         DappmanagerPackageManager, FakePackageManager, PackageManager, UnavailablePackageManager,
     },
-    reporting::{GithubPrCommentReporter, ResultReporter, WebhookResultReporter},
-    runner::{
-        RunController, RunnerConfig, cleanup::cleanup_target, stabilization::StabilizationConfig,
-    },
+    runner::{RunController, RunnerConfig, stabilization::StabilizationConfig},
     storage::{FileRunStore, RunStore},
+    worker::{PackageHarnessWorker, WorkerConfig, WorkerDependencies, WorkerReadiness},
 };
-use tokio::sync::mpsc;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // Load environment variables from a local .env file if one exists.
-    // Existing process env vars always win. Safe to call when no .env is present.
+    // Existing process variables win over a local development .env file.
     let _ = dotenvy::dotenv();
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+
     let config = Arc::new(Config::from_env()?);
     let package_manager = package_manager(&config);
     if env::args().any(|argument| argument == "--mcp-smoke") {
@@ -47,12 +42,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     let store: Arc<dyn RunStore> = Arc::new(FileRunStore::new(config.data_dir.clone()).await?);
     let clock: Arc<dyn Clock> = Arc::new(TokioClock);
-    let analyzer = analyzer(&config)?;
-    let reporter = reporter(&config, Arc::clone(&clock))?;
     let controller = Arc::new(RunController::new(
         Arc::clone(&package_manager),
-        analyzer,
-        reporter,
+        analyzer(&config)?,
         Arc::clone(&store),
         Arc::new(ExplicitPackageResolver),
         Arc::clone(&clock),
@@ -68,83 +60,49 @@ async fn main() -> Result<(), Box<dyn Error>> {
             cleanup_timeout: config.cleanup_timeout,
         },
     ));
-    let (queue_sender, mut queue_receiver) = mpsc::channel(256);
+    let coordinator = CoordinatorClient::new(
+        &config.tropibot_url,
+        config.package_harness_worker_id.clone(),
+        config.package_harness_worker_token.clone(),
+        config.tropibot_timeout,
+    )?;
     let accepting = Arc::new(AtomicBool::new(true));
-
-    for mut record in store.load_all().await? {
-        match record.status {
-            ExecutionStatus::Queued => {
-                queue_sender.send(record.request.run_id).await?;
-            }
-            ExecutionStatus::Running => {
-                record.interrupt();
-                if config.recover_cleanup_on_start {
-                    recover_interrupted_target(
-                        &config,
-                        package_manager.as_ref(),
-                        Arc::clone(&clock),
-                        &mut record,
-                    )
-                    .await;
-                }
-                store.save(&record).await?;
-            }
-            ExecutionStatus::Completed | ExecutionStatus::Interrupted => {}
-        }
-    }
-
-    let worker = tokio::spawn(async move {
-        while let Some(run_id) = queue_receiver.recv().await {
-            if let Err(run_error) = controller.execute(&run_id).await {
-                error!(run_id = %run_id, event = "run_worker_error", error = %run_error);
-            }
-        }
-    });
+    let worker_readiness = WorkerReadiness::default();
+    worker_readiness.set_not_ready("worker is reconciling local state");
+    let worker = PackageHarnessWorker::new(
+        coordinator,
+        WorkerDependencies {
+            controller,
+            package_manager: Arc::clone(&package_manager),
+            store: Arc::clone(&store),
+            clock,
+        },
+        WorkerConfig {
+            worker_id: config.package_harness_worker_id.clone(),
+            harness_dnp_name: config.harness_dnp_name.clone(),
+            poll_interval: config.package_harness_poll,
+            heartbeat_interval: config.package_harness_heartbeat,
+            cleanup_timeout: config.cleanup_timeout,
+        },
+        worker_readiness.clone(),
+        Arc::clone(&accepting),
+    );
+    let worker = tokio::spawn(worker.run());
     let state = ApiState {
         config: Arc::clone(&config),
-        store,
         package_manager,
-        queue: queue_sender,
-        accepting: Arc::clone(&accepting),
+        worker_readiness,
     };
     let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
-    info!(address = %config.listen_addr, event = "server_started");
+    info!(address = %config.listen_addr, event = "supervision_server_started");
     axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown_signal(accepting))
+        .with_graceful_shutdown(shutdown_signal(Arc::clone(&accepting)))
         .await?;
     match tokio::time::timeout(Duration::from_secs(300), worker).await {
         Ok(result) => result?,
         Err(_) => error!(event = "worker_shutdown_timeout"),
     }
     Ok(())
-}
-
-async fn recover_interrupted_target(
-    config: &Config,
-    package_manager: &dyn PackageManager,
-    clock: Arc<dyn Clock>,
-    record: &mut RunRecord,
-) {
-    let target = &record.request.package.dnp_name;
-    if target.as_str() == config.harness_dnp_name {
-        return;
-    }
-    let packages = match package_manager.list_packages().await {
-        Ok(packages) => packages,
-        Err(cleanup_error) => {
-            record.cleanup = CleanupResult {
-                status: CleanupStatus::Failed,
-                leftover_packages: Vec::new(),
-                error: Some(truncate_utf8(&cleanup_error.to_string(), 300)),
-            };
-            return;
-        }
-    };
-    let target_package = packages.iter().find(|package| package.dnp_name == *target);
-    if target_package.is_none_or(|package| package.is_core) {
-        return;
-    }
-    record.cleanup = cleanup_target(package_manager, clock, target, config.cleanup_timeout).await;
 }
 
 fn package_manager(config: &Config) -> Arc<dyn PackageManager> {
@@ -183,47 +141,6 @@ fn analyzer(config: &Config) -> Result<Arc<dyn LogAnalyzer>, Box<dyn Error>> {
             Ok(Arc::new(CompositeLogAnalyzer::new(nexus)))
         }
         None => Ok(Arc::new(HeuristicLogAnalyzer)),
-    }
-}
-
-fn reporter(
-    config: &Config,
-    clock: Arc<dyn Clock>,
-) -> Result<Option<Arc<dyn ResultReporter>>, Box<dyn Error>> {
-    match config.result_reporter_mode {
-        ResultReporterMode::None => Ok(None),
-        ResultReporterMode::Webhook => {
-            let url = config
-                .result_callback_url
-                .as_ref()
-                .ok_or("RESULT_CALLBACK_URL is required for webhook reporting")?;
-            let secret = config
-                .result_callback_hmac_secret
-                .as_ref()
-                .ok_or("RESULT_CALLBACK_HMAC_SECRET is required for webhook reporting")?;
-            Ok(Some(Arc::new(WebhookResultReporter::new(
-                url.clone(),
-                secret.clone(),
-                config.result_callback_timeout,
-                clock,
-            )?)))
-        }
-        ResultReporterMode::GithubPrComment => {
-            let app_id = config
-                .github_app_id
-                .as_ref()
-                .ok_or("GITHUB_APP_ID is required for github_pr_comment reporting")?;
-            let private_key = config.github_app_private_key.as_ref().ok_or(
-                "GITHUB_APP_PRIVATE_KEY or GITHUB_APP_PRIVATE_KEY_FILE is required for github_pr_comment reporting",
-            )?;
-            Ok(Some(Arc::new(GithubPrCommentReporter::new(
-                config.github_api_base_url.clone(),
-                app_id.clone(),
-                private_key.clone(),
-                config.result_callback_timeout,
-                clock,
-            )?)))
-        }
     }
 }
 

@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "workerId": "worker-01",
+  "claimToken": "opaque-random-value",
+  "outcome": {
+    "type": "worker_error",
+    "code": "interrupted",
+    "summary": "worker restarted before this job completed",
+    "cleanupStatus": "passed"
+  }
+}

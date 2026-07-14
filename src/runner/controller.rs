@@ -14,14 +14,14 @@ use crate::{
         AnalysisSide, AnalyzerKind, AnalyzerStatus, CaptureEvidence, CleanupStatus,
         ComparisonEvidence, ExecutionPhase, ExecutionStatus, HardCheckResult, HarnessResult,
         InstallResult, LogAnalysisInput, LogAnalysisResult, LogCollectionResult, PackageResolver,
-        ReasonCode, ReportStatus, ResultExecution, ResultPackage, ResultSide, ResultSource,
-        RunError, RunId, RunRecord, StabilizationResult, StepStatus, Verdict,
+        ReasonCode, ResultExecution, ResultPackage, ResultSide, ResultSource, RunError, RunId,
+        RunRecord, StabilizationResult, StepStatus, Verdict,
     },
     package_manager::{PackageManager, PackageManagerError},
-    reporting::ResultReporter,
     runner::{
         cleanup::{cleanup_target, leftover_packages},
         comparison::{compare, deterministic_verdict},
+        progress::{RunControl, RunProgress},
         stabilization::{StabilizationConfig, stabilize},
     },
     storage::{RunStore, StoreError},
@@ -62,7 +62,6 @@ struct Failure {
 pub struct RunController {
     package_manager: Arc<dyn PackageManager>,
     analyzer: Arc<dyn LogAnalyzer>,
-    reporter: Option<Arc<dyn ResultReporter>>,
     store: Arc<dyn RunStore>,
     resolver: Arc<dyn PackageResolver>,
     clock: Arc<dyn Clock>,
@@ -74,7 +73,6 @@ impl RunController {
     pub fn new(
         package_manager: Arc<dyn PackageManager>,
         analyzer: Arc<dyn LogAnalyzer>,
-        reporter: Option<Arc<dyn ResultReporter>>,
         store: Arc<dyn RunStore>,
         resolver: Arc<dyn PackageResolver>,
         clock: Arc<dyn Clock>,
@@ -83,7 +81,6 @@ impl RunController {
         Self {
             package_manager,
             analyzer,
-            reporter,
             store,
             resolver,
             clock,
@@ -95,7 +92,11 @@ impl RunController {
     ///
     /// The runner persists after phase transitions and evidence capture so an
     /// interrupted process can explain what happened on the next startup.
-    pub async fn execute(&self, run_id: &RunId) -> Result<(), ControllerError> {
+    pub async fn execute(
+        &self,
+        run_id: &RunId,
+        progress: &dyn RunProgress,
+    ) -> Result<(), ControllerError> {
         let mut record = self
             .store
             .get(run_id)
@@ -107,11 +108,12 @@ impl RunController {
         }
         record.start();
         self.save(&record).await?;
+        progress.publish(record.phase, record.worker.cleanup_required);
         let package = self.resolver.resolve(&record.request);
         let mut cleanup_authorized = false;
 
         let algorithm_result = self
-            .run_algorithm(&mut record, &mut cleanup_authorized)
+            .run_algorithm(&mut record, &mut cleanup_authorized, progress)
             .await;
         let failure = match algorithm_result {
             Ok(()) => None,
@@ -126,7 +128,8 @@ impl RunController {
         };
 
         if cleanup_authorized {
-            self.phase(&mut record, ExecutionPhase::Cleanup).await?;
+            self.phase(&mut record, ExecutionPhase::Cleanup, progress)
+                .await?;
             record.cleanup = if self.config.cleanup_enabled {
                 cleanup_target(
                     self.package_manager.as_ref(),
@@ -206,27 +209,8 @@ impl RunController {
             truncate_utf8(&summary, 500),
         );
         record.result = Some(result.clone());
-        self.phase(&mut record, ExecutionPhase::Reporting).await?;
-
-        if let Some(reporter) = &self.reporter {
-            match reporter.report(&result).await {
-                Ok(outcome) => {
-                    record.report.status = ReportStatus::Delivered;
-                    record.report.attempts = outcome.attempts;
-                    record.report.http_status = outcome.http_status;
-                }
-                Err(report_error) => {
-                    record.report.status = ReportStatus::Failed;
-                    record.report.attempts = report_error.attempts;
-                    record.report.http_status = report_error.http_status;
-                    record.report.last_error = Some(truncate_utf8(&report_error.to_string(), 300));
-                }
-            }
-        } else {
-            record.report.status = ReportStatus::Skipped;
-        }
-        record.transition(ExecutionPhase::Finished);
-        self.save(&record).await?;
+        self.phase(&mut record, ExecutionPhase::Finished, progress)
+            .await?;
         info!(
             run_id = %record.request.run_id,
             phase = ?record.phase,
@@ -241,9 +225,10 @@ impl RunController {
         &self,
         record: &mut RunRecord,
         cleanup_authorized: &mut bool,
+        progress: &dyn RunProgress,
     ) -> Result<(), Failure> {
         let package = self.resolver.resolve(&record.request);
-        self.phase_failure(record, ExecutionPhase::Preflight)
+        self.phase_failure(record, ExecutionPhase::Preflight, progress)
             .await?;
         let tools = self
             .package_manager
@@ -280,17 +265,16 @@ impl RunController {
             });
         }
         record.evidence.initial_packages = packages.clone();
-        // From this point onward the target package may have been mutated, so
-        // final cleanup is allowed even if a later phase fails.
-        *cleanup_authorized = true;
         self.save_failure(record).await?;
 
-        self.phase_failure(record, ExecutionPhase::InitialCleanup)
+        self.phase_failure(record, ExecutionPhase::InitialCleanup, progress)
             .await?;
         if packages
             .iter()
             .any(|installed| installed.dnp_name == package.dnp_name)
         {
+            self.authorize_cleanup(record, cleanup_authorized, progress)
+                .await?;
             let cleanup = cleanup_target(
                 self.package_manager.as_ref(),
                 Arc::clone(&self.clock),
@@ -309,14 +293,16 @@ impl RunController {
             }
         }
 
-        self.phase_failure(record, ExecutionPhase::BaselinePreview)
+        self.phase_failure(record, ExecutionPhase::BaselinePreview, progress)
             .await?;
         let baseline_preview = self
             .package_manager
             .preview_install(&package.dnp_name, package.baseline_ref.as_ref())
             .await
             .map_err(infrastructure)?;
-        self.phase_failure(record, ExecutionPhase::BaselineInstall)
+        self.phase_failure(record, ExecutionPhase::BaselineInstall, progress)
+            .await?;
+        self.authorize_cleanup(record, cleanup_authorized, progress)
             .await?;
         let baseline_started = self.clock.now();
         match self
@@ -343,16 +329,18 @@ impl RunController {
             }
         }
         let baseline_install_ms = elapsed_ms(baseline_started, self.clock.now());
-        self.phase_failure(record, ExecutionPhase::BaselineStabilization)
+        self.phase_failure(record, ExecutionPhase::BaselineStabilization, progress)
             .await?;
         let baseline_stabilization = stabilize(
             self.package_manager.as_ref(),
             Arc::clone(&self.clock),
             &package.dnp_name,
             self.config.stabilization,
+            progress,
         )
         .await;
-        self.phase_failure(record, ExecutionPhase::BaselineCapture)
+        self.control_failure(progress)?;
+        self.phase_failure(record, ExecutionPhase::BaselineCapture, progress)
             .await?;
         let baseline = self
             .capture(
@@ -371,14 +359,14 @@ impl RunController {
         record.evidence.baseline = Some(baseline);
         self.save_failure(record).await?;
 
-        self.phase_failure(record, ExecutionPhase::CandidatePreview)
+        self.phase_failure(record, ExecutionPhase::CandidatePreview, progress)
             .await?;
         let candidate_preview = self
             .package_manager
             .preview_install(&package.dnp_name, Some(&package.candidate_ref))
             .await
             .map_err(infrastructure)?;
-        self.phase_failure(record, ExecutionPhase::CandidateInstall)
+        self.phase_failure(record, ExecutionPhase::CandidateInstall, progress)
             .await?;
         let candidate_started = self.clock.now();
         // The candidate is always applied as an update from the installed
@@ -395,16 +383,18 @@ impl RunController {
             });
         }
         let candidate_install_ms = elapsed_ms(candidate_started, self.clock.now());
-        self.phase_failure(record, ExecutionPhase::CandidateStabilization)
+        self.phase_failure(record, ExecutionPhase::CandidateStabilization, progress)
             .await?;
         let candidate_stabilization = stabilize(
             self.package_manager.as_ref(),
             Arc::clone(&self.clock),
             &package.dnp_name,
             self.config.stabilization,
+            progress,
         )
         .await;
-        self.phase_failure(record, ExecutionPhase::CandidateCapture)
+        self.control_failure(progress)?;
+        self.phase_failure(record, ExecutionPhase::CandidateCapture, progress)
             .await?;
         let candidate = self
             .capture(
@@ -422,7 +412,8 @@ impl RunController {
             })?;
         record.evidence.candidate = Some(candidate);
 
-        self.phase_failure(record, ExecutionPhase::Analysis).await?;
+        self.phase_failure(record, ExecutionPhase::Analysis, progress)
+            .await?;
         let baseline = record.evidence.baseline.as_ref().ok_or_else(|| Failure {
             verdict: Verdict::InfrastructureError,
             reason: ReasonCode::UnexpectedError,
@@ -466,7 +457,7 @@ impl RunController {
             Ok(mut logs) => {
                 for entry in &mut logs.entries {
                     // Persisted logs are evidence, but still need strict size
-                    // and secret bounds before storage or reporting.
+                    // and secret bounds before storage or coordinator delivery.
                     entry.text = redact_and_bound(&entry.text, 64 * 1024);
                 }
                 (Some(logs), None)
@@ -490,9 +481,11 @@ impl RunController {
         &self,
         record: &mut RunRecord,
         phase: ExecutionPhase,
+        progress: &dyn RunProgress,
     ) -> Result<(), ControllerError> {
         record.transition(phase);
         self.save(record).await?;
+        progress.publish(phase, record.worker.cleanup_required);
         info!(
             run_id = %record.request.run_id,
             phase = ?phase,
@@ -506,8 +499,12 @@ impl RunController {
         &self,
         record: &mut RunRecord,
         phase: ExecutionPhase,
+        progress: &dyn RunProgress,
     ) -> Result<(), Failure> {
-        self.phase(record, phase).await.map_err(persistence_failure)
+        self.phase(record, phase, progress)
+            .await
+            .map_err(persistence_failure)?;
+        self.control_failure(progress)
     }
 
     async fn save(&self, record: &RunRecord) -> Result<(), ControllerError> {
@@ -516,6 +513,40 @@ impl RunController {
 
     async fn save_failure(&self, record: &RunRecord) -> Result<(), Failure> {
         self.save(record).await.map_err(persistence_failure)
+    }
+
+    async fn authorize_cleanup(
+        &self,
+        record: &mut RunRecord,
+        cleanup_authorized: &mut bool,
+        progress: &dyn RunProgress,
+    ) -> Result<(), Failure> {
+        if *cleanup_authorized {
+            return Ok(());
+        }
+        // Persist this before the first destructive call so restart recovery
+        // never guesses whether it must inspect and clean the target.
+        record.worker.cleanup_required = true;
+        *cleanup_authorized = true;
+        self.save_failure(record).await?;
+        progress.publish(record.phase, record.worker.cleanup_required);
+        Ok(())
+    }
+
+    fn control_failure(&self, progress: &dyn RunProgress) -> Result<(), Failure> {
+        match progress.control() {
+            RunControl::Continue => Ok(()),
+            RunControl::CancelRequested => Err(Failure {
+                verdict: Verdict::Inconclusive,
+                reason: ReasonCode::CancellationRequested,
+                summary: "Tropibot requested cancellation at a safe phase boundary".to_owned(),
+            }),
+            RunControl::ClaimLost => Err(Failure {
+                verdict: Verdict::InfrastructureError,
+                reason: ReasonCode::ClaimLost,
+                summary: "Tropibot no longer recognizes this worker claim".to_owned(),
+            }),
+        }
     }
 }
 

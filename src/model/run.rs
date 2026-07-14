@@ -2,8 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    CaptureEvidence, CleanupResult, ComparisonEvidence, HarnessResult, LogAnalysisResult,
-    ReasonCode, RunError, RunRequest,
+    CaptureEvidence, CleanupResult, CleanupStatus, ComparisonEvidence, HarnessResult,
+    LogAnalysisResult, ReasonCode, RunError, RunRequest,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -13,6 +13,54 @@ pub enum ExecutionStatus {
     Running,
     Completed,
     Interrupted,
+}
+
+/// Why a worker could not produce a normal harness result.
+///
+/// These values mirror the small v1 coordinator protocol and are persisted so
+/// a restart can deliver the same completion body without rerunning a job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerErrorCode {
+    Interrupted,
+    UnsupportedJob,
+    CleanupFailed,
+    LocalPersistenceFailed,
+    UnexpectedError,
+}
+
+/// A bounded explanation sent to Tropibot when no normal result is available.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerError {
+    pub code: WorkerErrorCode,
+    pub summary: String,
+    pub cleanup_status: CleanupStatus,
+}
+
+/// Delivery state owned by the polling worker.
+///
+/// `pending_completion_body` contains the exact serialized JSON body that
+/// must be retried. It deliberately lives beside the run evidence so one
+/// atomic file write captures both the result and the delivery obligation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerState {
+    /// Opaque coordinator claim token. It is required after a restart to
+    /// heartbeat or complete the same claim, so it must be persisted locally.
+    pub claim_token: Option<String>,
+    /// Becomes true immediately before the worker can mutate the target.
+    pub cleanup_required: bool,
+    /// A normal result is mutually exclusive with a worker error.
+    pub worker_error: Option<WorkerError>,
+    /// Exact UTF-8 completion JSON persisted before its first HTTP attempt.
+    pub pending_completion_body: Option<String>,
+    pub completion_acknowledged: bool,
+    /// `recorded` or `duplicate` once Tropibot has acknowledged delivery.
+    pub completion_disposition: Option<String>,
+    /// An unresolved cleanup or claim-reconciliation issue that requires an
+    /// operator and keeps the worker out of ready state.
+    pub manual_recovery_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,25 +90,6 @@ pub struct PhaseTransition {
     pub at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum ReportStatus {
-    #[default]
-    Pending,
-    Delivered,
-    Failed,
-    Skipped,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct ReportState {
-    pub status: ReportStatus,
-    pub attempts: u8,
-    pub last_error: Option<String>,
-    pub http_status: Option<u16>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct RunEvidence {
@@ -85,8 +114,9 @@ pub struct RunRecord {
     pub evidence: RunEvidence,
     pub errors: Vec<RunError>,
     pub cleanup: CleanupResult,
-    pub report: ReportState,
     pub result: Option<HarnessResult>,
+    #[serde(default)]
+    pub worker: WorkerState,
 }
 
 impl RunRecord {
@@ -106,9 +136,16 @@ impl RunRecord {
             evidence: RunEvidence::default(),
             errors: Vec::new(),
             cleanup: CleanupResult::default(),
-            report: ReportState::default(),
             result: None,
+            worker: WorkerState::default(),
         }
+    }
+
+    /// Creates a record for a job atomically claimed from Tropibot.
+    pub fn claimed(request: RunRequest, claim_token: String) -> Self {
+        let mut record = Self::new(request);
+        record.worker.claim_token = Some(claim_token);
+        record
     }
 
     pub fn transition(&mut self, phase: ExecutionPhase) {
@@ -132,5 +169,12 @@ impl RunRecord {
             message: "run was active when the harness restarted; it was not repeated".to_owned(),
             phase: self.phase,
         });
+    }
+
+    /// Whether this record prevents the process from claiming another job.
+    pub fn requires_worker_attention(&self) -> bool {
+        self.worker.manual_recovery_reason.is_some()
+            || self.worker.pending_completion_body.is_some()
+            || self.worker.claim_token.is_some() && !self.worker.completion_acknowledged
     }
 }

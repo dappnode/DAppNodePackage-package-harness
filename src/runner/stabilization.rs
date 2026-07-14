@@ -4,6 +4,7 @@ use crate::{
     clock::Clock,
     model::{DnpName, StabilizationResult, StabilizationSample},
     package_manager::PackageManager,
+    runner::RunProgress,
 };
 
 /// Polling policy for the container stabilization hard check.
@@ -27,6 +28,7 @@ pub async fn stabilize(
     clock: Arc<dyn Clock>,
     dnp_name: &DnpName,
     config: StabilizationConfig,
+    progress: &dyn RunProgress,
 ) -> StabilizationResult {
     let started = clock.now();
     let poll_millis = config.poll_interval.as_millis().max(1);
@@ -39,6 +41,9 @@ pub async fn stabilize(
     let mut last_non_running_states = Vec::new();
 
     for attempt in 0..max_attempts {
+        if !matches!(progress.control(), crate::runner::RunControl::Continue) {
+            break;
+        }
         let observed_at = clock.now().to_rfc3339();
         match package_manager.get_package_details(dnp_name).await {
             Ok(details) => {
@@ -117,6 +122,9 @@ pub async fn stabilize(
         }
         if attempt + 1 < max_attempts {
             clock.sleep(config.poll_interval).await;
+            if !matches!(progress.control(), crate::runner::RunControl::Continue) {
+                break;
+            }
         }
     }
     StabilizationResult {

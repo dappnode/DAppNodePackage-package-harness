@@ -22,7 +22,7 @@ use dappnode_package_harness::{
     storage::{FileRunStore, RunStore},
     worker::{PackageHarnessWorker, WorkerConfig, WorkerDependencies, WorkerReadiness},
 };
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -31,16 +31,38 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let _ = dotenvy::dotenv();
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug")),
         )
         .init();
 
     let config = Arc::new(Config::from_env()?);
+    info!(
+        event = "config_loaded",
+        listen_addr = %config.listen_addr,
+        data_dir = %config.data_dir.display(),
+        harness_dnp_name = %config.harness_dnp_name,
+        package_manager_mode = ?config.package_manager_mode,
+        destructive_tests_allowed = config.allow_destructive_tests,
+        stabilization_timeout_ms = config.stabilization_timeout.as_millis() as u64,
+        stabilization_poll_ms = config.stabilization_poll.as_millis() as u64,
+        stabilization_required_samples = config.stabilization_required_samples,
+        cleanup_enabled = config.cleanup_enabled,
+        cleanup_timeout_ms = config.cleanup_timeout.as_millis() as u64,
+        log_tail_lines = config.log_tail,
+        poll_seconds = config.package_harness_poll.as_secs(),
+        heartbeat_seconds = config.package_harness_heartbeat.as_secs(),
+        nexus_enabled = config.nexus_api_key.is_some(),
+    );
     let package_manager = package_manager(&config);
+    debug!(
+        event = "package_manager_ready",
+        mode = ?config.package_manager_mode,
+    );
     if env::args().any(|argument| argument == "--mcp-smoke") {
         return mcp_smoke(package_manager).await;
     }
     let store: Arc<dyn RunStore> = Arc::new(FileRunStore::new(config.data_dir.clone()).await?);
+    info!(event = "run_store_ready", data_dir = %config.data_dir.display());
     let clock: Arc<dyn Clock> = Arc::new(TokioClock);
     let controller = Arc::new(RunController::new(
         Arc::clone(&package_manager),
@@ -66,6 +88,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         config.package_harness_worker_token.clone(),
         config.tropibot_timeout,
     )?;
+    info!(
+        event = "coordinator_client_ready",
+        tropibot_url = %config.tropibot_url,
+        worker_id = %config.package_harness_worker_id,
+        tropibot_timeout_ms = config.tropibot_timeout.as_millis() as u64,
+        mcp_enabled = config.dappmanager_mcp_url.is_some(),
+    );
     let accepting = Arc::new(AtomicBool::new(true));
     let worker_readiness = WorkerReadiness::default();
     worker_readiness.set_not_ready("worker is reconciling local state");
@@ -88,6 +117,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Arc::clone(&accepting),
     );
     let worker = tokio::spawn(worker.run());
+    debug!(event = "worker_spawned");
     let state = ApiState {
         config: Arc::clone(&config),
         package_manager,
@@ -95,12 +125,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
     info!(address = %config.listen_addr, event = "supervision_server_started");
+    debug!(event = "supervision_server_binding_complete");
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown_signal(Arc::clone(&accepting)))
         .await?;
+    info!(event = "supervision_server_stopped");
     match tokio::time::timeout(Duration::from_secs(300), worker).await {
-        Ok(result) => result?,
-        Err(_) => error!(event = "worker_shutdown_timeout"),
+        Ok(result) => {
+            info!(event = "worker_shutdown_complete");
+            result?;
+        }
+        Err(_) => {
+            error!(event = "worker_shutdown_timeout", timeout_seconds = 300);
+        }
     }
     Ok(())
 }

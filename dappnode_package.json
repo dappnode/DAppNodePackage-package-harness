@@ -1,8 +1,6 @@
 {
   "architectures": [
-    "linux/amd64",
-    "linux/arm64"
-  ],
+    "linux/amd64"  ],
   "author": "DAppNode Association <admin@dappnode.io>",
   "bugs": {
     "url": "https://github.com/dappnode/DAppNodePackage-package-harness/issues"

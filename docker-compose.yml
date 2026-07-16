@@ -11,11 +11,11 @@ services:
       DATA_DIR: /data
       HARNESS_DNP_NAME: package-harness.dnp.dappnode.eth
       PACKAGE_MANAGER_MODE: mcp
-      DAPPMANAGER_MCP_URL: ""
+      DAPPMANAGER_MCP_URL: "http://my.dappnode/mcp"
       DAPPMANAGER_MCP_TOKEN: ""
       MCP_TIMEOUT_MS: "30000"
       MCP_MUTATION_TIMEOUT_MS: "1800000"
-      ALLOW_DESTRUCTIVE_PACKAGE_TESTS: "false"
+      ALLOW_DESTRUCTIVE_PACKAGE_TESTS: "true"
       TROPIBOT_URL: ""
       PACKAGE_HARNESS_WORKER_ID: ""
       PACKAGE_HARNESS_WORKER_TOKEN: ""

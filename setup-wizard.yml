@@ -96,16 +96,3 @@ fields:
     title: Nexus model
     description: Optional Nexus model identifier. The default is nexus/auto.
     required: false
-
-  - id: destructive-acknowledgement
-    target:
-      type: environment
-      name: ALLOW_DESTRUCTIVE_PACKAGE_TESTS
-      service: package-harness
-    title: Enable destructive package tests
-    description: >-
-      Select true only on a dedicated disposable Dappnode. Runs remove the target
-      package and its volumes before and after testing.
-    enum:
-      - "true"
-    required: true

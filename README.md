@@ -12,7 +12,7 @@ Tropibot claim → atomically persist claim → execute one package job
     → retry completion until Tropibot acknowledges it
 ```
 
-The harness has no public job-submission or GitHub API. It needs outbound HTTPS access to Tropibot. `GET /healthz` is a process check; `GET /readyz` also checks destructive configuration, Dappmanager tool availability, and unresolved local recovery state.
+The harness has no public job-submission or GitHub API. It needs outbound HTTPS access to Tropibot. `GET /healthz` is a process check; `GET /readyz` also checks Dappmanager tool availability and unresolved local recovery state.
 
 For every accepted job, the deterministic controller:
 
@@ -51,7 +51,6 @@ Rust 1.96.1 is pinned by `rust-toolchain.toml`. The process reads a local `.env`
 mkdir -p .data
 PACKAGE_MANAGER_MODE=fake \
 DATA_DIR=./.data \
-ALLOW_DESTRUCTIVE_PACKAGE_TESTS=true \
 TROPIBOT_URL=https://tropibot.example \
 PACKAGE_HARNESS_WORKER_ID=worker-01 \
 PACKAGE_HARNESS_WORKER_TOKEN=development-token \
@@ -86,7 +85,6 @@ For real nodes set at least:
 PACKAGE_MANAGER_MODE=mcp
 DAPPMANAGER_MCP_URL=https://dedicated-test-dappnode.example/mcp
 DAPPMANAGER_MCP_TOKEN=<token>
-ALLOW_DESTRUCTIVE_PACKAGE_TESTS=true
 ```
 
 Dappmanager must expose all seven tools listed in [`src/package_manager/mod.rs`](src/package_manager/mod.rs), including mutation tools. Before using a new Dappmanager version, run:

@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     analysis::redaction::redact_and_bound,
@@ -134,21 +134,39 @@ impl PackageHarnessWorker {
             match self.coordinator.claim().await {
                 Ok(ClaimOutcome::NoWork) => {
                     transient_attempt = 0;
+                    debug!(
+                        event = "claim_no_work",
+                        poll_interval_seconds = self.config.poll_interval.as_secs(),
+                    );
                     tokio::time::sleep(self.config.poll_interval).await;
                 }
                 Ok(ClaimOutcome::Claimed(job)) => {
                     transient_attempt = 0;
+                    info!(
+                        event = "claim_succeeded",
+                        run_id = %job.request.run_id,
+                        dnp_name = %job.request.package.dnp_name,
+                    );
                     if let Err(error) = self.process_claim(job).await {
+                        error!(
+                            event = "claim_processing_failed",
+                            error = %error,
+                        );
                         self.readiness.set_not_ready(error);
                         return;
                     }
                 }
-                Err(CoordinatorError::Authentication { .. }) => {
+                Err(CoordinatorError::Authentication { status }) => {
+                    error!(
+                        event = "claim_authentication_failed",
+                        status = status.as_u16(),
+                    );
                     self.readiness
                         .set_not_ready("Tropibot rejected worker authentication; polling stopped");
                     return;
                 }
                 Err(CoordinatorError::UnresolvedJob) => {
+                    error!(event = "claim_unresolved_job");
                     self.readiness.set_not_ready(
                         "Tropibot reports an unresolved job but no recoverable local record exists",
                     );
@@ -156,7 +174,11 @@ impl PackageHarnessWorker {
                 }
                 Err(error) if error.is_transient() => {
                     transient_attempt = transient_attempt.saturating_add(1);
-                    warn!(event = "claim_transient_failure", error = %error);
+                    warn!(
+                        event = "claim_transient_failure",
+                        attempt = transient_attempt,
+                        error = %error,
+                    );
                     tokio::time::sleep(retry_delay(
                         self.config.poll_interval,
                         transient_attempt,
@@ -165,6 +187,10 @@ impl PackageHarnessWorker {
                     .await;
                 }
                 Err(error) => {
+                    error!(
+                        event = "claim_failed",
+                        error = %error,
+                    );
                     self.readiness
                         .set_not_ready(format!("Tropibot claim failed: {error}"));
                     return;
@@ -463,7 +489,12 @@ impl PackageHarnessWorker {
                 }
                 Err(error) if error.is_transient() => {
                     transient_attempt = transient_attempt.saturating_add(1);
-                    warn!(run_id = %record.request.run_id, event = "completion_transient_failure", error = %error);
+                    warn!(
+                        run_id = %record.request.run_id,
+                        event = "completion_transient_failure",
+                        attempt = transient_attempt,
+                        error = %error,
+                    );
                     tokio::time::sleep(retry_delay(
                         self.config.poll_interval,
                         transient_attempt,
@@ -471,15 +502,30 @@ impl PackageHarnessWorker {
                     ))
                     .await;
                 }
-                Err(CoordinatorError::Authentication { .. }) => {
+                Err(CoordinatorError::Authentication { status }) => {
+                    error!(
+                        run_id = %record.request.run_id,
+                        event = "completion_authentication_failed",
+                        status = status.as_u16(),
+                    );
                     return Err(
                         "Tropibot rejected worker authentication while completing a job".to_owned(),
                     );
                 }
-                Err(CoordinatorError::CompletionConflict { .. }) => {
+                Err(CoordinatorError::CompletionConflict { status, .. }) => {
+                    error!(
+                        run_id = %record.request.run_id,
+                        event = "completion_conflict",
+                        status = status.as_u16(),
+                    );
                     return Err("Tropibot rejected the persisted completion as conflicting; operator recovery is required".to_owned());
                 }
                 Err(error) => {
+                    error!(
+                        run_id = %record.request.run_id,
+                        event = "completion_failed",
+                        error = %error,
+                    );
                     return Err(format!("Tropibot completion failed: {error}"));
                 }
             }

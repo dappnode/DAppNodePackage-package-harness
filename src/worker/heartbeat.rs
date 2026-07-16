@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use tracing::{debug, warn};
+use tracing::warn;
 
 use crate::coordinator::{CoordinatorClient, CoordinatorError, HeartbeatOutcome};
 
@@ -53,7 +53,12 @@ impl HeartbeatTask {
                         warn!(run_id = %job_id, event = "heartbeat_authentication_failed", error = %error);
                     }
                     Err(error) => {
-                        debug!(run_id = %job_id, event = "heartbeat_failed", error = %error);
+                        warn!(
+                            run_id = %job_id,
+                            event = "heartbeat_failed",
+                            error = %error,
+                            transient = error.is_transient(),
+                        );
                     }
                 }
             }

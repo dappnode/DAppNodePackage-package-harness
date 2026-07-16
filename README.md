@@ -1,6 +1,6 @@
 # Dappnode Package Harness
 
-This package is a small, reliable polling worker for Tropibot. On a dedicated, disposable Dappnode it claims one package job at a time, installs a baseline, upgrades it to the candidate, captures bounded evidence, runs deterministic and advisory log analysis, removes the target package and its volumes, and delivers the result back to Tropibot.
+This package is a small, reliable polling worker for Tropibot. On a dedicated, disposable Dappnode it claims one package job at a time, uses an already-installed target as its baseline when available (or installs one when absent), upgrades it to the candidate, captures bounded evidence, runs deterministic and advisory log analysis, restores an existing target to its original version (or removes a newly installed target and its volumes), and delivers the result back to Tropibot.
 
 It is intentionally destructive. Never connect it to a personal or production Dappnode. The dedicated node is the safety boundary: cleanup is best effort and is not a security boundary. The harness refuses its own package and core packages, mutates only the claimed target, never mounts the Docker socket, and does not execute shell commands.
 
@@ -17,13 +17,13 @@ The harness has no public job-submission or GitHub API. It needs outbound HTTPS 
 For every accepted job, the deterministic controller:
 
 1. verifies Dappmanager MCP tools and target safety;
-2. removes any existing target installation;
-3. installs the latest registry baseline, or the explicit `baselineRef`;
+2. checks whether the target is already installed; if so, records its exact version and uses it as the baseline;
+3. otherwise installs the latest registry baseline, or the explicit `baselineRef`;
 4. waits for a stable, non-empty all-running container set;
 5. captures normalized details and bounded, redacted log tails;
 6. upgrades the baseline in place to the candidate;
 7. repeats stabilization and capture, compares both observations, and performs optional Nexus analysis;
-8. removes only the target with `deleteVolumes: true` and reports unexpected leftover dependencies.
+8. restores a pre-existing target to its recorded version; otherwise removes only the target with `deleteVolumes: true`, and reports unexpected leftover dependencies.
 
 Nexus is advisory. With no key, the harness uses the heuristic analyzer only. With a key, it sends one bounded redacted request with no tools; Nexus failures fall back safely, and Nexus can never override a deterministic failure.
 

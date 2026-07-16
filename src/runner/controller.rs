@@ -19,7 +19,7 @@ use crate::{
     },
     package_manager::{PackageManager, PackageManagerError},
     runner::{
-        cleanup::{cleanup_target, leftover_packages},
+        cleanup::{cleanup_target, leftover_packages, restore_target},
         comparison::{compare, deterministic_verdict},
         progress::{RunControl, RunProgress},
         stabilization::{StabilizationConfig, stabilize},
@@ -130,7 +130,29 @@ impl RunController {
         if cleanup_authorized {
             self.phase(&mut record, ExecutionPhase::Cleanup, progress)
                 .await?;
-            record.cleanup = if self.config.cleanup_enabled {
+            record.cleanup = if let Some(baseline_ref) = record.worker.baseline_restore_ref.as_ref()
+            {
+                match crate::model::PackageRef::parse(baseline_ref) {
+                    Ok(baseline_ref) => {
+                        restore_target(
+                            self.package_manager.as_ref(),
+                            Arc::clone(&self.clock),
+                            &package.dnp_name,
+                            &baseline_ref,
+                            self.config.cleanup_timeout,
+                        )
+                        .await
+                    }
+                    Err(error) => crate::model::CleanupResult {
+                        status: CleanupStatus::Failed,
+                        leftover_packages: Vec::new(),
+                        error: Some(truncate_utf8(
+                            &format!("saved baseline reference is invalid: {error}"),
+                            300,
+                        )),
+                    },
+                }
+            } else if self.config.cleanup_enabled {
                 cleanup_target(
                     self.package_manager.as_ref(),
                     Arc::clone(&self.clock),
@@ -267,65 +289,77 @@ impl RunController {
         record.evidence.initial_packages = packages.clone();
         self.save_failure(record).await?;
 
-        self.phase_failure(record, ExecutionPhase::InitialCleanup, progress)
-            .await?;
-        if packages
+        let installed_baseline = packages
             .iter()
-            .any(|installed| installed.dnp_name == package.dnp_name)
-        {
-            self.authorize_cleanup(record, cleanup_authorized, progress)
-                .await?;
-            let cleanup = cleanup_target(
-                self.package_manager.as_ref(),
-                Arc::clone(&self.clock),
-                &package.dnp_name,
-                self.config.cleanup_timeout,
-            )
-            .await;
-            if cleanup.status != CleanupStatus::Passed {
-                return Err(Failure {
+            .find(|installed| installed.dnp_name == package.dnp_name);
+        if let Some(installed_baseline) = installed_baseline {
+            let version = installed_baseline
+                .version
+                .as_deref()
+                .ok_or_else(|| Failure {
                     verdict: Verdict::InfrastructureError,
-                    reason: ReasonCode::CleanupFailed,
-                    summary: cleanup
-                        .error
-                        .unwrap_or_else(|| "initial target cleanup did not complete".to_owned()),
-                });
-            }
+                    reason: ReasonCode::BaselineUnavailable,
+                    summary: "installed target has no version to restore after testing".to_owned(),
+                })?;
+            let baseline_ref =
+                crate::model::PackageRef::parse(version).map_err(|error| Failure {
+                    verdict: Verdict::InfrastructureError,
+                    reason: ReasonCode::BaselineUnavailable,
+                    summary: truncate_utf8(
+                        &format!("installed target version cannot be restored: {error}"),
+                        500,
+                    ),
+                })?;
+            // Save this before candidate mutation so restart recovery restores
+            // the package that was already running, rather than deleting it.
+            record.worker.baseline_restore_ref = Some(baseline_ref.to_string());
+            self.save_failure(record).await?;
         }
 
         self.phase_failure(record, ExecutionPhase::BaselinePreview, progress)
             .await?;
-        let baseline_preview = self
-            .package_manager
-            .preview_install(&package.dnp_name, package.baseline_ref.as_ref())
-            .await
-            .map_err(infrastructure)?;
+        let baseline_preview = if installed_baseline.is_some() {
+            crate::model::PreviewSummary {
+                package_name: Some(package.dnp_name.to_string()),
+                version: record.worker.baseline_restore_ref.clone(),
+                image_count: None,
+                requires_user_input: false,
+                summary: "using the target package already installed before this run".to_owned(),
+            }
+        } else {
+            self.package_manager
+                .preview_install(&package.dnp_name, package.baseline_ref.as_ref())
+                .await
+                .map_err(infrastructure)?
+        };
         self.phase_failure(record, ExecutionPhase::BaselineInstall, progress)
             .await?;
-        self.authorize_cleanup(record, cleanup_authorized, progress)
-            .await?;
         let baseline_started = self.clock.now();
-        match self
-            .package_manager
-            .install_package(&package.dnp_name, package.baseline_ref.as_ref())
-            .await
-        {
-            Ok(()) => {}
-            Err(PackageManagerError::RequiredSetup) => {
-                return Err(Failure {
-                    verdict: Verdict::Inconclusive,
-                    reason: ReasonCode::UnsupportedRequiredSetup,
-                    summary:
-                        "baseline requires setup values; only default/empty settings are supported"
-                            .to_owned(),
-                });
-            }
-            Err(error) => {
-                return Err(Failure {
-                    verdict: Verdict::InfrastructureError,
-                    reason: ReasonCode::BaselineInstallFailed,
-                    summary: truncate_utf8(&error.to_string(), 500),
-                });
+        if installed_baseline.is_none() {
+            self.authorize_cleanup(record, cleanup_authorized, progress)
+                .await?;
+            match self
+                .package_manager
+                .install_package(&package.dnp_name, package.baseline_ref.as_ref())
+                .await
+            {
+                Ok(()) => {}
+                Err(PackageManagerError::RequiredSetup) => {
+                    return Err(Failure {
+                        verdict: Verdict::Inconclusive,
+                        reason: ReasonCode::UnsupportedRequiredSetup,
+                        summary:
+                            "baseline requires setup values; only default/empty settings are supported"
+                                .to_owned(),
+                    });
+                }
+                Err(error) => {
+                    return Err(Failure {
+                        verdict: Verdict::InfrastructureError,
+                        reason: ReasonCode::BaselineInstallFailed,
+                        summary: truncate_utf8(&error.to_string(), 500),
+                    });
+                }
             }
         }
         let baseline_install_ms = elapsed_ms(baseline_started, self.clock.now());
@@ -367,6 +401,8 @@ impl RunController {
             .await
             .map_err(infrastructure)?;
         self.phase_failure(record, ExecutionPhase::CandidateInstall, progress)
+            .await?;
+        self.authorize_cleanup(record, cleanup_authorized, progress)
             .await?;
         let candidate_started = self.clock.now();
         // The candidate is always applied as an update from the installed

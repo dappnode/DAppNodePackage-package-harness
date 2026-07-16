@@ -51,6 +51,10 @@ pub struct WorkerState {
     pub claim_token: Option<String>,
     /// Becomes true immediately before the worker can mutate the target.
     pub cleanup_required: bool,
+    /// Exact package reference that was installed before this run. When set,
+    /// cleanup restores this package instead of removing it.
+    #[serde(default)]
+    pub baseline_restore_ref: Option<String>,
     /// A normal result is mutually exclusive with a worker error.
     pub worker_error: Option<WorkerError>,
     /// Exact UTF-8 completion JSON persisted before its first HTTP attempt.

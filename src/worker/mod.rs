@@ -21,10 +21,14 @@ use crate::{
         CoordinatorError, WorkerErrorCompletion,
     },
     model::{
-        CleanupResult, CleanupStatus, ExecutionStatus, RunRecord, WorkerError, WorkerErrorCode,
+        CleanupResult, CleanupStatus, ExecutionStatus, PackageRef, RunRecord, WorkerError,
+        WorkerErrorCode,
     },
     package_manager::PackageManager,
-    runner::{RunController, cleanup::cleanup_target},
+    runner::{
+        RunController,
+        cleanup::{cleanup_target, restore_target},
+    },
     storage::RunStore,
 };
 
@@ -367,13 +371,29 @@ impl PackageHarnessWorker {
             return Err("refusing restart cleanup of a core package".to_owned());
         }
         if packages.iter().any(|package| package.dnp_name == *target) {
-            record.cleanup = cleanup_target(
-                self.package_manager.as_ref(),
-                Arc::clone(&self.clock),
-                target,
-                self.config.cleanup_timeout,
-            )
-            .await;
+            record.cleanup = match record.worker.baseline_restore_ref.as_deref() {
+                Some(version) => {
+                    let baseline_ref = PackageRef::parse(version)
+                        .map_err(|error| format!("saved baseline reference is invalid: {error}"))?;
+                    restore_target(
+                        self.package_manager.as_ref(),
+                        Arc::clone(&self.clock),
+                        target,
+                        &baseline_ref,
+                        self.config.cleanup_timeout,
+                    )
+                    .await
+                }
+                None => {
+                    cleanup_target(
+                        self.package_manager.as_ref(),
+                        Arc::clone(&self.clock),
+                        target,
+                        self.config.cleanup_timeout,
+                    )
+                    .await
+                }
+            };
         } else {
             record.cleanup = CleanupResult {
                 status: CleanupStatus::Passed,

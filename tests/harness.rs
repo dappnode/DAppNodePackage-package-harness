@@ -64,6 +64,7 @@ struct ScriptedPackageManager {
 struct ScriptedState {
     installed: bool,
     candidate: bool,
+    version: String,
     cleanup_calls: usize,
 }
 
@@ -88,6 +89,19 @@ impl ScriptedPackageManager {
     fn cleanup_calls(&self) -> Result<usize, PackageManagerError> {
         Ok(self.state()?.cleanup_calls)
     }
+
+    fn with_installed_baseline(self, version: &str) -> Result<Self, PackageManagerError> {
+        let mut state = self.state()?;
+        state.installed = true;
+        state.version = version.to_owned();
+        drop(state);
+        Ok(self)
+    }
+
+    fn installed_version(&self) -> Result<Option<String>, PackageManagerError> {
+        let state = self.state()?;
+        Ok(state.installed.then(|| state.version.clone()))
+    }
 }
 
 #[async_trait]
@@ -104,14 +118,7 @@ impl PackageManager for ScriptedPackageManager {
         if state.installed || self.core {
             Ok(vec![PackageSummary {
                 dnp_name: self.target.clone(),
-                version: Some(
-                    if state.candidate {
-                        "candidate"
-                    } else {
-                        "baseline"
-                    }
-                    .to_owned(),
-                ),
+                version: Some(state.version.clone()),
                 is_core: self.core,
             }])
         } else {
@@ -132,16 +139,7 @@ impl PackageManager for ScriptedPackageManager {
         } else {
             self.baseline_running
         };
-        Ok(details(
-            dnp_name,
-            if state.candidate {
-                "candidate"
-            } else {
-                "baseline"
-            },
-            running,
-            "service",
-        ))
+        Ok(details(dnp_name, &state.version, running, "service"))
     }
 
     async fn get_package_logs(
@@ -179,17 +177,19 @@ impl PackageManager for ScriptedPackageManager {
         let mut state = self.state()?;
         state.installed = true;
         state.candidate = false;
+        state.version = "baseline".to_owned();
         Ok(())
     }
 
     async fn update_package(
         &self,
         _dnp_name: &DnpName,
-        _version: &PackageRef,
+        version: &PackageRef,
     ) -> Result<(), PackageManagerError> {
         let mut state = self.state()?;
         state.installed = true;
-        state.candidate = true;
+        state.candidate = version.as_str() != "/ipfs/QmOriginal";
+        state.version = version.to_string();
         Ok(())
     }
 
@@ -355,6 +355,28 @@ async fn unstable_candidate_is_failed_but_still_cleaned() -> Result<(), Box<dyn 
     );
     assert_eq!(record.cleanup.status, CleanupStatus::Passed);
     assert_eq!(observation.cleanup_calls()?, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn installed_target_is_used_as_baseline_and_restored() -> Result<(), Box<dyn Error>> {
+    let request = request("installed-baseline")?;
+    let manager = Arc::new(
+        ScriptedPackageManager::new(request.package.dnp_name.clone())
+            .with_installed_baseline("/ipfs/QmOriginal")?,
+    );
+    let observation = manager.clone();
+    let (_directory, _store, record) = execute_with(request, manager, &NoopRunProgress).await?;
+    assert_eq!(record.cleanup.status, CleanupStatus::Passed);
+    assert_eq!(
+        record.worker.baseline_restore_ref.as_deref(),
+        Some("/ipfs/QmOriginal")
+    );
+    assert_eq!(observation.cleanup_calls()?, 0);
+    assert_eq!(
+        observation.installed_version()?.as_deref(),
+        Some("/ipfs/QmOriginal")
+    );
     Ok(())
 }
 

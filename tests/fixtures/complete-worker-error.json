@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "workerId": "worker-01",
-  "claimToken": "opaque-random-value",
+  "claimToken": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   "outcome": {
     "type": "worker_error",
     "code": "interrupted",

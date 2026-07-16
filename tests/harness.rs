@@ -466,7 +466,10 @@ fn claim_fixture_is_strictly_validated() -> Result<(), Box<dyn Error>> {
         claimed.request.run_id.to_string(),
         "gh-pr-42-0123456789ab-abcdef1234567890"
     );
-    assert_eq!(claimed.claim_token, "opaque-random-value");
+    assert_eq!(
+        claimed.claim_token,
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    );
     Ok(())
 }
 
@@ -475,7 +478,7 @@ fn complete_fixture_matches_the_protocol_shape() -> Result<(), Box<dyn Error>> {
     let completion = CompleteRequest {
         schema_version: 1,
         worker_id: "worker-01".to_owned(),
-        claim_token: "opaque-random-value".to_owned(),
+        claim_token: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
         outcome: dappnode_package_harness::coordinator::CompletionOutcome::WorkerError(
             dappnode_package_harness::coordinator::WorkerErrorCompletion {
                 code: WorkerErrorCode::Interrupted,
@@ -496,7 +499,7 @@ fn heartbeat_fixture_matches_the_protocol_shape() -> Result<(), Box<dyn Error>> 
     let heartbeat = HeartbeatRequest {
         schema_version: 1,
         worker_id: "worker-01",
-        claim_token: "opaque-random-value",
+        claim_token: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         phase: "candidate_stabilization",
         cleanup_required: true,
     };

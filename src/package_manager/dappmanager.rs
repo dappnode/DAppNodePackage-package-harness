@@ -15,6 +15,7 @@ use super::{PackageManager, PackageManagerError, REQUIRED_MCP_TOOLS, ToolAvailab
 #[derive(Clone)]
 pub struct DappmanagerPackageManager {
     client: DappnodeMcpClient,
+    mutation_client: DappnodeMcpClient,
 }
 
 impl DappmanagerPackageManager {
@@ -22,10 +23,17 @@ impl DappmanagerPackageManager {
         url: String,
         token: String,
         timeout: std::time::Duration,
+        mutation_timeout: std::time::Duration,
     ) -> Result<Self, PackageManagerError> {
         crate::tls::ensure_crypto_provider();
-        let client = DappnodeMcpClient::with_timeout(url, token, timeout).map_err(package_error)?;
-        Ok(Self { client })
+        let client =
+            DappnodeMcpClient::with_timeout(&url, &token, timeout).map_err(package_error)?;
+        let mutation_client =
+            DappnodeMcpClient::with_timeout(url, token, mutation_timeout).map_err(package_error)?;
+        Ok(Self {
+            client,
+            mutation_client,
+        })
     }
 }
 
@@ -153,7 +161,7 @@ impl PackageManager for DappmanagerPackageManager {
         let options = install_options(version);
         let user_settings = serde_json::Map::new();
         match self
-            .client
+            .mutation_client
             .install_package(dnp_name, version, &user_settings, options)
             .await
         {
@@ -172,7 +180,7 @@ impl PackageManager for DappmanagerPackageManager {
         version: &PackageRef,
     ) -> Result<(), PackageManagerError> {
         let options = install_options(Some(version));
-        self.client
+        self.mutation_client
             .update_package(dnp_name, Some(version), options)
             .await
             .or_else(|error| {
@@ -189,7 +197,7 @@ impl PackageManager for DappmanagerPackageManager {
         dnp_name: &DnpName,
         delete_volumes: bool,
     ) -> Result<(), PackageManagerError> {
-        self.client
+        self.mutation_client
             .remove_package(dnp_name, delete_volumes)
             .await
             .or_else(|error| {

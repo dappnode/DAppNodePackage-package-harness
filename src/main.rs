@@ -112,15 +112,19 @@ fn package_manager(config: &Config) -> Arc<dyn PackageManager> {
             config.dappmanager_mcp_url.clone(),
             config.dappmanager_mcp_token.clone(),
         ) {
-            (Some(url), Some(token)) => {
-                DappmanagerPackageManager::new(url, token, config.mcp_timeout).map_or_else(
-                    |error| {
-                        Arc::new(UnavailablePackageManager::new(error.to_string()))
-                            as Arc<dyn PackageManager>
-                    },
-                    |manager| Arc::new(manager) as Arc<dyn PackageManager>,
-                )
-            }
+            (Some(url), Some(token)) => DappmanagerPackageManager::new(
+                url,
+                token,
+                config.mcp_timeout,
+                config.mcp_mutation_timeout,
+            )
+            .map_or_else(
+                |error| {
+                    Arc::new(UnavailablePackageManager::new(error.to_string()))
+                        as Arc<dyn PackageManager>
+                },
+                |manager| Arc::new(manager) as Arc<dyn PackageManager>,
+            ),
             _ => Arc::new(UnavailablePackageManager::new(
                 "Dappmanager MCP configuration is incomplete",
             )),

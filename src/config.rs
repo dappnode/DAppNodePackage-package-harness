@@ -29,6 +29,8 @@ pub struct Config {
     pub dappmanager_mcp_url: Option<String>,
     pub dappmanager_mcp_token: Option<String>,
     pub mcp_timeout: Duration,
+    /// Timeout reserved for package installation, update, and removal calls.
+    pub mcp_mutation_timeout: Duration,
     pub stabilization_timeout: Duration,
     pub stabilization_poll: Duration,
     pub stabilization_required_samples: usize,
@@ -112,6 +114,7 @@ impl Config {
             dappmanager_mcp_url: optional("DAPPMANAGER_MCP_URL"),
             dappmanager_mcp_token: optional("DAPPMANAGER_MCP_TOKEN"),
             mcp_timeout: millis("MCP_TIMEOUT_MS", 30_000)?,
+            mcp_mutation_timeout: long_millis("MCP_MUTATION_TIMEOUT_MS", 1_800_000)?,
             stabilization_timeout: millis("STABILIZATION_TIMEOUT_MS", 180_000)?,
             stabilization_poll: millis("STABILIZATION_POLL_MS", 5_000)?,
             stabilization_required_samples: required_samples,
@@ -215,6 +218,17 @@ fn millis(name: &'static str, default: u64) -> Result<Duration, ConfigError> {
         return Err(ConfigError::Invalid {
             name,
             message: "must be between 100 and 600000 milliseconds".to_owned(),
+        });
+    }
+    Ok(Duration::from_millis(value))
+}
+
+fn long_millis(name: &'static str, default: u64) -> Result<Duration, ConfigError> {
+    let value = parse(name, default)?;
+    if !(100..=3_600_000).contains(&value) {
+        return Err(ConfigError::Invalid {
+            name,
+            message: "must be between 100 and 3600000 milliseconds".to_owned(),
         });
     }
     Ok(Duration::from_millis(value))

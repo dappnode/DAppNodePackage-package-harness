@@ -112,7 +112,7 @@ cargo build --release
 The `Makefile` provides matching development commands. To build the container and package scaffold:
 
 ```bash
-docker build -t package-harness.dnp.dappnode.eth:0.1.0 .
+docker build -t package-harness.dnp.dappnode.eth:0.1.1 .
 npx @dappnode/dappnodesdk@0.3.52 build --skip_save --skip_upload
 ```
 

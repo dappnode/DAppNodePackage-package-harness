@@ -40,7 +40,7 @@
   },
   "shortDescription": "Disposable-node upgrade tests for Dappnode package builds",
   "type": "service",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "warnings": {
     "onInstall": "This package performs destructive install, upgrade, removal, and volume-deletion operations. Use it only on a dedicated disposable test Dappnode and explicitly acknowledge destructive testing in the setup wizard.",
     "onRemove": "Removing the harness deletes its persisted run history. It does not automatically remove dependencies left behind by earlier package tests."

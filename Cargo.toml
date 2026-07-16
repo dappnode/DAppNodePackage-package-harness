@@ -1,6 +1,6 @@
 [package]
 name = "dappnode-package-harness"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.96"
 license = "GPL-3.0"
@@ -11,7 +11,7 @@ async-trait = "0.1.89"
 axum = { version = "0.8.8", features = ["json", "macros"] }
 chrono = { version = "0.4.42", features = ["serde"] }
 dotenvy = "0.15.7"
-dappnode-mcp-client = "0.1.0"
+dappnode-mcp-client = "0.1.1"
 dappnode-types = "0.1.0"
 futures-util = "0.3.31"
 hex = "0.4.3"

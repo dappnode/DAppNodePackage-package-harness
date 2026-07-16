@@ -287,9 +287,9 @@ dependencies = [
 
 [[package]]
 name = "dappnode-mcp-client"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "469ff2e4a4747e8b66cbc0a1af5aa50a31c5b5e71c10d109fb55d2209852492c"
+checksum = "bc79e6e97e3c60fb28f7215681e70759c685b186cb50e236abe8476c0790185d"
 dependencies = [
  "dappnode-types",
  "reqwest",
@@ -302,7 +302,7 @@ dependencies = [
 
 [[package]]
 name = "dappnode-package-harness"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -331,9 +331,9 @@ dependencies = [
 
 [[package]]
 name = "dappnode-types"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82188514300a7c5e1b8a39216ae2725e5736632d164f66537cc168b9a7a51b79"
+checksum = "2d8ed44fdd7c8b1a3e5c0d5fe9727a16123ff54b08e6a9f63f1bf64df9926ff6"
 dependencies = [
  "semver",
  "serde",

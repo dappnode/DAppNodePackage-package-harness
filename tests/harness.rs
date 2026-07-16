@@ -540,7 +540,7 @@ async fn coordinator_claims_with_required_headers_and_parses_response() -> Resul
         .and(path("/v1/package-harness/jobs/claim"))
         .and(header("authorization", "Bearer worker-secret"))
         .and(header("content-type", "application/json"))
-        .and(header("user-agent", "dappnode-package-harness/0.1.0"))
+        .and(header("user-agent", "dappnode-package-harness/0.1.1"))
         .and(body_json(
             json!({ "schemaVersion": 1, "workerId": "worker-01" }),
         ))

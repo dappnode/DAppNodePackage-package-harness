@@ -17,13 +17,13 @@ The harness has no public job-submission or GitHub API. It needs outbound HTTPS 
 For every accepted job, the deterministic controller:
 
 1. verifies Dappmanager MCP tools and target safety;
-2. checks whether the target is already installed; if so, records its exact version and uses it as the baseline;
-3. otherwise installs the latest registry baseline, or the explicit `baselineRef`;
+2. checks whether the target is already installed and records its exact version for restoration;
+3. uses that installation as the baseline when no explicit `baselineRef` was requested; otherwise it installs or applies the requested baseline;
 4. waits for a stable, non-empty all-running container set;
 5. captures normalized details and bounded, redacted log tails;
 6. upgrades the baseline in place to the candidate;
 7. repeats stabilization and capture, compares both observations, and performs optional Nexus analysis;
-8. restores a pre-existing target to its recorded version; otherwise removes only the target with `deleteVolumes: true`, and reports unexpected leftover dependencies.
+8. restores a pre-existing target to its recorded version; for allowlisted slow packages, retains that exact baseline for reuse; otherwise removes only the target with `deleteVolumes: true`; and fails cleanup when final inventory cannot be verified or contains unexpected dependencies.
 
 Nexus is advisory. With no key, the harness uses the heuristic analyzer only. With a key, it sends one bounded redacted request with no tools; Nexus failures fall back safely, and Nexus can never override a deterministic failure.
 
@@ -41,7 +41,7 @@ PACKAGE_HARNESS_HEARTBEAT_SECONDS=20
 
 The shared bearer token is appropriate for this small trusted v1 deployment. The protocol deliberately leaves room for later per-worker credentials or mTLS, but neither is part of this version. The worker never logs the token.
 
-Use [`.env.example`](.env.example) for all timeout, Dappmanager, cleanup, and optional Nexus settings. `MCP_TIMEOUT_MS` bounds read-only Dappmanager calls at 30 seconds by default, while `MCP_MUTATION_TIMEOUT_MS` gives installs, updates, and removals 30 minutes by default (up to one hour). `TROPIBOT_TIMEOUT_MS` bounds each coordinator request. The Dappmanager MCP token and Nexus key remain local and are never sent to Tropibot or persisted in a job record.
+Use [`.env.example`](.env.example) for all timeout, Dappmanager, cleanup, and optional Nexus settings. `MCP_TIMEOUT_MS` bounds read-only Dappmanager calls at 30 seconds by default, while `MCP_MUTATION_TIMEOUT_MS` gives each install, update, or removal attempt 30 minutes by default (up to one hour). Transient transport and package-download failures are retried three times with bounded exponential backoff; tune this with `MCP_MUTATION_ATTEMPTS` and `MCP_MUTATION_RETRY_DELAY_MS`. `RETAIN_BASELINE_PACKAGES` is a comma-separated allowlist for packages with expensive downloads: after the first successful baseline install, the harness records its exact version, restores it after candidate testing, and reuses it on later runs instead of removing and downloading it again. `TROPIBOT_TIMEOUT_MS` bounds each coordinator request. The Dappmanager MCP token and Nexus key remain local and are never sent to Tropibot or persisted in a job record.
 
 ## Local fake mode
 

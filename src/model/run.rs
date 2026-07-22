@@ -38,6 +38,24 @@ pub struct WorkerError {
     pub cleanup_status: CleanupStatus,
 }
 
+/// Destructive target state that restart recovery must reconcile.
+///
+/// This is persisted before each mutation. It replaces the ambiguous
+/// `cleanup_required + optional baseline` convention with an explicit action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum TargetRecoveryPlan {
+    /// The target did not exist before the run and must be removed.
+    Remove,
+    /// Return the target to an exact baseline. `retained` records that the
+    /// harness intentionally keeps a newly installed baseline as a local cache.
+    Restore {
+        baseline_ref: String,
+        #[serde(default)]
+        retained: bool,
+    },
+}
+
 /// Delivery state owned by the polling worker.
 ///
 /// `pending_completion_body` contains the exact serialized JSON body that
@@ -51,8 +69,12 @@ pub struct WorkerState {
     pub claim_token: Option<String>,
     /// Becomes true immediately before the worker can mutate the target.
     pub cleanup_required: bool,
+    /// Explicit recovery action persisted before target mutation.
+    #[serde(default)]
+    pub target_recovery: Option<TargetRecoveryPlan>,
     /// Exact package reference that was installed before this run. When set,
-    /// cleanup restores this package instead of removing it.
+    /// cleanup restores this package instead of removing it. Kept only for
+    /// backward-compatible recovery of records written by harness 0.1.1.
     #[serde(default)]
     pub baseline_restore_ref: Option<String>,
     /// A normal result is mutually exclusive with a worker error.
@@ -65,6 +87,31 @@ pub struct WorkerState {
     /// An unresolved cleanup or claim-reconciliation issue that requires an
     /// operator and keeps the worker out of ready state.
     pub manual_recovery_reason: Option<String>,
+}
+
+impl WorkerState {
+    /// Returns the explicit plan, falling back to the legacy restore field for
+    /// records persisted by older harness versions.
+    pub fn recovery_plan(&self) -> TargetRecoveryPlan {
+        self.target_recovery.clone().unwrap_or_else(|| {
+            self.baseline_restore_ref
+                .as_ref()
+                .map_or(TargetRecoveryPlan::Remove, |baseline_ref| {
+                    TargetRecoveryPlan::Restore {
+                        baseline_ref: baseline_ref.clone(),
+                        retained: false,
+                    }
+                })
+        })
+    }
+
+    pub fn set_recovery_plan(&mut self, plan: TargetRecoveryPlan) {
+        self.baseline_restore_ref = match &plan {
+            TargetRecoveryPlan::Restore { baseline_ref, .. } => Some(baseline_ref.clone()),
+            TargetRecoveryPlan::Remove => None,
+        };
+        self.target_recovery = Some(plan);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -64,7 +64,24 @@ pub async fn restore_target(
     baseline_ref: &PackageRef,
     timeout: Duration,
 ) -> CleanupResult {
-    if let Err(error) = package_manager.update_package(dnp_name, baseline_ref).await {
+    let installed = match package_manager.list_packages().await {
+        Ok(packages) => packages.iter().any(|package| &package.dnp_name == dnp_name),
+        Err(error) => {
+            return CleanupResult {
+                status: CleanupStatus::Failed,
+                leftover_packages: Vec::new(),
+                error: Some(truncate_utf8(&error.to_string(), 300)),
+            };
+        }
+    };
+    let restore = if installed {
+        package_manager.update_package(dnp_name, baseline_ref).await
+    } else {
+        package_manager
+            .install_package(dnp_name, Some(baseline_ref))
+            .await
+    };
+    if let Err(error) = restore {
         return CleanupResult {
             status: CleanupStatus::Failed,
             leftover_packages: Vec::new(),
@@ -110,6 +127,7 @@ pub async fn restore_target(
 pub fn leftover_packages(
     initial: &[PackageSummary],
     final_packages: &[PackageSummary],
+    retained_target: Option<&DnpName>,
 ) -> Vec<String> {
     let initial_names: BTreeSet<&str> = initial
         .iter()
@@ -117,7 +135,10 @@ pub fn leftover_packages(
         .collect();
     final_packages
         .iter()
-        .filter(|package| !initial_names.contains(package.dnp_name.as_str()))
+        .filter(|package| {
+            !initial_names.contains(package.dnp_name.as_str())
+                && retained_target != Some(&package.dnp_name)
+        })
         .map(|package| package.dnp_name.to_string())
         .collect()
 }

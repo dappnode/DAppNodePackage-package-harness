@@ -21,13 +21,13 @@ use crate::{
         CoordinatorError, WorkerErrorCompletion,
     },
     model::{
-        CleanupResult, CleanupStatus, ExecutionStatus, PackageRef, RunRecord, WorkerError,
-        WorkerErrorCode,
+        CleanupResult, CleanupStatus, ExecutionStatus, PackageRef, RunRecord, TargetRecoveryPlan,
+        WorkerError, WorkerErrorCode,
     },
     package_manager::PackageManager,
     runner::{
         RunController,
-        cleanup::{cleanup_target, restore_target},
+        cleanup::{cleanup_target, leftover_packages, restore_target},
     },
     storage::RunStore,
 };
@@ -396,21 +396,27 @@ impl PackageHarnessWorker {
         {
             return Err("refusing restart cleanup of a core package".to_owned());
         }
-        if packages.iter().any(|package| package.dnp_name == *target) {
-            record.cleanup = match record.worker.baseline_restore_ref.as_deref() {
-                Some(version) => {
-                    let baseline_ref = PackageRef::parse(version)
-                        .map_err(|error| format!("saved baseline reference is invalid: {error}"))?;
-                    restore_target(
-                        self.package_manager.as_ref(),
-                        Arc::clone(&self.clock),
-                        target,
-                        &baseline_ref,
-                        self.config.cleanup_timeout,
-                    )
-                    .await
-                }
-                None => {
+        let recovery_plan = record.worker.recovery_plan();
+        let retained_target = matches!(
+            recovery_plan,
+            TargetRecoveryPlan::Restore { retained: true, .. }
+        )
+        .then_some(target);
+        record.cleanup = match recovery_plan {
+            TargetRecoveryPlan::Restore { baseline_ref, .. } => {
+                let baseline_ref = PackageRef::parse(&baseline_ref)
+                    .map_err(|error| format!("saved baseline reference is invalid: {error}"))?;
+                restore_target(
+                    self.package_manager.as_ref(),
+                    Arc::clone(&self.clock),
+                    target,
+                    &baseline_ref,
+                    self.config.cleanup_timeout,
+                )
+                .await
+            }
+            TargetRecoveryPlan::Remove => {
+                if packages.iter().any(|package| package.dnp_name == *target) {
                     cleanup_target(
                         self.package_manager.as_ref(),
                         Arc::clone(&self.clock),
@@ -418,14 +424,44 @@ impl PackageHarnessWorker {
                         self.config.cleanup_timeout,
                     )
                     .await
+                } else {
+                    CleanupResult {
+                        status: CleanupStatus::Passed,
+                        leftover_packages: Vec::new(),
+                        error: None,
+                    }
                 }
-            };
-        } else {
-            record.cleanup = CleanupResult {
-                status: CleanupStatus::Passed,
-                leftover_packages: Vec::new(),
-                error: None,
-            };
+            }
+        };
+        match self.package_manager.list_packages().await {
+            Ok(final_packages) => {
+                record.cleanup.leftover_packages = leftover_packages(
+                    &record.evidence.initial_packages,
+                    &final_packages,
+                    retained_target,
+                );
+                if record.cleanup.status == CleanupStatus::Passed
+                    && !record.cleanup.leftover_packages.is_empty()
+                {
+                    record.cleanup.status = CleanupStatus::Failed;
+                    record.cleanup.error = Some(redact_and_bound(
+                        &format!(
+                            "restart cleanup left packages that were not present before the run: {}",
+                            record.cleanup.leftover_packages.join(", ")
+                        ),
+                        300,
+                    ));
+                }
+                record.evidence.final_packages = final_packages;
+            }
+            Err(error) => {
+                if record.cleanup.status == CleanupStatus::Passed {
+                    record.cleanup.status = CleanupStatus::Failed;
+                }
+                if record.cleanup.error.is_none() {
+                    record.cleanup.error = Some(redact_and_bound(&error.to_string(), 300));
+                }
+            }
         }
         self.store
             .save(record)

@@ -1,6 +1,9 @@
+use std::{future::Future, time::Duration};
+
 use async_trait::async_trait;
 use dappnode_mcp_client::{DappnodeMcpClient, DappnodeMcpError};
 use dappnode_types::{ContainerState, InstallOptions};
+use tracing::warn;
 
 use crate::{
     analysis::redaction::truncate_utf8,
@@ -10,20 +13,27 @@ use crate::{
     },
 };
 
-use super::{PackageManager, PackageManagerError, REQUIRED_MCP_TOOLS, ToolAvailability};
+use super::{
+    PackageManager, PackageManagerError, REQUIRED_MCP_TOOLS, ToolAvailability,
+    retryable_tool_message, retryable_transport_message,
+};
 
 #[derive(Clone)]
 pub struct DappmanagerPackageManager {
     client: DappnodeMcpClient,
     mutation_client: DappnodeMcpClient,
+    mutation_attempts: usize,
+    mutation_retry_delay: Duration,
 }
 
 impl DappmanagerPackageManager {
     pub fn new(
         url: String,
         token: String,
-        timeout: std::time::Duration,
-        mutation_timeout: std::time::Duration,
+        timeout: Duration,
+        mutation_timeout: Duration,
+        mutation_attempts: usize,
+        mutation_retry_delay: Duration,
     ) -> Result<Self, PackageManagerError> {
         crate::tls::ensure_crypto_provider();
         let client =
@@ -33,7 +43,53 @@ impl DappmanagerPackageManager {
         Ok(Self {
             client,
             mutation_client,
+            mutation_attempts,
+            mutation_retry_delay,
         })
+    }
+
+    async fn retry_mutation<Operation, OperationFuture, Reconcile, ReconcileFuture>(
+        &self,
+        tool: &'static str,
+        mut operation: Operation,
+        mut reconcile: Reconcile,
+    ) -> Result<(), DappnodeMcpError>
+    where
+        Operation: FnMut() -> OperationFuture,
+        OperationFuture: Future<Output = Result<(), DappnodeMcpError>>,
+        Reconcile: FnMut() -> ReconcileFuture,
+        ReconcileFuture: Future<Output = bool>,
+    {
+        for attempt in 1..=self.mutation_attempts {
+            match operation().await {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if attempt < self.mutation_attempts && retryable_mutation_error(&error) =>
+                {
+                    if reconcile().await {
+                        warn!(
+                            tool,
+                            attempt,
+                            error = %error,
+                            event = "mcp_mutation_reconciled"
+                        );
+                        return Ok(());
+                    }
+                    let delay = retry_delay(self.mutation_retry_delay, attempt);
+                    warn!(
+                        tool,
+                        attempt,
+                        max_attempts = self.mutation_attempts,
+                        retry_delay_ms = delay.as_millis(),
+                        error = %error,
+                        event = "mcp_mutation_retry"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("mutation attempts are validated to be non-zero")
     }
 }
 
@@ -161,8 +217,14 @@ impl PackageManager for DappmanagerPackageManager {
         let options = install_options(version);
         let user_settings = serde_json::Map::new();
         match self
-            .mutation_client
-            .install_package(dnp_name, version, &user_settings, options)
+            .retry_mutation(
+                "dappnode_install_package",
+                || {
+                    self.mutation_client
+                        .install_package(dnp_name, version, &user_settings, options)
+                },
+                || async { self.client.get_package_details(dnp_name).await.is_ok() },
+            )
             .await
         {
             Ok(()) => Ok(()),
@@ -180,16 +242,29 @@ impl PackageManager for DappmanagerPackageManager {
         version: &PackageRef,
     ) -> Result<(), PackageManagerError> {
         let options = install_options(Some(version));
-        self.mutation_client
-            .update_package(dnp_name, Some(version), options)
-            .await
-            .or_else(|error| {
-                if operation_in_progress_error(&error.to_string()) {
-                    Ok(())
-                } else {
-                    Err(package_error(error))
-                }
-            })
+        self.retry_mutation(
+            "dappnode_update_package",
+            || {
+                self.mutation_client
+                    .update_package(dnp_name, Some(version), options)
+            },
+            || async {
+                self.client
+                    .get_package_details(dnp_name)
+                    .await
+                    .ok()
+                    .and_then(|details| details.version)
+                    .is_some_and(|installed| installed.to_string() == version.as_str())
+            },
+        )
+        .await
+        .or_else(|error| {
+            if operation_in_progress_error(&error.to_string()) {
+                Ok(())
+            } else {
+                Err(package_error(error))
+            }
+        })
     }
 
     async fn remove_package(
@@ -197,16 +272,26 @@ impl PackageManager for DappmanagerPackageManager {
         dnp_name: &DnpName,
         delete_volumes: bool,
     ) -> Result<(), PackageManagerError> {
-        self.mutation_client
-            .remove_package(dnp_name, delete_volumes)
-            .await
-            .or_else(|error| {
-                if package_absent_error(&error.to_string()) {
-                    Ok(())
-                } else {
-                    Err(package_error(error))
-                }
-            })
+        self.retry_mutation(
+            "dappnode_remove_package",
+            || {
+                self.mutation_client
+                    .remove_package(dnp_name, delete_volumes)
+            },
+            || async {
+                self.client.list_packages().await.is_ok_and(|packages| {
+                    !packages.iter().any(|package| &package.dnp_name == dnp_name)
+                })
+            },
+        )
+        .await
+        .or_else(|error| {
+            if package_absent_error(&error.to_string()) {
+                Ok(())
+            } else {
+                Err(package_error(error))
+            }
+        })
     }
 }
 
@@ -275,13 +360,37 @@ fn package_absent_error(message: &str) -> bool {
         || lower.contains("not installed")
 }
 
+fn retryable_mutation_error(error: &DappnodeMcpError) -> bool {
+    match error {
+        DappnodeMcpError::Timeout { .. } => true,
+        DappnodeMcpError::Transport { message, .. } => retryable_transport_message(message),
+        DappnodeMcpError::Tool { message, .. } => retryable_tool_message(message),
+        DappnodeMcpError::Configuration { .. }
+        | DappnodeMcpError::InvalidArgument { .. }
+        | DappnodeMcpError::InvalidResponse { .. } => false,
+    }
+}
+
+fn retry_delay(initial: Duration, failed_attempt: usize) -> Duration {
+    let exponent = u32::try_from(failed_attempt.saturating_sub(1).min(6)).unwrap_or(6);
+    initial
+        .checked_mul(2_u32.saturating_pow(exponent))
+        .unwrap_or(Duration::from_secs(60))
+        .min(Duration::from_secs(60))
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error;
 
     use crate::model::{RunRequest, RunRequestDto};
 
-    use super::{install_options, operation_in_progress_error, package_absent_error};
+    use dappnode_mcp_client::DappnodeMcpError;
+
+    use super::{
+        install_options, operation_in_progress_error, package_absent_error,
+        retryable_mutation_error,
+    };
 
     #[test]
     fn detects_dappmanager_in_progress_errors() {
@@ -303,6 +412,34 @@ mod tests {
         ));
         assert!(package_absent_error("package was not found"));
         assert!(!package_absent_error("permission denied"));
+    }
+
+    #[test]
+    fn retries_transient_ipfs_and_transport_failures() {
+        assert!(retryable_mutation_error(&DappnodeMcpError::Tool {
+            tool: "dappnode_install_package".to_owned(),
+            message: "Can't download image: Could not get block QmExample".to_owned(),
+        }));
+        assert!(retryable_mutation_error(&DappnodeMcpError::Tool {
+            tool: "dappnode_install_package".to_owned(),
+            message: "terminated".to_owned(),
+        }));
+        assert!(retryable_mutation_error(&DappnodeMcpError::Transport {
+            operation: "connect".to_owned(),
+            message: "connection reset".to_owned(),
+        }));
+    }
+
+    #[test]
+    fn does_not_retry_authentication_or_validation_failures() {
+        assert!(!retryable_mutation_error(&DappnodeMcpError::Transport {
+            operation: "connect".to_owned(),
+            message: "HTTP 403 Forbidden".to_owned(),
+        }));
+        assert!(!retryable_mutation_error(&DappnodeMcpError::Tool {
+            tool: "dappnode_install_package".to_owned(),
+            message: "required setup values are missing".to_owned(),
+        }));
     }
 
     #[test]

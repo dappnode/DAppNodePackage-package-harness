@@ -130,7 +130,7 @@ pub async fn stabilize(
     StabilizationResult {
         passed: false,
         stable_samples: consecutive,
-        duration_ms: elapsed_ms(started, clock.now()).max(config.timeout.as_millis() as u64),
+        duration_ms: elapsed_ms(started, clock.now()),
         samples,
         last_non_running_states,
     }

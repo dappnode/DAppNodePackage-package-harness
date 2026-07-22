@@ -30,8 +30,7 @@ pub const REQUIRED_MCP_TOOLS: [&str; 7] = [
 ];
 
 /// Required tools that mutate packages or Docker state.
-pub const MUTATING_MCP_TOOLS: [&str; 4] = [
-    "dappnode_fetch_install_preview",
+pub const MUTATING_MCP_TOOLS: [&str; 3] = [
     "dappnode_install_package",
     "dappnode_update_package",
     "dappnode_remove_package",
@@ -88,6 +87,46 @@ pub enum PackageManagerError {
     RequiredSetup,
     #[error("package was not found")]
     NotFound,
+}
+
+impl PackageManagerError {
+    /// Whether repeating a package mutation may recover from this failure.
+    pub fn is_transient_mutation_failure(&self) -> bool {
+        match self {
+            Self::Timeout { .. } => true,
+            Self::Transport(message) => retryable_transport_message(message),
+            Self::Tool { message, .. } => retryable_tool_message(message),
+            Self::InvalidResponse { .. } | Self::RequiredSetup | Self::NotFound => false,
+        }
+    }
+}
+
+pub(crate) fn retryable_transport_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    !lower.contains("401")
+        && !lower.contains("403")
+        && !lower.contains("unauthorized")
+        && !lower.contains("forbidden")
+        && !lower.contains("not_logged_in")
+}
+
+pub(crate) fn retryable_tool_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "can't download",
+        "cannot download",
+        "could not get block",
+        "failed to fetch",
+        "connection reset",
+        "econnreset",
+        "socket hang up",
+        "temporarily unavailable",
+        "timed out",
+        "timeout",
+        "terminated",
+    ]
+    .iter()
+    .any(|signature| lower.contains(signature))
 }
 
 /// Capability surface required to install, observe, and clean up a package.

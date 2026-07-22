@@ -1,4 +1,4 @@
-use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{collections::BTreeSet, env, net::SocketAddr, path::PathBuf, time::Duration};
 
 use thiserror::Error;
 
@@ -31,12 +31,19 @@ pub struct Config {
     pub mcp_timeout: Duration,
     /// Timeout reserved for package installation, update, and removal calls.
     pub mcp_mutation_timeout: Duration,
+    /// Maximum number of attempts for transient package mutations.
+    pub mcp_mutation_attempts: usize,
+    /// Initial delay between transient mutation attempts. Later delays back off.
+    pub mcp_mutation_retry_delay: Duration,
     pub stabilization_timeout: Duration,
     pub stabilization_poll: Duration,
     pub stabilization_required_samples: usize,
     pub log_tail: usize,
     pub cleanup_enabled: bool,
     pub cleanup_timeout: Duration,
+    /// Packages whose first successful baseline should remain installed and
+    /// be restored after subsequent candidate tests.
+    pub retain_baseline_packages: BTreeSet<String>,
     pub nexus_api_key: Option<String>,
     pub nexus_base_url: String,
     pub nexus_model: String,
@@ -73,6 +80,13 @@ impl Config {
             return Err(ConfigError::Invalid {
                 name: "STABILIZATION_REQUIRED_SAMPLES",
                 message: "must be between 1 and 20".to_owned(),
+            });
+        }
+        let mutation_attempts = parse::<usize>("MCP_MUTATION_ATTEMPTS", 3)?;
+        if !(1..=10).contains(&mutation_attempts) {
+            return Err(ConfigError::Invalid {
+                name: "MCP_MUTATION_ATTEMPTS",
+                message: "must be between 1 and 10".to_owned(),
             });
         }
         let package_manager_mode = match env::var("PACKAGE_MANAGER_MODE")
@@ -115,12 +129,15 @@ impl Config {
             dappmanager_mcp_token: optional("DAPPMANAGER_MCP_TOKEN"),
             mcp_timeout: millis("MCP_TIMEOUT_MS", 30_000)?,
             mcp_mutation_timeout: long_millis("MCP_MUTATION_TIMEOUT_MS", 1_800_000)?,
+            mcp_mutation_attempts: mutation_attempts,
+            mcp_mutation_retry_delay: millis("MCP_MUTATION_RETRY_DELAY_MS", 5_000)?,
             stabilization_timeout: millis("STABILIZATION_TIMEOUT_MS", 180_000)?,
             stabilization_poll: millis("STABILIZATION_POLL_MS", 5_000)?,
             stabilization_required_samples: required_samples,
             log_tail,
             cleanup_enabled: bool_value("CLEANUP_ENABLED", true)?,
             cleanup_timeout: millis("CLEANUP_TIMEOUT_MS", 60_000)?,
+            retain_baseline_packages: package_list("RETAIN_BASELINE_PACKAGES")?,
             nexus_api_key: optional("NEXUS_API_KEY"),
             nexus_base_url: env::var("NEXUS_BASE_URL")
                 .unwrap_or_else(|_| "https://nexus-api.dappnode.com/v1".to_owned()),
@@ -151,6 +168,25 @@ impl Config {
         }
         None
     }
+}
+
+fn package_list(name: &'static str) -> Result<BTreeSet<String>, ConfigError> {
+    let Some(value) = optional(name) else {
+        return Ok(BTreeSet::new());
+    };
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            crate::model::DnpName::parse(value)
+                .map(|name| name.to_string())
+                .map_err(|error| ConfigError::Invalid {
+                    name,
+                    message: format!("invalid package '{value}': {error}"),
+                })
+        })
+        .collect()
 }
 
 #[derive(Debug, Error)]

@@ -478,14 +478,20 @@ impl PackageHarnessWorker {
         )
         .then_some(target);
         record.cleanup = match recovery_plan {
-            TargetRecoveryPlan::Restore { baseline_ref, .. } => {
+            TargetRecoveryPlan::Restore {
+                baseline_ref,
+                expected_version,
+                ..
+            } => {
                 let baseline_ref = PackageRef::parse(&baseline_ref)
                     .map_err(|error| format!("saved baseline reference is invalid: {error}"))?;
+                let expected_version = expected_version.as_deref().unwrap_or(baseline_ref.as_str());
                 restore_target(
                     self.package_manager.as_ref(),
                     Arc::clone(&self.clock),
                     target,
                     &baseline_ref,
+                    expected_version,
                     self.config.cleanup_timeout,
                 )
                 .await

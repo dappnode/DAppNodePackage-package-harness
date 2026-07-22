@@ -4,7 +4,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -13,7 +13,7 @@ use dappnode_package_harness::{
     analysis::{
         AnalyzerError, CompositeLogAnalyzer, HeuristicLogAnalyzer, LogAnalyzer, NexusLogAnalyzer,
     },
-    clock::Clock,
+    clock::{Clock, TokioClock},
     coordinator::protocol::{ClaimResponse, CompleteRequest, HeartbeatRequest},
     coordinator::{ClaimOutcome, CompletionDisposition, CoordinatorClient, HeartbeatOutcome},
     model::{
@@ -25,7 +25,7 @@ use dappnode_package_harness::{
     package_manager::{PackageManager, PackageManagerError, REQUIRED_MCP_TOOLS, ToolAvailability},
     runner::{
         NoopRunProgress, RunControl, RunController, RunProgress, RunnerConfig,
-        cleanup::restore_target,
+        cleanup::{cleanup_target, restore_target},
         stabilization::{StabilizationConfig, stabilize},
     },
     storage::{FileRunStore, RunStore},
@@ -64,6 +64,10 @@ struct ScriptedPackageManager {
     candidate_error: Option<PackageManagerError>,
     leave_extra_package: bool,
     core: bool,
+    restore_resolution: Option<(String, String)>,
+    list_packages_delay: Duration,
+    package_details_delay: Duration,
+    remove_leaves_installed: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -88,6 +92,10 @@ impl ScriptedPackageManager {
             candidate_error: None,
             leave_extra_package: false,
             core: false,
+            restore_resolution: None,
+            list_packages_delay: Duration::ZERO,
+            package_details_delay: Duration::ZERO,
+            remove_leaves_installed: false,
         }
     }
 
@@ -107,6 +115,11 @@ impl ScriptedPackageManager {
         state.version = version.to_owned();
         drop(state);
         Ok(self)
+    }
+
+    fn with_restore_resolution(mut self, version: &str, resolved_ref: &str) -> Self {
+        self.restore_resolution = Some((version.to_owned(), resolved_ref.to_owned()));
+        self
     }
 
     fn installed_version(&self) -> Result<Option<String>, PackageManagerError> {
@@ -133,6 +146,9 @@ impl PackageManager for ScriptedPackageManager {
     }
 
     async fn list_packages(&self) -> Result<Vec<PackageSummary>, PackageManagerError> {
+        if !self.list_packages_delay.is_zero() {
+            tokio::time::sleep(self.list_packages_delay).await;
+        }
         let state = self.state()?.clone();
         let mut packages = if state.installed || self.core {
             vec![PackageSummary {
@@ -162,6 +178,9 @@ impl PackageManager for ScriptedPackageManager {
         &self,
         dnp_name: &DnpName,
     ) -> Result<PackageDetails, PackageManagerError> {
+        if !self.package_details_delay.is_zero() {
+            tokio::time::sleep(self.package_details_delay).await;
+        }
         let state = self.state()?.clone();
         if !state.installed || dnp_name != &self.target {
             return Err(PackageManagerError::NotFound);
@@ -195,7 +214,12 @@ impl PackageManager for ScriptedPackageManager {
         Ok(PreviewSummary {
             package_name: Some(dnp_name.to_string()),
             version: version.map(ToString::to_string),
-            resolved_ref: version.map(ToString::to_string),
+            resolved_ref: version.map(|version| {
+                self.restore_resolution
+                    .as_ref()
+                    .filter(|(expected, _)| expected == version.as_str())
+                    .map_or_else(|| version.to_string(), |(_, resolved)| resolved.clone())
+            }),
             image_count: Some(1),
             requires_user_input: false,
             summary: "preview".to_owned(),
@@ -230,7 +254,11 @@ impl PackageManager for ScriptedPackageManager {
         state.installed =
             !(self.candidate_removes_target && version.as_str() == "/ipfs/QmCandidate");
         state.candidate = version.as_str() == "/ipfs/QmCandidate";
-        state.version = version.to_string();
+        state.version = self
+            .restore_resolution
+            .as_ref()
+            .filter(|(_, resolved)| resolved == version.as_str())
+            .map_or_else(|| version.to_string(), |(expected, _)| expected.clone());
         Ok(())
     }
 
@@ -247,7 +275,9 @@ impl PackageManager for ScriptedPackageManager {
                 message: "simulated cleanup failure".to_owned(),
             });
         }
-        state.installed = false;
+        if !self.remove_leaves_installed {
+            state.installed = false;
+        }
         Ok(())
     }
 }
@@ -466,6 +496,35 @@ async fn installed_target_is_used_as_baseline_and_restored() -> Result<(), Box<d
 }
 
 #[tokio::test]
+async fn semantic_downgrade_restores_by_immutable_origin() -> Result<(), Box<dyn Error>> {
+    let request = request("semantic-baseline-restore")?;
+    let manager = Arc::new(
+        ScriptedPackageManager::new(request.package.dnp_name.clone())
+            .with_installed_baseline("0.1.3")?
+            .with_restore_resolution("0.1.3", "/ipfs/QmBaselineOrigin"),
+    );
+
+    let (_directory, _store, record) =
+        execute_with(request, manager.clone(), &NoopRunProgress).await?;
+
+    assert_eq!(record.cleanup.status, CleanupStatus::Passed);
+    assert_eq!(
+        manager.update_versions()?,
+        vec!["/ipfs/QmCandidate", "/ipfs/QmBaselineOrigin"]
+    );
+    assert_eq!(manager.installed_version()?.as_deref(), Some("0.1.3"));
+    assert!(matches!(
+        record.worker.target_recovery,
+        Some(TargetRecoveryPlan::Restore {
+            baseline_ref,
+            expected_version: Some(expected_version),
+            retained: false,
+        }) if baseline_ref == "/ipfs/QmBaselineOrigin" && expected_version == "0.1.3"
+    ));
+    Ok(())
+}
+
+#[tokio::test]
 async fn expensive_baseline_is_retained_then_reused() -> Result<(), Box<dyn Error>> {
     let mut first_request = request("retained-baseline-first")?;
     first_request.package.baseline_ref = Some(PackageRef::parse("1.0.0")?);
@@ -492,8 +551,9 @@ async fn expensive_baseline_is_retained_then_reused() -> Result<(), Box<dyn Erro
         first.worker.target_recovery,
         Some(TargetRecoveryPlan::Restore {
             baseline_ref,
+            expected_version: Some(expected_version),
             retained: true,
-        }) if baseline_ref == "1.0.0"
+        }) if baseline_ref == "1.0.0" && expected_version == "1.0.0"
     ));
 
     let mut second_request = first_request;
@@ -528,6 +588,7 @@ fn legacy_worker_state_recovers_its_saved_baseline() -> Result<(), Box<dyn Error
         restored.recovery_plan(),
         TargetRecoveryPlan::Restore {
             baseline_ref: "1.2.3".to_owned(),
+            expected_version: None,
             retained: false,
         }
     );
@@ -575,6 +636,7 @@ async fn restoration_reinstalls_a_missing_preexisting_target() -> Result<(), Box
         Arc::new(ImmediateClock),
         &request.package.dnp_name,
         &baseline_ref,
+        baseline_ref.as_str(),
         Duration::from_millis(10),
     )
     .await;
@@ -583,6 +645,59 @@ async fn restoration_reinstalls_a_missing_preexisting_target() -> Result<(), Box
     assert_eq!(
         manager.installed_version()?.as_deref(),
         Some("/ipfs/QmOriginal")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn cleanup_deadline_includes_slow_inventory_calls() -> Result<(), Box<dyn Error>> {
+    let request = request("bounded-cleanup-verification")?;
+    let mut manager = ScriptedPackageManager::new(request.package.dnp_name.clone())
+        .with_installed_baseline("1.0.0")?;
+    manager.remove_leaves_installed = true;
+    manager.list_packages_delay = Duration::from_millis(400);
+    let started = Instant::now();
+
+    let cleanup = cleanup_target(
+        &manager,
+        Arc::new(TokioClock),
+        &request.package.dnp_name,
+        Duration::from_millis(600),
+    )
+    .await;
+
+    assert_eq!(cleanup.status, CleanupStatus::TimedOut);
+    assert!(
+        started.elapsed() < Duration::from_millis(1_100),
+        "cleanup verification exceeded its wall-clock deadline"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn restore_deadline_includes_slow_detail_calls() -> Result<(), Box<dyn Error>> {
+    let request = request("bounded-restore-verification")?;
+    let mut manager = ScriptedPackageManager::new(request.package.dnp_name.clone())
+        .with_installed_baseline("0.1.4")?
+        .with_restore_resolution("0.1.4", "/ipfs/QmBaselineOrigin");
+    manager.package_details_delay = Duration::from_millis(400);
+    let baseline_ref = PackageRef::parse("/ipfs/QmBaselineOrigin")?;
+    let started = Instant::now();
+
+    let cleanup = restore_target(
+        &manager,
+        Arc::new(TokioClock),
+        &request.package.dnp_name,
+        &baseline_ref,
+        "0.1.3",
+        Duration::from_millis(600),
+    )
+    .await;
+
+    assert_eq!(cleanup.status, CleanupStatus::TimedOut);
+    assert!(
+        started.elapsed() < Duration::from_millis(1_100),
+        "restore verification exceeded its wall-clock deadline"
     );
     Ok(())
 }

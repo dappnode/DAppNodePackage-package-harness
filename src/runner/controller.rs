@@ -165,28 +165,33 @@ impl RunController {
                 "Applying the persisted cleanup plan"
             );
             record.cleanup = match &recovery_plan {
-                TargetRecoveryPlan::Restore { baseline_ref, .. } => {
-                    match crate::model::PackageRef::parse(baseline_ref) {
-                        Ok(baseline_ref) => {
-                            restore_target(
-                                self.package_manager.as_ref(),
-                                Arc::clone(&self.clock),
-                                &package.dnp_name,
-                                &baseline_ref,
-                                self.config.cleanup_timeout,
-                            )
-                            .await
-                        }
-                        Err(error) => crate::model::CleanupResult {
-                            status: CleanupStatus::Failed,
-                            leftover_packages: Vec::new(),
-                            error: Some(truncate_utf8(
-                                &format!("saved baseline reference is invalid: {error}"),
-                                300,
-                            )),
-                        },
+                TargetRecoveryPlan::Restore {
+                    baseline_ref,
+                    expected_version,
+                    ..
+                } => match crate::model::PackageRef::parse(baseline_ref) {
+                    Ok(baseline_ref) => {
+                        let expected_version =
+                            expected_version.as_deref().unwrap_or(baseline_ref.as_str());
+                        restore_target(
+                            self.package_manager.as_ref(),
+                            Arc::clone(&self.clock),
+                            &package.dnp_name,
+                            &baseline_ref,
+                            expected_version,
+                            self.config.cleanup_timeout,
+                        )
+                        .await
                     }
-                }
+                    Err(error) => crate::model::CleanupResult {
+                        status: CleanupStatus::Failed,
+                        leftover_packages: Vec::new(),
+                        error: Some(truncate_utf8(
+                            &format!("saved baseline reference is invalid: {error}"),
+                            300,
+                        )),
+                    },
+                },
                 TargetRecoveryPlan::Remove if self.config.cleanup_enabled => {
                     cleanup_target(
                         self.package_manager.as_ref(),
@@ -508,6 +513,7 @@ impl RunController {
             dnp_name = %package.dnp_name,
             requested_ref = package.baseline_ref.as_ref().map_or("latest", crate::model::PackageRef::as_str),
             resolved_version = baseline_preview.version.as_deref().unwrap_or("unknown"),
+            resolved_ref = baseline_resolved_ref.as_deref().unwrap_or("unavailable"),
             reused_existing = reuse_installed_baseline,
             requires_user_input = baseline_preview.requires_user_input,
             "Baseline preview ready"
@@ -630,7 +636,8 @@ impl RunController {
                 event = "baseline_retained",
                 run_id = %record.request.run_id,
                 dnp_name = %package.dnp_name,
-                baseline_ref = %baseline_ref,
+                restore_ref = baseline_resolved_ref.as_deref().unwrap_or(baseline_ref.as_str()),
+                expected_version = %baseline_ref,
                 "Baseline will be retained and restored for future runs"
             );
         }

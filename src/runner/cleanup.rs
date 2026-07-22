@@ -54,11 +54,7 @@ pub async fn cleanup_target(
             break;
         }
         match tokio::time::timeout(remaining, package_manager.list_packages()).await {
-            Ok(Ok(packages))
-                if !packages
-                    .iter()
-                    .any(|package| &package.dnp_name == dnp_name) =>
-            {
+            Ok(Ok(packages)) if !packages.iter().any(|package| &package.dnp_name == dnp_name) => {
                 info!(
                     event = "cleanup_remove_verified",
                     dnp_name = %dnp_name,
@@ -132,10 +128,39 @@ pub async fn restore_target(
     timeout: Duration,
 ) -> CleanupResult {
     let started = clock.now();
+    let restore_ref = if baseline_ref.is_ipfs() {
+        baseline_ref.clone()
+    } else {
+        match package_manager
+            .preview_install(dnp_name, Some(baseline_ref))
+            .await
+        {
+            Ok(preview) => preview
+                .resolved_ref
+                .as_deref()
+                .and_then(|resolved| PackageRef::parse(resolved).ok())
+                .unwrap_or_else(|| baseline_ref.clone()),
+            Err(error) => {
+                warn!(
+                    event = "cleanup_restore_resolution_failed",
+                    dnp_name = %dnp_name,
+                    baseline_ref = %baseline_ref,
+                    expected_version,
+                    error = %error,
+                    "Could not resolve the baseline's immutable reference"
+                );
+                return CleanupResult {
+                    status: CleanupStatus::Failed,
+                    leftover_packages: Vec::new(),
+                    error: Some(truncate_utf8(&error.to_string(), 300)),
+                };
+            }
+        }
+    };
     info!(
         event = "cleanup_restore_started",
         dnp_name = %dnp_name,
-        baseline_ref = %baseline_ref,
+        baseline_ref = %restore_ref,
         expected_version,
         verification_timeout_ms = timeout.as_millis() as u64,
         "Restoring the exact baseline version"
@@ -163,7 +188,7 @@ pub async fn restore_target(
         info!(
             event = "cleanup_restore_already_complete",
             dnp_name = %dnp_name,
-            baseline_ref = %baseline_ref,
+            baseline_ref = %restore_ref,
             expected_version,
             duration_ms = elapsed_ms(started, clock.now()),
             "Target is already at the baseline version"
@@ -178,24 +203,24 @@ pub async fn restore_target(
     info!(
         event = "cleanup_restore_action_selected",
         dnp_name = %dnp_name,
-        baseline_ref = %baseline_ref,
+        baseline_ref = %restore_ref,
         expected_version,
         observed_version = installed_version.as_deref().unwrap_or("not_installed"),
         action = if installed { "update" } else { "install" },
         "Baseline restoration action selected"
     );
     let restore = if installed {
-        package_manager.update_package(dnp_name, baseline_ref).await
+        package_manager.update_package(dnp_name, &restore_ref).await
     } else {
         package_manager
-            .install_package(dnp_name, Some(baseline_ref))
+            .install_package(dnp_name, Some(&restore_ref))
             .await
     };
     if let Err(error) = restore {
         warn!(
             event = "cleanup_restore_failed",
             dnp_name = %dnp_name,
-            baseline_ref = %baseline_ref,
+            baseline_ref = %restore_ref,
             expected_version,
             duration_ms = elapsed_ms(started, clock.now()),
             error = %error,
@@ -222,7 +247,7 @@ pub async fn restore_target(
                 info!(
                     event = "cleanup_restore_verified",
                     dnp_name = %dnp_name,
-                    baseline_ref = %baseline_ref,
+                    baseline_ref = %restore_ref,
                     expected_version,
                     duration_ms = elapsed_ms(started, clock.now()),
                     verification_samples = attempt + 1,
@@ -239,7 +264,7 @@ pub async fn restore_target(
                     info!(
                         event = "cleanup_restore_waiting",
                         dnp_name = %dnp_name,
-                        baseline_ref = %baseline_ref,
+                        baseline_ref = %restore_ref,
                         expected_version,
                         observed_version = details.version.as_deref().unwrap_or("unknown"),
                         sample = attempt + 1,
@@ -265,7 +290,7 @@ pub async fn restore_target(
                 warn!(
                     event = "cleanup_restore_timed_out",
                     dnp_name = %dnp_name,
-                    baseline_ref = %baseline_ref,
+                    baseline_ref = %restore_ref,
                     expected_version,
                     duration_ms = elapsed_ms(started, clock.now()),
                     "Target did not return to its baseline version"
@@ -303,7 +328,7 @@ pub async fn restore_target(
     warn!(
         event = "cleanup_restore_timed_out",
         dnp_name = %dnp_name,
-        baseline_ref = %baseline_ref,
+        baseline_ref = %restore_ref,
         expected_version,
         duration_ms = elapsed_ms(started, clock.now()),
         "Target did not return to its baseline version"

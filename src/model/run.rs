@@ -78,9 +78,9 @@ pub struct WorkerState {
     /// Explicit recovery action persisted before target mutation.
     #[serde(default)]
     pub target_recovery: Option<TargetRecoveryPlan>,
-    /// Exact package reference that was installed before this run. When set,
-    /// cleanup restores this package instead of removing it. Kept only for
-    /// backward-compatible recovery of records written by harness 0.1.1.
+    /// Version that was installed before this run. When set, cleanup restores
+    /// this package instead of removing it. Kept only for backward-compatible
+    /// recovery of records written by harness 0.1.1.
     #[serde(default)]
     pub baseline_restore_ref: Option<String>,
     /// A normal result is mutually exclusive with a worker error.

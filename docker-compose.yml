@@ -1,3 +1,4 @@
+version: "3.5"
 services:
   package-harness:
     build:
@@ -16,7 +17,7 @@ services:
       MCP_MUTATION_TIMEOUT_MS: "1800000"
       MCP_MUTATION_ATTEMPTS: "3"
       MCP_MUTATION_RETRY_DELAY_MS: "5000"
-      RETAIN_BASELINE_PACKAGES: "${RETAIN_BASELINE_PACKAGES:-near.dnp.dappnode.eth}"
+      RETAIN_BASELINE_PACKAGES: "near.dnp.dappnode.eth"
       ALLOW_DESTRUCTIVE_PACKAGE_TESTS: "true"
       TROPIBOT_URL: ""
       PACKAGE_HARNESS_WORKER_ID: ""

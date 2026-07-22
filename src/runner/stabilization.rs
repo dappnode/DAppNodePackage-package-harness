@@ -1,10 +1,12 @@
 use std::{sync::Arc, time::Duration};
 
+use tracing::{info, warn};
+
 use crate::{
     clock::Clock,
     model::{DnpName, StabilizationResult, StabilizationSample},
     package_manager::PackageManager,
-    runner::RunProgress,
+    runner::{RunControl, RunProgress},
 };
 
 /// Polling policy for the container stabilization hard check.
@@ -40,8 +42,18 @@ pub async fn stabilize(
     let mut samples = Vec::new();
     let mut last_non_running_states = Vec::new();
 
+    info!(
+        event = "stabilization_started",
+        dnp_name = %dnp_name,
+        timeout_ms = config.timeout.as_millis() as u64,
+        poll_interval_ms = config.poll_interval.as_millis() as u64,
+        required_stable_samples = config.required_samples,
+        max_attempts,
+        "[wait] Waiting for a stable, all-running container set"
+    );
+
     for attempt in 0..max_attempts {
-        if !matches!(progress.control(), crate::runner::RunControl::Continue) {
+        if !matches!(progress.control(), RunControl::Continue) {
             break;
         }
         let observed_at = clock.now().to_rfc3339();
@@ -82,6 +94,20 @@ pub async fn stabilize(
                     consecutive = 0;
                     expected_names = None;
                 }
+                info!(
+                    event = "stabilization_sample",
+                    dnp_name = %dnp_name,
+                    sample = attempt + 1,
+                    max_attempts,
+                    container_count = details.containers.len(),
+                    container_names = ?names,
+                    all_running,
+                    stable_samples = consecutive,
+                    required_stable_samples = config.required_samples,
+                    non_running = ?non_running,
+                    elapsed_ms = elapsed_ms(started, clock.now()),
+                    "[sample] Container health sample collected"
+                );
                 push_sample(
                     &mut samples,
                     StabilizationSample {
@@ -93,10 +119,20 @@ pub async fn stabilize(
                     },
                 );
                 if consecutive >= config.required_samples {
+                    let duration_ms = elapsed_ms(started, clock.now());
+                    info!(
+                        event = "stabilization_succeeded",
+                        dnp_name = %dnp_name,
+                        duration_ms,
+                        samples = attempt + 1,
+                        stable_samples = consecutive,
+                        container_count = details.containers.len(),
+                        "[ok] Containers are stable and running"
+                    );
                     return StabilizationResult {
                         passed: true,
                         stable_samples: consecutive,
-                        duration_ms: elapsed_ms(started, clock.now()),
+                        duration_ms,
                         samples,
                         last_non_running_states,
                     };
@@ -105,6 +141,15 @@ pub async fn stabilize(
             Err(error) => {
                 consecutive = 0;
                 expected_names = None;
+                warn!(
+                    event = "stabilization_sample_failed",
+                    dnp_name = %dnp_name,
+                    sample = attempt + 1,
+                    max_attempts,
+                    elapsed_ms = elapsed_ms(started, clock.now()),
+                    error = %error,
+                    "[warn] Could not inspect containers; stability streak reset"
+                );
                 push_sample(
                     &mut samples,
                     StabilizationSample {
@@ -122,15 +167,28 @@ pub async fn stabilize(
         }
         if attempt + 1 < max_attempts {
             clock.sleep(config.poll_interval).await;
-            if !matches!(progress.control(), crate::runner::RunControl::Continue) {
+            if !matches!(progress.control(), RunControl::Continue) {
                 break;
             }
         }
     }
+    let duration_ms = elapsed_ms(started, clock.now());
+    let control = progress.control();
+    warn!(
+        event = "stabilization_incomplete",
+        dnp_name = %dnp_name,
+        duration_ms,
+        samples = samples.len(),
+        stable_samples = consecutive,
+        required_stable_samples = config.required_samples,
+        last_non_running = ?last_non_running_states,
+        control = ?control,
+        "[error] Containers did not reach the required stable state"
+    );
     StabilizationResult {
         passed: false,
         stable_samples: consecutive,
-        duration_ms: elapsed_ms(started, clock.now()),
+        duration_ms,
         samples,
         last_non_running_states,
     }

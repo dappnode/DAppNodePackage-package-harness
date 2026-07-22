@@ -1,12 +1,15 @@
-use std::{future::Future, time::Duration};
+use std::{
+    future::Future,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use dappnode_mcp_client::{DappnodeMcpClient, DappnodeMcpError};
 use dappnode_types::{ContainerState, InstallOptions};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{
-    analysis::redaction::truncate_utf8,
+    analysis::redaction::{redact_and_bound, truncate_utf8},
     model::{
         ContainerLog, ContainerSnapshot, DnpName, PackageDetails, PackageLogs, PackageRef,
         PackageSummary, PreviewSummary,
@@ -22,6 +25,7 @@ use super::{
 pub struct DappmanagerPackageManager {
     client: DappnodeMcpClient,
     mutation_client: DappnodeMcpClient,
+    mutation_timeout: Duration,
     mutation_attempts: usize,
     mutation_retry_delay: Duration,
 }
@@ -43,6 +47,7 @@ impl DappmanagerPackageManager {
         Ok(Self {
             client,
             mutation_client,
+            mutation_timeout,
             mutation_attempts,
             mutation_retry_delay,
         })
@@ -51,6 +56,8 @@ impl DappmanagerPackageManager {
     async fn retry_mutation<Operation, OperationFuture, Reconcile, ReconcileFuture>(
         &self,
         tool: &'static str,
+        dnp_name: &DnpName,
+        requested_ref: Option<&str>,
         mut operation: Operation,
         mut reconcile: Reconcile,
     ) -> Result<(), DappnodeMcpError>
@@ -61,32 +68,78 @@ impl DappmanagerPackageManager {
         ReconcileFuture: Future<Output = bool>,
     {
         for attempt in 1..=self.mutation_attempts {
+            let started = Instant::now();
+            info!(
+                event = "mcp_mutation_attempt_started",
+                tool,
+                dnp_name = %dnp_name,
+                requested_ref = requested_ref.unwrap_or("none"),
+                attempt,
+                max_attempts = self.mutation_attempts,
+                timeout_ms = self.mutation_timeout.as_millis() as u64,
+                "[mutation] Dappmanager attempt started"
+            );
             match operation().await {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    info!(
+                        event = "mcp_mutation_attempt_succeeded",
+                        tool,
+                        dnp_name = %dnp_name,
+                        requested_ref = requested_ref.unwrap_or("none"),
+                        attempt,
+                        duration_ms = started.elapsed().as_millis() as u64,
+                        "[ok] Dappmanager mutation completed"
+                    );
+                    return Ok(());
+                }
                 Err(error)
                     if attempt < self.mutation_attempts && retryable_mutation_error(&error) =>
                 {
+                    let safe_error = redact_and_bound(&error.to_string(), 500);
                     if reconcile().await {
-                        warn!(
+                        info!(
+                            event = "mcp_mutation_reconciled",
                             tool,
+                            dnp_name = %dnp_name,
+                            requested_ref = requested_ref.unwrap_or("none"),
                             attempt,
-                            error = %error,
-                            event = "mcp_mutation_reconciled"
+                            duration_ms = started.elapsed().as_millis() as u64,
+                            error = %safe_error,
+                            "[ok] Timed-out mutation had already reached the requested state"
                         );
                         return Ok(());
                     }
                     let delay = retry_delay(self.mutation_retry_delay, attempt);
                     warn!(
+                        event = "mcp_mutation_retry",
                         tool,
+                        dnp_name = %dnp_name,
+                        requested_ref = requested_ref.unwrap_or("none"),
                         attempt,
                         max_attempts = self.mutation_attempts,
+                        attempt_duration_ms = started.elapsed().as_millis() as u64,
                         retry_delay_ms = delay.as_millis(),
-                        error = %error,
-                        event = "mcp_mutation_retry"
+                        error = %safe_error,
+                        "[retry] Transient Dappmanager mutation failure; retry scheduled"
                     );
                     tokio::time::sleep(delay).await;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    let safe_error = redact_and_bound(&error.to_string(), 500);
+                    warn!(
+                        event = "mcp_mutation_attempt_failed",
+                        tool,
+                        dnp_name = %dnp_name,
+                        requested_ref = requested_ref.unwrap_or("none"),
+                        attempt,
+                        max_attempts = self.mutation_attempts,
+                        duration_ms = started.elapsed().as_millis() as u64,
+                        retryable = retryable_mutation_error(&error),
+                        error = %safe_error,
+                        "[error] Dappmanager mutation failed"
+                    );
+                    return Err(error);
+                }
             }
         }
         unreachable!("mutation attempts are validated to be non-zero")
@@ -219,6 +272,8 @@ impl PackageManager for DappmanagerPackageManager {
         match self
             .retry_mutation(
                 "dappnode_install_package",
+                dnp_name,
+                version.map(PackageRef::as_str),
                 || {
                     self.mutation_client
                         .install_package(dnp_name, version, &user_settings, options)
@@ -244,6 +299,8 @@ impl PackageManager for DappmanagerPackageManager {
         let options = install_options(Some(version));
         self.retry_mutation(
             "dappnode_update_package",
+            dnp_name,
+            Some(version.as_str()),
             || {
                 self.mutation_client
                     .update_package(dnp_name, Some(version), options)
@@ -274,6 +331,8 @@ impl PackageManager for DappmanagerPackageManager {
     ) -> Result<(), PackageManagerError> {
         self.retry_mutation(
             "dappnode_remove_package",
+            dnp_name,
+            None,
             || {
                 self.mutation_client
                     .remove_package(dnp_name, delete_volumes)

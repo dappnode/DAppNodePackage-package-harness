@@ -59,6 +59,12 @@ cargo run
 
 The fake package manager makes ordinary candidates pass. A candidate reference containing `unstable` simulates non-running containers and `install-error` simulates a failed upgrade; both paths still run cleanup.
 
+## Operational logs
+
+The default `info` logs are a human-readable execution narrative while retaining searchable `event`, `run_id`, package, duration, attempt, and status fields. Long MCP mutations announce every attempt and configured deadline; active jobs emit a heartbeat liveness line about once per minute; stabilization logs each bounded container-health sample; Nexus logs its model, input size, timeout, duration, and fallback error; and cleanup reports both its selected recovery action and final inventory verification. Credentials and raw package evidence are never logged.
+
+Set `RUST_LOG=dappnode_package_harness=debug,tower_http=info` for polling and persistence diagnostics. The normal package default remains `info` to avoid logging an empty Tropibot poll on every interval.
+
 ## Tropibot protocol and recovery
 
 The worker uses the fixed v1 paths:

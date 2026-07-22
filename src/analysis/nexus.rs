@@ -1,7 +1,8 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tracing::{info, warn};
 
 use crate::{
     analysis::{heuristic::analyze_heuristically, redaction::truncate_utf8},
@@ -102,37 +103,72 @@ impl LogAnalyzer for NexusLogAnalyzer {
             temperature: 0.0,
             tool_choice: "none",
         };
-        let response = tokio::time::timeout(
-            self.timeout,
-            self.client
-                .post(format!("{}/chat/completions", self.base_url))
-                .bearer_auth(&self.api_key)
-                .json(&request)
-                .send(),
-        )
-        .await
-        .map_err(|_| AnalyzerError::Timeout)?
-        .map_err(|error| AnalyzerError::Transport(error.to_string()))?;
-        if !response.status().is_success() {
-            return Err(AnalyzerError::Transport(format!(
-                "Nexus returned HTTP {}",
-                response.status().as_u16()
-            )));
-        }
-        let response: ChatResponse = response
-            .json()
+        let started = Instant::now();
+        info!(
+            event = "nexus_analysis_started",
+            model = %self.model,
+            endpoint = %self.base_url,
+            timeout_ms = self.timeout.as_millis() as u64,
+            input_bytes = bounded.len(),
+            input_truncated = input_json.len() > bounded.len(),
+            baseline_log_blocks = input.baseline.len(),
+            candidate_log_blocks = input.candidate.len(),
+            "[analysis] Nexus request started"
+        );
+        let result: Result<LogAnalysisResult, AnalyzerError> = async {
+            let response = tokio::time::timeout(
+                self.timeout,
+                self.client
+                    .post(format!("{}/chat/completions", self.base_url))
+                    .bearer_auth(&self.api_key)
+                    .json(&request)
+                    .send(),
+            )
             .await
-            .map_err(|error| AnalyzerError::InvalidResponse(error.to_string()))?;
-        let content = response
-            .choices
-            .first()
-            .map(|choice| choice.message.content.as_str())
-            .ok_or_else(|| AnalyzerError::InvalidResponse("missing choice content".to_owned()))?;
-        let mut result: LogAnalysisResult = serde_json::from_str(content)
-            .map_err(|error| AnalyzerError::InvalidResponse(error.to_string()))?;
-        validate_result(&result)?;
-        result.analyzer = AnalyzerKind::Nexus;
-        Ok(result)
+            .map_err(|_| AnalyzerError::Timeout)?
+            .map_err(|error| AnalyzerError::Transport(error.to_string()))?;
+            if !response.status().is_success() {
+                return Err(AnalyzerError::Transport(format!(
+                    "Nexus returned HTTP {}",
+                    response.status().as_u16()
+                )));
+            }
+            let response: ChatResponse = response
+                .json()
+                .await
+                .map_err(|error| AnalyzerError::InvalidResponse(error.to_string()))?;
+            let content = response
+                .choices
+                .first()
+                .map(|choice| choice.message.content.as_str())
+                .ok_or_else(|| {
+                    AnalyzerError::InvalidResponse("missing choice content".to_owned())
+                })?;
+            let mut result: LogAnalysisResult = serde_json::from_str(content)
+                .map_err(|error| AnalyzerError::InvalidResponse(error.to_string()))?;
+            validate_result(&result)?;
+            result.analyzer = AnalyzerKind::Nexus;
+            Ok(result)
+        }
+        .await;
+        match &result {
+            Ok(result) => info!(
+                event = "nexus_analysis_succeeded",
+                model = %self.model,
+                duration_ms = started.elapsed().as_millis() as u64,
+                status = ?result.status,
+                findings = result.new_findings.len(),
+                "[ok] Nexus analysis completed"
+            ),
+            Err(error) => warn!(
+                event = "nexus_analysis_failed",
+                model = %self.model,
+                duration_ms = started.elapsed().as_millis() as u64,
+                error = %error,
+                "[warn] Nexus analysis unavailable; heuristic fallback will be used"
+            ),
+        }
+        result
     }
 }
 

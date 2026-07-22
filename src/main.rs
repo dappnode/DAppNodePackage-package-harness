@@ -33,16 +33,32 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug")),
         )
+        // Event names and fields preserve machine-searchable structure. Hiding
+        // Rust module targets makes the default Docker log view much easier to
+        // scan; module-specific RUST_LOG filters continue to work normally.
+        .with_target(false)
+        .with_ansi(false)
+        .compact()
         .init();
 
     let config = Arc::new(Config::from_env()?);
     info!(
-        event = "config_loaded",
+        event = "harness_starting",
+        version = env!("CARGO_PKG_VERSION"),
+        worker_id = %config.package_harness_worker_id,
         listen_addr = %config.listen_addr,
         data_dir = %config.data_dir.display(),
+        "[startup] Package Harness starting"
+    );
+    info!(
+        event = "execution_policy_loaded",
         harness_dnp_name = %config.harness_dnp_name,
         package_manager_mode = ?config.package_manager_mode,
         destructive_tests_allowed = config.allow_destructive_tests,
+        mcp_read_timeout_ms = config.mcp_timeout.as_millis() as u64,
+        mcp_mutation_timeout_ms = config.mcp_mutation_timeout.as_millis() as u64,
+        mcp_mutation_attempts = config.mcp_mutation_attempts,
+        mcp_mutation_retry_delay_ms = config.mcp_mutation_retry_delay.as_millis() as u64,
         stabilization_timeout_ms = config.stabilization_timeout.as_millis() as u64,
         stabilization_poll_ms = config.stabilization_poll.as_millis() as u64,
         stabilization_required_samples = config.stabilization_required_samples,
@@ -50,9 +66,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         cleanup_timeout_ms = config.cleanup_timeout.as_millis() as u64,
         retained_baseline_packages = ?config.retain_baseline_packages,
         log_tail_lines = config.log_tail,
+        "  Execution policy loaded"
+    );
+    info!(
+        event = "integration_policy_loaded",
         poll_seconds = config.package_harness_poll.as_secs(),
         heartbeat_seconds = config.package_harness_heartbeat.as_secs(),
         nexus_enabled = config.nexus_api_key.is_some(),
+        nexus_model = %config.nexus_model,
+        nexus_timeout_ms = config.nexus_timeout.as_millis() as u64,
+        nexus_max_input_bytes = config.nexus_max_input_bytes,
+        "  Coordinator and analyzer policy loaded"
     );
     let package_manager = package_manager(&config);
     debug!(
@@ -63,7 +87,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return mcp_smoke(package_manager).await;
     }
     let store: Arc<dyn RunStore> = Arc::new(FileRunStore::new(config.data_dir.clone()).await?);
-    info!(event = "run_store_ready", data_dir = %config.data_dir.display());
+    info!(
+        event = "run_store_ready",
+        data_dir = %config.data_dir.display(),
+        "[ready] Local run store ready"
+    );
     let clock: Arc<dyn Clock> = Arc::new(TokioClock);
     let controller = Arc::new(RunController::new(
         Arc::clone(&package_manager),
@@ -95,7 +123,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tropibot_url = %config.tropibot_url,
         worker_id = %config.package_harness_worker_id,
         tropibot_timeout_ms = config.tropibot_timeout.as_millis() as u64,
-        mcp_enabled = config.dappmanager_mcp_url.is_some(),
+        mcp_enabled = config.package_manager_mode == PackageManagerMode::Mcp,
+        "[ready] Tropibot coordinator client ready"
     );
     let accepting = Arc::new(AtomicBool::new(true));
     let worker_readiness = WorkerReadiness::default();
@@ -126,19 +155,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
         worker_readiness,
     };
     let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
-    info!(address = %config.listen_addr, event = "supervision_server_started");
+    info!(
+        address = %config.listen_addr,
+        event = "supervision_server_started",
+        "[ready] Supervision server listening"
+    );
     debug!(event = "supervision_server_binding_complete");
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown_signal(Arc::clone(&accepting)))
         .await?;
-    info!(event = "supervision_server_stopped");
+    info!(
+        event = "supervision_server_stopped",
+        "[stop] Supervision server stopped"
+    );
     match tokio::time::timeout(Duration::from_secs(300), worker).await {
         Ok(result) => {
-            info!(event = "worker_shutdown_complete");
+            info!(
+                event = "worker_shutdown_complete",
+                "[ok] Worker shutdown complete"
+            );
             result?;
         }
         Err(_) => {
-            error!(event = "worker_shutdown_timeout", timeout_seconds = 300);
+            error!(
+                event = "worker_shutdown_timeout",
+                timeout_seconds = 300,
+                "[error] Worker did not stop within the shutdown deadline"
+            );
         }
     }
     Ok(())
@@ -225,5 +268,8 @@ async fn shutdown_signal(accepting: Arc<AtomicBool>) {
         () = terminate => {}
     }
     accepting.store(false, Ordering::SeqCst);
-    info!(event = "shutdown_started");
+    info!(
+        event = "shutdown_started",
+        "[shutdown] Shutdown requested; finishing safe work"
+    );
 }

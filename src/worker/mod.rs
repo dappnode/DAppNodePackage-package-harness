@@ -124,11 +124,29 @@ impl PackageHarnessWorker {
     /// action is needed. Errors that make another claim unsafe become a local
     /// not-ready reason instead of being silently skipped.
     pub async fn run(self) {
+        info!(
+            event = "worker_recovery_started",
+            worker_id = %self.config.worker_id,
+            "[recovery] Checking local state before polling for work"
+        );
         if let Err(error) = self.recover().await {
+            error!(
+                event = "worker_recovery_failed",
+                worker_id = %self.config.worker_id,
+                error = %error,
+                "[error] Worker requires operator recovery and will not claim work"
+            );
             self.readiness.set_not_ready(error);
             return;
         }
         self.readiness.clear();
+        info!(
+            event = "worker_polling_started",
+            worker_id = %self.config.worker_id,
+            poll_interval_seconds = self.config.poll_interval.as_secs(),
+            heartbeat_interval_seconds = self.config.heartbeat_interval.as_secs(),
+            "[ready] Recovery complete; polling Tropibot for package jobs"
+        );
         let mut transient_attempt = 0_u32;
         while self.accepting.load(Ordering::SeqCst) {
             match self.coordinator.claim().await {
@@ -146,11 +164,17 @@ impl PackageHarnessWorker {
                         event = "claim_succeeded",
                         run_id = %job.request.run_id,
                         dnp_name = %job.request.package.dnp_name,
+                        repository = %job.request.source.repository,
+                        pull_request = job.request.source.pull_request,
+                        candidate_ref = %job.request.package.candidate_ref,
+                        baseline_ref = job.request.package.baseline_ref.as_ref().map_or("latest", PackageRef::as_str),
+                        "[job] Claimed package validation job"
                     );
                     if let Err(error) = self.process_claim(job).await {
                         error!(
                             event = "claim_processing_failed",
                             error = %error,
+                            "[error] Claimed job could not be completed safely"
                         );
                         self.readiness.set_not_ready(error);
                         return;
@@ -160,13 +184,17 @@ impl PackageHarnessWorker {
                     error!(
                         event = "claim_authentication_failed",
                         status = status.as_u16(),
+                        "[error] Tropibot rejected worker authentication; polling stopped"
                     );
                     self.readiness
                         .set_not_ready("Tropibot rejected worker authentication; polling stopped");
                     return;
                 }
                 Err(CoordinatorError::UnresolvedJob) => {
-                    error!(event = "claim_unresolved_job");
+                    error!(
+                        event = "claim_unresolved_job",
+                        "[error] Tropibot reports an unresolved job with no matching local record"
+                    );
                     self.readiness.set_not_ready(
                         "Tropibot reports an unresolved job but no recoverable local record exists",
                     );
@@ -178,6 +206,7 @@ impl PackageHarnessWorker {
                         event = "claim_transient_failure",
                         attempt = transient_attempt,
                         error = %error,
+                        "[warn] Tropibot claim failed transiently; polling will retry"
                     );
                     tokio::time::sleep(retry_delay(
                         self.config.poll_interval,
@@ -190,6 +219,7 @@ impl PackageHarnessWorker {
                     error!(
                         event = "claim_failed",
                         error = %error,
+                        "[error] Tropibot claim failed permanently; polling stopped"
                     );
                     self.readiness
                         .set_not_ready(format!("Tropibot claim failed: {error}"));
@@ -205,6 +235,12 @@ impl PackageHarnessWorker {
             .create(&record)
             .await
             .map_err(|error| format!("cannot persist claimed job before execution: {error}"))?;
+        info!(
+            event = "claim_persisted",
+            run_id = %record.request.run_id,
+            dnp_name = %record.request.package.dnp_name,
+            "[job] Claim persisted; destructive execution may now begin"
+        );
 
         let unsupported_job = match self.unsupported_job_reason(&record).await {
             Ok(reason) => reason,
@@ -221,6 +257,12 @@ impl PackageHarnessWorker {
         }
 
         let progress = WorkerProgress::new();
+        info!(
+            event = "heartbeat_started",
+            run_id = %record.request.run_id,
+            interval_seconds = self.config.heartbeat_interval.as_secs(),
+            "[heartbeat] Supervision started"
+        );
         let heartbeat = HeartbeatTask::start(
             self.coordinator.clone(),
             record.request.run_id.to_string(),
@@ -237,6 +279,11 @@ impl PackageHarnessWorker {
             .execute(&record.request.run_id, progress.as_ref())
             .await;
         heartbeat.stop().await;
+        info!(
+            event = "heartbeat_stopped",
+            run_id = %record.request.run_id,
+            "[heartbeat] Supervision stopped"
+        );
 
         record = self
             .store
@@ -246,7 +293,12 @@ impl PackageHarnessWorker {
             .ok_or("executed job disappeared from local storage")?;
 
         if let Err(error) = execution {
-            error!(run_id = %record.request.run_id, event = "run_worker_error", error = %error);
+            error!(
+                run_id = %record.request.run_id,
+                event = "run_worker_error",
+                error = %error,
+                "[error] Controller execution failed; attempting target recovery"
+            );
             if let Err(recovery_error) = self.recover_target_if_required(&mut record).await {
                 let reason = self
                     .mark_manual_recovery(
@@ -300,6 +352,11 @@ impl PackageHarnessWorker {
             .load_all()
             .await
             .map_err(|error| format!("cannot load local worker records: {error}"))?;
+        info!(
+            event = "recovery_records_loaded",
+            record_count = records.len(),
+            "[recovery] Local worker records inspected"
+        );
         let unresolved = records
             .into_iter()
             .filter(RunRecord::requires_worker_attention)
@@ -310,8 +367,22 @@ impl PackageHarnessWorker {
             );
         }
         let Some(mut record) = unresolved.into_iter().next() else {
+            info!(
+                event = "recovery_not_required",
+                "[ok] No interrupted jobs require recovery"
+            );
             return Ok(());
         };
+        warn!(
+            event = "recovery_job_found",
+            run_id = %record.request.run_id,
+            dnp_name = %record.request.package.dnp_name,
+            status = ?record.status,
+            phase = ?record.phase,
+            cleanup_required = record.worker.cleanup_required,
+            pending_completion = record.worker.pending_completion_body.is_some(),
+            "[warn] Found an unresolved local job; reconciling before polling"
+        );
         if record.worker.manual_recovery_reason.is_some() {
             return Err(record
                 .worker
@@ -397,6 +468,13 @@ impl PackageHarnessWorker {
             return Err("refusing restart cleanup of a core package".to_owned());
         }
         let recovery_plan = record.worker.recovery_plan();
+        info!(
+            event = "restart_cleanup_started",
+            run_id = %record.request.run_id,
+            dnp_name = %target,
+            recovery_plan = ?recovery_plan,
+            "[cleanup] Restart recovery is reconciling the target package"
+        );
         let retained_target = matches!(
             recovery_plan,
             TargetRecoveryPlan::Restore { retained: true, .. }
@@ -467,6 +545,26 @@ impl PackageHarnessWorker {
             .save(record)
             .await
             .map_err(|error| format!("cannot persist restart cleanup result: {error}"))?;
+        if record.cleanup.status == CleanupStatus::Passed {
+            info!(
+                event = "restart_cleanup_finished",
+                run_id = %record.request.run_id,
+                dnp_name = %target,
+                status = ?record.cleanup.status,
+                leftover_packages = ?record.cleanup.leftover_packages,
+                "[ok] Restart cleanup reconciliation finished"
+            );
+        } else {
+            warn!(
+                event = "restart_cleanup_failed",
+                run_id = %record.request.run_id,
+                dnp_name = %target,
+                status = ?record.cleanup.status,
+                leftover_packages = ?record.cleanup.leftover_packages,
+                error = record.cleanup.error.as_deref().unwrap_or("unknown cleanup error"),
+                "[error] Restart cleanup reconciliation failed"
+            );
+        }
         Ok(())
     }
 
@@ -501,6 +599,13 @@ impl PackageHarnessWorker {
                 .ok_or("pending completion unexpectedly missing")?
                 .as_bytes()
                 .to_vec();
+            info!(
+                event = "completion_delivery_started",
+                run_id = %record.request.run_id,
+                attempt = transient_attempt.saturating_add(1),
+                payload_bytes = body.len(),
+                "[delivery] Delivering persisted completion to Tropibot"
+            );
             match self
                 .coordinator
                 .complete_raw(&record.request.run_id.to_string(), body)
@@ -519,7 +624,8 @@ impl PackageHarnessWorker {
                     info!(
                         run_id = %record.request.run_id,
                         event = "completion_acknowledged",
-                        disposition = ?record.worker.completion_disposition
+                        disposition = ?record.worker.completion_disposition,
+                        "[ok] Tropibot acknowledged the package result"
                     );
                     return Ok(());
                 }
@@ -530,6 +636,7 @@ impl PackageHarnessWorker {
                         event = "completion_transient_failure",
                         attempt = transient_attempt,
                         error = %error,
+                        "[warn] Result delivery failed transiently; identical payload will be retried"
                     );
                     tokio::time::sleep(retry_delay(
                         self.config.poll_interval,
@@ -543,6 +650,7 @@ impl PackageHarnessWorker {
                         run_id = %record.request.run_id,
                         event = "completion_authentication_failed",
                         status = status.as_u16(),
+                        "[error] Tropibot rejected authentication during result delivery"
                     );
                     return Err(
                         "Tropibot rejected worker authentication while completing a job".to_owned(),
@@ -553,6 +661,7 @@ impl PackageHarnessWorker {
                         run_id = %record.request.run_id,
                         event = "completion_conflict",
                         status = status.as_u16(),
+                        "[error] Tropibot rejected the result as conflicting"
                     );
                     return Err("Tropibot rejected the persisted completion as conflicting; operator recovery is required".to_owned());
                 }
@@ -561,6 +670,7 @@ impl PackageHarnessWorker {
                         run_id = %record.request.run_id,
                         event = "completion_failed",
                         error = %error,
+                        "[error] Result delivery failed permanently"
                     );
                     return Err(format!("Tropibot completion failed: {error}"));
                 }
@@ -584,6 +694,13 @@ impl PackageHarnessWorker {
         reason: impl AsRef<str>,
     ) -> Result<String, String> {
         let reason = redact_and_bound(reason.as_ref(), 500);
+        error!(
+            event = "manual_recovery_required",
+            run_id = %record.request.run_id,
+            dnp_name = %record.request.package.dnp_name,
+            reason = %reason,
+            "[error] Worker paused for operator recovery"
+        );
         record.worker.manual_recovery_reason = Some(reason.clone());
         self.store.save(record).await.map_err(|store_error| {
             format!("cannot persist manual recovery requirement: {store_error}")

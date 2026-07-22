@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use chrono::Utc;
 use thiserror::Error;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{
     analysis::{
@@ -60,6 +60,13 @@ struct Failure {
     summary: String,
 }
 
+struct CaptureContext<'a> {
+    run_id: &'a RunId,
+    side: &'static str,
+    dnp_name: &'a crate::model::DnpName,
+    started_at: chrono::DateTime<Utc>,
+}
+
 /// Coordinates one run from queued record to persisted final result.
 pub struct RunController {
     package_manager: Arc<dyn PackageManager>,
@@ -113,6 +120,16 @@ impl RunController {
         progress.publish(record.phase, record.worker.cleanup_required);
         let package = self.resolver.resolve(&record.request);
         let mut cleanup_authorized = false;
+        info!(
+            event = "run_started",
+            run_id = %record.request.run_id,
+            dnp_name = %package.dnp_name,
+            repository = %record.request.source.repository,
+            pull_request = record.request.source.pull_request,
+            candidate_ref = %package.candidate_ref,
+            baseline_ref = package.baseline_ref.as_ref().map_or("latest", crate::model::PackageRef::as_str),
+            "[job] Starting package validation run"
+        );
 
         let algorithm_result = self
             .run_algorithm(&mut record, &mut cleanup_authorized, progress)
@@ -120,6 +137,16 @@ impl RunController {
         let failure = match algorithm_result {
             Ok(()) => None,
             Err(failure) => {
+                warn!(
+                    event = "run_algorithm_failed",
+                    run_id = %record.request.run_id,
+                    dnp_name = %package.dnp_name,
+                    phase = ?record.phase,
+                    verdict = ?failure.verdict,
+                    reason = ?failure.reason,
+                    summary = ?redact_and_bound(&failure.summary, 500),
+                    "[warn] Package workflow stopped; cleanup will still run when required"
+                );
                 record.errors.push(RunError {
                     code: failure.reason.clone(),
                     message: truncate_utf8(&failure.summary, 500),
@@ -133,6 +160,14 @@ impl RunController {
             self.phase(&mut record, ExecutionPhase::Cleanup, progress)
                 .await?;
             let recovery_plan = record.worker.recovery_plan();
+            info!(
+                event = "cleanup_plan_started",
+                run_id = %record.request.run_id,
+                dnp_name = %package.dnp_name,
+                recovery_plan = ?recovery_plan,
+                cleanup_timeout_ms = self.config.cleanup_timeout.as_millis() as u64,
+                "[cleanup] Applying the persisted cleanup plan"
+            );
             record.cleanup = match &recovery_plan {
                 TargetRecoveryPlan::Restore { baseline_ref, .. } => {
                     match crate::model::PackageRef::parse(baseline_ref) {
@@ -203,6 +238,30 @@ impl RunController {
                     }
                 }
             }
+            if matches!(
+                record.cleanup.status,
+                CleanupStatus::Passed | CleanupStatus::Skipped
+            ) {
+                info!(
+                    event = "cleanup_verified",
+                    run_id = %record.request.run_id,
+                    dnp_name = %package.dnp_name,
+                    status = ?record.cleanup.status,
+                    final_package_count = record.evidence.final_packages.len(),
+                    leftover_packages = ?record.cleanup.leftover_packages,
+                    "[ok] Cleanup and final inventory verification completed"
+                );
+            } else {
+                warn!(
+                    event = "cleanup_failed",
+                    run_id = %record.request.run_id,
+                    dnp_name = %package.dnp_name,
+                    status = ?record.cleanup.status,
+                    leftover_packages = ?record.cleanup.leftover_packages,
+                    error = record.cleanup.error.as_deref().unwrap_or("unknown cleanup error"),
+                    "[error] Cleanup could not restore the expected node state"
+                );
+            }
             self.save(&record).await?;
         } else {
             record.cleanup = crate::model::CleanupResult {
@@ -264,11 +323,21 @@ impl RunController {
         self.phase(&mut record, ExecutionPhase::Finished, progress)
             .await?;
         info!(
-            run_id = %record.request.run_id,
-            phase = ?record.phase,
-            dnp_name = %record.request.package.dnp_name,
             event = "run_finished",
-            verdict = ?verdict
+            run_id = %record.request.run_id,
+            dnp_name = %record.request.package.dnp_name,
+            verdict = ?result.verdict,
+            reason = ?result.reason_code,
+            cleanup = ?result.cleanup.status,
+            duration_ms = result.execution.duration_ms,
+            baseline_version = result.package.baseline_resolved_version.as_deref().unwrap_or("unknown"),
+            candidate_version = result.package.candidate_reported_version.as_deref().unwrap_or("unknown"),
+            analyzer = ?result.log_analysis.analyzer,
+            analysis_status = ?result.log_analysis.status,
+            findings = result.log_analysis.new_findings.len(),
+            analyzer_errors = ?result.log_analysis.analyzer_errors,
+            summary = ?redact_and_bound(&result.summary, 500),
+            "[done] Package validation run finished"
         );
         Ok(())
     }
@@ -294,6 +363,13 @@ impl RunController {
                 summary: tools.message(),
             });
         }
+        info!(
+            event = "preflight_tools_verified",
+            run_id = %record.request.run_id,
+            dnp_name = %package.dnp_name,
+            available_tools = tools.available.len(),
+            "[ok] Required Dappmanager tools are available"
+        );
         if package.dnp_name.as_str() == self.config.harness_dnp_name {
             return Err(Failure {
                 verdict: Verdict::InfrastructureError,
@@ -322,6 +398,15 @@ impl RunController {
         let installed_baseline = packages
             .iter()
             .find(|installed| installed.dnp_name == package.dnp_name);
+        info!(
+            event = "baseline_inventory_inspected",
+            run_id = %record.request.run_id,
+            dnp_name = %package.dnp_name,
+            installed_package_count = packages.len(),
+            target_already_installed = installed_baseline.is_some(),
+            installed_version = installed_baseline.and_then(|package| package.version.as_deref()).unwrap_or("none"),
+            "[baseline] Inventory inspected"
+        );
         if let Some(installed_baseline) = installed_baseline {
             let version = installed_baseline
                 .version
@@ -367,6 +452,13 @@ impl RunController {
         self.phase_failure(record, ExecutionPhase::BaselinePreview, progress)
             .await?;
         let baseline_preview = if reuse_installed_baseline {
+            info!(
+                event = "baseline_reused",
+                run_id = %record.request.run_id,
+                dnp_name = %package.dnp_name,
+                version = installed_baseline.and_then(|package| package.version.as_deref()).unwrap_or("unknown"),
+                "[baseline] Reusing the package already installed as the baseline"
+            );
             crate::model::PreviewSummary {
                 package_name: Some(package.dnp_name.to_string()),
                 version: record.worker.baseline_restore_ref.clone(),
@@ -380,6 +472,15 @@ impl RunController {
                 .await
                 .map_err(infrastructure)?
         };
+        info!(
+            event = "baseline_preview_ready",
+            run_id = %record.request.run_id,
+            dnp_name = %package.dnp_name,
+            requested_ref = package.baseline_ref.as_ref().map_or("latest", crate::model::PackageRef::as_str),
+            resolved_version = baseline_preview.version.as_deref().unwrap_or("unknown"),
+            requires_user_input = baseline_preview.requires_user_input,
+            "[ok] Baseline install preview ready"
+        );
         self.phase_failure(record, ExecutionPhase::BaselineInstall, progress)
             .await?;
         let baseline_started = self.clock.now();
@@ -419,6 +520,14 @@ impl RunController {
             }
         }
         let baseline_install_ms = elapsed_ms(baseline_started, self.clock.now());
+        info!(
+            event = "baseline_install_completed",
+            run_id = %record.request.run_id,
+            dnp_name = %package.dnp_name,
+            reused_existing = reuse_installed_baseline,
+            duration_ms = baseline_install_ms,
+            "[ok] Baseline installation step completed"
+        );
         self.phase_failure(record, ExecutionPhase::BaselineStabilization, progress)
             .await?;
         let baseline_stabilization = stabilize(
@@ -434,11 +543,15 @@ impl RunController {
             .await?;
         let baseline = self
             .capture(
-                &package.dnp_name,
+                CaptureContext {
+                    run_id: &record.request.run_id,
+                    side: "baseline",
+                    dnp_name: &package.dnp_name,
+                    started_at: baseline_started,
+                },
                 baseline_preview,
                 baseline_install_ms,
                 baseline_stabilization,
-                baseline_started,
             )
             .await
             .map_err(|error| Failure {
@@ -478,6 +591,13 @@ impl RunController {
                     baseline_ref: baseline_ref.to_string(),
                     retained: true,
                 });
+            info!(
+                event = "baseline_retained",
+                run_id = %record.request.run_id,
+                dnp_name = %package.dnp_name,
+                baseline_ref = %baseline_ref,
+                "[baseline] Baseline will be retained and restored for future runs"
+            );
         }
         record.evidence.baseline = Some(baseline);
         self.save_failure(record).await?;
@@ -489,6 +609,15 @@ impl RunController {
             .preview_install(&package.dnp_name, Some(&package.candidate_ref))
             .await
             .map_err(infrastructure)?;
+        info!(
+            event = "candidate_preview_ready",
+            run_id = %record.request.run_id,
+            dnp_name = %package.dnp_name,
+            candidate_ref = %package.candidate_ref,
+            resolved_version = candidate_preview.version.as_deref().unwrap_or("unknown"),
+            requires_user_input = candidate_preview.requires_user_input,
+            "[ok] Candidate install preview ready"
+        );
         self.phase_failure(record, ExecutionPhase::CandidateInstall, progress)
             .await?;
         self.authorize_cleanup(record, cleanup_authorized, progress)
@@ -513,6 +642,14 @@ impl RunController {
             });
         }
         let candidate_install_ms = elapsed_ms(candidate_started, self.clock.now());
+        info!(
+            event = "candidate_install_completed",
+            run_id = %record.request.run_id,
+            dnp_name = %package.dnp_name,
+            candidate_ref = %package.candidate_ref,
+            duration_ms = candidate_install_ms,
+            "[ok] Candidate update completed"
+        );
         self.phase_failure(record, ExecutionPhase::CandidateStabilization, progress)
             .await?;
         let candidate_stabilization = stabilize(
@@ -528,11 +665,15 @@ impl RunController {
             .await?;
         let candidate = self
             .capture(
-                &package.dnp_name,
+                CaptureContext {
+                    run_id: &record.request.run_id,
+                    side: "candidate",
+                    dnp_name: &package.dnp_name,
+                    started_at: candidate_started,
+                },
                 candidate_preview,
                 candidate_install_ms,
                 candidate_stabilization,
-                candidate_started,
             )
             .await
             .map_err(|error| Failure {
@@ -554,34 +695,86 @@ impl RunController {
             reason: ReasonCode::UnexpectedError,
             summary: "candidate evidence was unexpectedly absent".to_owned(),
         })?;
-        record.evidence.comparison = Some(compare(baseline, candidate));
-        let input = analysis_input(baseline, candidate);
-        record.evidence.log_analysis = Some(
-            self.analyzer
-                .analyze(&input)
-                .await
-                .unwrap_or_else(|error| analysis_failure(&error.to_string())),
+        let comparison = compare(baseline, candidate);
+        info!(
+            event = "comparison_completed",
+            run_id = %record.request.run_id,
+            dnp_name = %package.dnp_name,
+            baseline_version = comparison.baseline_version.as_deref().unwrap_or("unknown"),
+            candidate_version = comparison.candidate_version.as_deref().unwrap_or("unknown"),
+            containers_added = ?comparison.containers_added,
+            containers_removed = ?comparison.containers_removed,
+            deterministic_regressions = comparison.deterministic_regressions.len(),
+            "[analysis] Baseline and candidate evidence compared"
         );
+        record.evidence.comparison = Some(comparison);
+        let input = analysis_input(baseline, candidate);
+        let analysis_input_bytes = input
+            .baseline
+            .iter()
+            .chain(&input.candidate)
+            .map(|(_, text)| text.len())
+            .sum::<usize>();
+        info!(
+            event = "log_analysis_started",
+            run_id = %record.request.run_id,
+            dnp_name = %package.dnp_name,
+            baseline_log_blocks = input.baseline.len(),
+            candidate_log_blocks = input.candidate.len(),
+            input_bytes = analysis_input_bytes,
+            "[analysis] Comparative log analysis started"
+        );
+        let analysis_started = self.clock.now();
+        let analysis = self
+            .analyzer
+            .analyze(&input)
+            .await
+            .unwrap_or_else(|error| analysis_failure(&error.to_string()));
+        let analysis_duration_ms = elapsed_ms(analysis_started, self.clock.now());
+        if analysis.analyzer_errors.is_empty() {
+            info!(
+                event = "log_analysis_completed",
+                run_id = %record.request.run_id,
+                dnp_name = %package.dnp_name,
+                analyzer = ?analysis.analyzer,
+                status = ?analysis.status,
+                findings = analysis.new_findings.len(),
+                duration_ms = analysis_duration_ms,
+                "[ok] Comparative log analysis completed"
+            );
+        } else {
+            warn!(
+                event = "log_analysis_completed_with_fallback",
+                run_id = %record.request.run_id,
+                dnp_name = %package.dnp_name,
+                analyzer = ?analysis.analyzer,
+                status = ?analysis.status,
+                findings = analysis.new_findings.len(),
+                duration_ms = analysis_duration_ms,
+                analyzer_errors = ?analysis.analyzer_errors,
+                "[warn] Log analysis completed with an advisory analyzer fallback"
+            );
+        }
+        record.evidence.log_analysis = Some(analysis);
         self.save_failure(record).await?;
         Ok(())
     }
 
     async fn capture(
         &self,
-        dnp_name: &crate::model::DnpName,
+        context: CaptureContext<'_>,
         preview: crate::model::PreviewSummary,
         install_duration_ms: u64,
         stabilization: StabilizationResult,
-        started_at: chrono::DateTime<Utc>,
     ) -> Result<CaptureEvidence, String> {
         let details = self
             .package_manager
-            .get_package_details(dnp_name)
+            .get_package_details(context.dnp_name)
             .await
             .map_err(|error| truncate_utf8(&error.to_string(), 500))?;
         let (logs, log_error) = match self
             .package_manager
-            .get_package_logs(dnp_name, self.config.log_tail)
+            .get_package_logs(context.dnp_name, self.config.log_tail)
             .await
         {
             Ok(mut logs) => {
@@ -592,8 +785,43 @@ impl RunController {
                 }
                 (Some(logs), None)
             }
-            Err(error) => (None, Some(truncate_utf8(&error.to_string(), 300))),
+            Err(error) => {
+                let error = truncate_utf8(&error.to_string(), 300);
+                warn!(
+                    event = "capture_logs_failed",
+                    run_id = %context.run_id,
+                    dnp_name = %context.dnp_name,
+                    side = context.side,
+                    error = %error,
+                    "[warn] Package details were captured, but container logs were unavailable"
+                );
+                (None, Some(error))
+            }
         };
+        let log_blocks = logs.as_ref().map_or(0, |logs| logs.entries.len());
+        let log_bytes = logs.as_ref().map_or(0, |logs| {
+            logs.entries.iter().map(|entry| entry.text.len()).sum()
+        });
+        let running_containers = details
+            .containers
+            .iter()
+            .filter(|container| container.running)
+            .count();
+        info!(
+            event = "evidence_capture_completed",
+            run_id = %context.run_id,
+            dnp_name = %context.dnp_name,
+            side = context.side,
+            reported_version = details.version.as_deref().unwrap_or("unknown"),
+            container_count = details.containers.len(),
+            running_containers,
+            stabilization_passed = stabilization.passed,
+            stabilization_duration_ms = stabilization.duration_ms,
+            install_duration_ms,
+            log_blocks,
+            log_bytes,
+            "[capture] Package evidence captured"
+        );
         Ok(CaptureEvidence {
             install_status: StepStatus::Passed,
             install_duration_ms,
@@ -602,7 +830,7 @@ impl RunController {
             stabilization,
             logs,
             log_error,
-            started_at: started_at.to_rfc3339(),
+            started_at: context.started_at.to_rfc3339(),
             finished_at: self.clock.now().to_rfc3339(),
         })
     }
@@ -613,14 +841,31 @@ impl RunController {
         phase: ExecutionPhase,
         progress: &dyn RunProgress,
     ) -> Result<(), ControllerError> {
+        let previous = record.phase_history.last().cloned();
         record.transition(phase);
+        let entered_at = record
+            .phase_history
+            .last()
+            .map_or_else(Utc::now, |transition| transition.at);
+        let previous_phase = previous
+            .as_ref()
+            .map_or("none", |transition| phase_name(transition.phase));
+        let previous_duration_ms = previous
+            .as_ref()
+            .map_or(0, |transition| elapsed_ms(transition.at, entered_at));
         self.save(record).await?;
         progress.publish(phase, record.worker.cleanup_required);
+        let label = phase_name(phase);
         info!(
+            event = "phase_started",
             run_id = %record.request.run_id,
             phase = ?phase,
+            phase_name = label,
+            previous_phase,
+            previous_duration_ms,
             dnp_name = %record.request.package.dnp_name,
-            event = "phase_transition"
+            cleanup_required = record.worker.cleanup_required,
+            "[phase] {label}"
         );
         Ok(())
     }
@@ -729,6 +974,26 @@ fn store_error(error: StoreError) -> ControllerError {
 
 fn elapsed_ms(start: chrono::DateTime<Utc>, end: chrono::DateTime<Utc>) -> u64 {
     end.signed_duration_since(start).num_milliseconds().max(0) as u64
+}
+
+fn phase_name(phase: ExecutionPhase) -> &'static str {
+    match phase {
+        ExecutionPhase::Queued => "Queued",
+        ExecutionPhase::Preflight => "Preflight safety checks",
+        ExecutionPhase::InitialCleanup => "Initial cleanup",
+        ExecutionPhase::BaselinePreview => "Baseline preview",
+        ExecutionPhase::BaselineInstall => "Baseline installation",
+        ExecutionPhase::BaselineStabilization => "Baseline stabilization",
+        ExecutionPhase::BaselineCapture => "Baseline evidence capture",
+        ExecutionPhase::CandidatePreview => "Candidate preview",
+        ExecutionPhase::CandidateInstall => "Candidate upgrade",
+        ExecutionPhase::CandidateStabilization => "Candidate stabilization",
+        ExecutionPhase::CandidateCapture => "Candidate evidence capture",
+        ExecutionPhase::Analysis => "Evidence comparison and analysis",
+        ExecutionPhase::Cleanup => "Target cleanup and restoration",
+        ExecutionPhase::Reporting => "Result delivery",
+        ExecutionPhase::Finished => "Run finished",
+    }
 }
 
 fn analysis_failure(message: &str) -> LogAnalysisResult {

@@ -1,4 +1,8 @@
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use tracing::{info, warn};
 
@@ -21,7 +25,7 @@ pub async fn cleanup_target(
         dnp_name = %dnp_name,
         delete_volumes = true,
         verification_timeout_ms = timeout.as_millis() as u64,
-        "[cleanup] Removing the test package and its volumes"
+        "Removing the test package and its volumes"
     );
     if let Err(error) = package_manager.remove_package(dnp_name, true).await
         && !matches!(error, crate::package_manager::PackageManagerError::NotFound)
@@ -31,7 +35,7 @@ pub async fn cleanup_target(
             dnp_name = %dnp_name,
             duration_ms = elapsed_ms(started, clock.now()),
             error = %error,
-            "[error] Dappmanager could not remove the test package"
+            "Dappmanager could not remove the test package"
         );
         return CleanupResult {
             status: CleanupStatus::Failed,
@@ -40,18 +44,27 @@ pub async fn cleanup_target(
         };
     }
     let poll = Duration::from_millis(500);
+    let verification_started = Instant::now();
     let attempts = ((timeout.as_millis() / poll.as_millis()) as usize)
         .saturating_add(1)
         .min(1_000);
     for attempt in 0..attempts {
-        match package_manager.list_packages().await {
-            Ok(packages) if !packages.iter().any(|package| &package.dnp_name == dnp_name) => {
+        let remaining = timeout.saturating_sub(verification_started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, package_manager.list_packages()).await {
+            Ok(Ok(packages))
+                if !packages
+                    .iter()
+                    .any(|package| &package.dnp_name == dnp_name) =>
+            {
                 info!(
                     event = "cleanup_remove_verified",
                     dnp_name = %dnp_name,
                     duration_ms = elapsed_ms(started, clock.now()),
                     verification_samples = attempt + 1,
-                    "[ok] Package removal verified"
+                    "Package removal verified"
                 );
                 return CleanupResult {
                     status: CleanupStatus::Passed,
@@ -59,7 +72,7 @@ pub async fn cleanup_target(
                     error: None,
                 };
             }
-            Ok(_) => {
+            Ok(Ok(_)) => {
                 if attempt == 0 || (attempt + 1) % 10 == 0 {
                     info!(
                         event = "cleanup_remove_waiting",
@@ -67,17 +80,17 @@ pub async fn cleanup_target(
                         sample = attempt + 1,
                         max_samples = attempts,
                         elapsed_ms = elapsed_ms(started, clock.now()),
-                        "[progress] Waiting for package removal to become visible"
+                        "Waiting for package removal to become visible"
                     );
                 }
             }
-            Err(error) if attempt + 1 == attempts => {
+            Ok(Err(error)) if attempt + 1 == attempts => {
                 warn!(
                     event = "cleanup_verification_failed",
                     dnp_name = %dnp_name,
                     duration_ms = elapsed_ms(started, clock.now()),
                     error = %error,
-                    "[error] Final package-removal verification failed"
+                    "Final package-removal verification failed"
                 );
                 return CleanupResult {
                     status: CleanupStatus::Failed,
@@ -85,17 +98,22 @@ pub async fn cleanup_target(
                     error: Some(truncate_utf8(&error.to_string(), 300)),
                 };
             }
-            Err(_) => {}
+            Ok(Err(_)) => {}
+            Err(_) => break,
         }
         if attempt + 1 < attempts {
-            clock.sleep(poll).await;
+            let remaining = timeout.saturating_sub(verification_started.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            clock.sleep(poll.min(remaining)).await;
         }
     }
     warn!(
         event = "cleanup_remove_timed_out",
         dnp_name = %dnp_name,
         duration_ms = elapsed_ms(started, clock.now()),
-        "[error] Package remained installed after cleanup polling"
+        "Package remained installed after cleanup polling"
     );
     CleanupResult {
         status: CleanupStatus::TimedOut,
@@ -110,6 +128,7 @@ pub async fn restore_target(
     clock: Arc<dyn Clock>,
     dnp_name: &DnpName,
     baseline_ref: &PackageRef,
+    expected_version: &str,
     timeout: Duration,
 ) -> CleanupResult {
     let started = clock.now();
@@ -117,17 +136,21 @@ pub async fn restore_target(
         event = "cleanup_restore_started",
         dnp_name = %dnp_name,
         baseline_ref = %baseline_ref,
+        expected_version,
         verification_timeout_ms = timeout.as_millis() as u64,
-        "[cleanup] Restoring the exact baseline version"
+        "Restoring the exact baseline version"
     );
-    let installed = match package_manager.list_packages().await {
-        Ok(packages) => packages.iter().any(|package| &package.dnp_name == dnp_name),
+    let installed_version = match package_manager.list_packages().await {
+        Ok(packages) => packages
+            .iter()
+            .find(|package| &package.dnp_name == dnp_name)
+            .and_then(|package| package.version.clone()),
         Err(error) => {
             warn!(
                 event = "cleanup_restore_inventory_failed",
                 dnp_name = %dnp_name,
                 error = %error,
-                "[error] Could not inspect the target before restoration"
+                "Could not inspect the target before restoration"
             );
             return CleanupResult {
                 status: CleanupStatus::Failed,
@@ -136,12 +159,30 @@ pub async fn restore_target(
             };
         }
     };
+    if installed_version.as_deref() == Some(expected_version) {
+        info!(
+            event = "cleanup_restore_already_complete",
+            dnp_name = %dnp_name,
+            baseline_ref = %baseline_ref,
+            expected_version,
+            duration_ms = elapsed_ms(started, clock.now()),
+            "Target is already at the baseline version"
+        );
+        return CleanupResult {
+            status: CleanupStatus::Passed,
+            leftover_packages: Vec::new(),
+            error: None,
+        };
+    }
+    let installed = installed_version.is_some();
     info!(
         event = "cleanup_restore_action_selected",
         dnp_name = %dnp_name,
         baseline_ref = %baseline_ref,
+        expected_version,
+        observed_version = installed_version.as_deref().unwrap_or("not_installed"),
         action = if installed { "update" } else { "install" },
-        "[cleanup] Baseline restoration action selected"
+        "Baseline restoration action selected"
     );
     let restore = if installed {
         package_manager.update_package(dnp_name, baseline_ref).await
@@ -155,9 +196,10 @@ pub async fn restore_target(
             event = "cleanup_restore_failed",
             dnp_name = %dnp_name,
             baseline_ref = %baseline_ref,
+            expected_version,
             duration_ms = elapsed_ms(started, clock.now()),
             error = %error,
-            "[error] Baseline restoration mutation failed"
+            "Baseline restoration mutation failed"
         );
         return CleanupResult {
             status: CleanupStatus::Failed,
@@ -166,19 +208,25 @@ pub async fn restore_target(
         };
     }
     let poll = Duration::from_millis(500);
+    let verification_started = Instant::now();
     let attempts = ((timeout.as_millis() / poll.as_millis()) as usize)
         .saturating_add(1)
         .min(1_000);
     for attempt in 0..attempts {
-        match package_manager.get_package_details(dnp_name).await {
-            Ok(details) if details.version.as_deref() == Some(baseline_ref.as_str()) => {
+        let remaining = timeout.saturating_sub(verification_started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, package_manager.get_package_details(dnp_name)).await {
+            Ok(Ok(details)) if details.version.as_deref() == Some(expected_version) => {
                 info!(
                     event = "cleanup_restore_verified",
                     dnp_name = %dnp_name,
                     baseline_ref = %baseline_ref,
+                    expected_version,
                     duration_ms = elapsed_ms(started, clock.now()),
                     verification_samples = attempt + 1,
-                    "[ok] Baseline restoration verified"
+                    "Baseline restoration verified"
                 );
                 return CleanupResult {
                     status: CleanupStatus::Passed,
@@ -186,21 +234,22 @@ pub async fn restore_target(
                     error: None,
                 };
             }
-            Ok(details) if attempt + 1 < attempts => {
+            Ok(Ok(details)) if attempt + 1 < attempts => {
                 if attempt == 0 || (attempt + 1) % 10 == 0 {
                     info!(
                         event = "cleanup_restore_waiting",
                         dnp_name = %dnp_name,
-                        expected_ref = %baseline_ref,
+                        baseline_ref = %baseline_ref,
+                        expected_version,
                         observed_version = details.version.as_deref().unwrap_or("unknown"),
                         sample = attempt + 1,
                         max_samples = attempts,
                         elapsed_ms = elapsed_ms(started, clock.now()),
-                        "[progress] Waiting for the baseline version to become visible"
+                        "Waiting for the baseline version to become visible"
                     );
                 }
             }
-            Err(error) if attempt + 1 < attempts => {
+            Ok(Err(error)) if attempt + 1 < attempts => {
                 if attempt == 0 || (attempt + 1) % 10 == 0 {
                     warn!(
                         event = "cleanup_restore_sample_failed",
@@ -208,17 +257,18 @@ pub async fn restore_target(
                         sample = attempt + 1,
                         max_samples = attempts,
                         error = %error,
-                        "[warn] Could not verify the restored baseline yet"
+                        "Could not verify the restored baseline yet"
                     );
                 }
             }
-            Ok(_) => {
+            Ok(Ok(_)) => {
                 warn!(
                     event = "cleanup_restore_timed_out",
                     dnp_name = %dnp_name,
                     baseline_ref = %baseline_ref,
+                    expected_version,
                     duration_ms = elapsed_ms(started, clock.now()),
-                    "[error] Target did not return to its baseline version"
+                    "Target did not return to its baseline version"
                 );
                 return CleanupResult {
                     status: CleanupStatus::TimedOut,
@@ -226,13 +276,13 @@ pub async fn restore_target(
                     error: Some("target package did not return to its original version".to_owned()),
                 };
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 warn!(
                     event = "cleanup_restore_verification_failed",
                     dnp_name = %dnp_name,
                     duration_ms = elapsed_ms(started, clock.now()),
                     error = %error,
-                    "[error] Final baseline-restoration verification failed"
+                    "Final baseline-restoration verification failed"
                 );
                 return CleanupResult {
                     status: CleanupStatus::Failed,
@@ -240,12 +290,29 @@ pub async fn restore_target(
                     error: Some(truncate_utf8(&error.to_string(), 300)),
                 };
             }
+            Err(_) => break,
         }
         if attempt + 1 < attempts {
-            clock.sleep(poll).await;
+            let remaining = timeout.saturating_sub(verification_started.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            clock.sleep(poll.min(remaining)).await;
         }
     }
-    unreachable!("cleanup polling always returns before exhausting attempts")
+    warn!(
+        event = "cleanup_restore_timed_out",
+        dnp_name = %dnp_name,
+        baseline_ref = %baseline_ref,
+        expected_version,
+        duration_ms = elapsed_ms(started, clock.now()),
+        "Target did not return to its baseline version"
+    );
+    CleanupResult {
+        status: CleanupStatus::TimedOut,
+        leftover_packages: Vec::new(),
+        error: Some("target package did not return to its original version".to_owned()),
+    }
 }
 
 fn elapsed_ms(start: chrono::DateTime<chrono::Utc>, end: chrono::DateTime<chrono::Utc>) -> u64 {

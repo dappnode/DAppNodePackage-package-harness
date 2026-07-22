@@ -50,7 +50,13 @@ pub enum TargetRecoveryPlan {
     /// Return the target to an exact baseline. `retained` records that the
     /// harness intentionally keeps a newly installed baseline as a local cache.
     Restore {
+        /// Immutable reference used for restoration. New records use the
+        /// release's IPFS origin so a semver downgrade cannot be suppressed.
         baseline_ref: String,
+        /// Version expected in package inventory after restoration. Older
+        /// records omit this and use `baseline_ref` for both purposes.
+        #[serde(default)]
+        expected_version: Option<String>,
         #[serde(default)]
         retained: bool,
     },
@@ -99,6 +105,7 @@ impl WorkerState {
                 .map_or(TargetRecoveryPlan::Remove, |baseline_ref| {
                     TargetRecoveryPlan::Restore {
                         baseline_ref: baseline_ref.clone(),
+                        expected_version: None,
                         retained: false,
                     }
                 })
@@ -107,7 +114,11 @@ impl WorkerState {
 
     pub fn set_recovery_plan(&mut self, plan: TargetRecoveryPlan) {
         self.baseline_restore_ref = match &plan {
-            TargetRecoveryPlan::Restore { baseline_ref, .. } => Some(baseline_ref.clone()),
+            TargetRecoveryPlan::Restore {
+                baseline_ref,
+                expected_version,
+                ..
+            } => Some(expected_version.as_ref().unwrap_or(baseline_ref).clone()),
             TargetRecoveryPlan::Remove => None,
         };
         self.target_recovery = Some(plan);

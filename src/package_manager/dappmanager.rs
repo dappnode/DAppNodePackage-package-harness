@@ -9,7 +9,7 @@ use dappnode_types::{ContainerState, InstallOptions};
 use tracing::{info, warn};
 
 use crate::{
-    analysis::redaction::{redact_and_bound, truncate_utf8},
+    analysis::redaction::{redact_and_bound_single_line, truncate_utf8},
     model::{
         ContainerLog, ContainerSnapshot, DnpName, PackageDetails, PackageLogs, PackageRef,
         PackageSummary, PreviewSummary,
@@ -77,7 +77,7 @@ impl DappmanagerPackageManager {
                 attempt,
                 max_attempts = self.mutation_attempts,
                 timeout_ms = self.mutation_timeout.as_millis() as u64,
-                "[mutation] Dappmanager attempt started"
+                "Dappmanager attempt started"
             );
             match operation().await {
                 Ok(()) => {
@@ -88,14 +88,14 @@ impl DappmanagerPackageManager {
                         requested_ref = requested_ref.unwrap_or("none"),
                         attempt,
                         duration_ms = started.elapsed().as_millis() as u64,
-                        "[ok] Dappmanager mutation completed"
+                        "Dappmanager mutation completed"
                     );
                     return Ok(());
                 }
                 Err(error)
                     if attempt < self.mutation_attempts && retryable_mutation_error(&error) =>
                 {
-                    let safe_error = redact_and_bound(&error.to_string(), 500);
+                    let safe_error = redact_and_bound_single_line(&error.to_string(), 500);
                     if reconcile().await {
                         info!(
                             event = "mcp_mutation_reconciled",
@@ -105,7 +105,7 @@ impl DappmanagerPackageManager {
                             attempt,
                             duration_ms = started.elapsed().as_millis() as u64,
                             error = %safe_error,
-                            "[ok] Timed-out mutation had already reached the requested state"
+                            "Timed-out mutation had already reached the requested state"
                         );
                         return Ok(());
                     }
@@ -120,12 +120,12 @@ impl DappmanagerPackageManager {
                         attempt_duration_ms = started.elapsed().as_millis() as u64,
                         retry_delay_ms = delay.as_millis(),
                         error = %safe_error,
-                        "[retry] Transient Dappmanager mutation failure; retry scheduled"
+                        "Transient Dappmanager mutation failure; retry scheduled"
                     );
                     tokio::time::sleep(delay).await;
                 }
                 Err(error) => {
-                    let safe_error = redact_and_bound(&error.to_string(), 500);
+                    let safe_error = redact_and_bound_single_line(&error.to_string(), 500);
                     warn!(
                         event = "mcp_mutation_attempt_failed",
                         tool,
@@ -136,7 +136,7 @@ impl DappmanagerPackageManager {
                         duration_ms = started.elapsed().as_millis() as u64,
                         retryable = retryable_mutation_error(&error),
                         error = %safe_error,
-                        "[error] Dappmanager mutation failed"
+                        "Dappmanager mutation failed"
                     );
                     return Err(error);
                 }
@@ -247,6 +247,7 @@ impl PackageManager for DappmanagerPackageManager {
             .fetch_install_preview(dnp_name, version)
             .await
             .map_err(package_error)?;
+        let resolved_ref = preview.origin.clone();
         let summary = serde_json::to_string(&preview)
             .map(|text| truncate_utf8(&text, 2_000))
             .unwrap_or_else(|_| "preview received".to_owned());
@@ -256,6 +257,7 @@ impl PackageManager for DappmanagerPackageManager {
                 .semantic_version
                 .map(|version| version.to_string())
                 .or_else(|| preview.requested_version.map(|version| version.to_string())),
+            resolved_ref,
             image_count: None,
             requires_user_input: preview.requires_user_input,
             summary,

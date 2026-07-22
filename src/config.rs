@@ -142,7 +142,7 @@ impl Config {
             nexus_base_url: env::var("NEXUS_BASE_URL")
                 .unwrap_or_else(|_| "https://nexus-api.dappnode.com/v1".to_owned()),
             nexus_model: env::var("NEXUS_MODEL").unwrap_or_else(|_| "nexus/auto".to_owned()),
-            nexus_timeout: millis("NEXUS_TIMEOUT_MS", 30_000)?,
+            nexus_timeout: millis("NEXUS_TIMEOUT_MS", 300_000)?,
             nexus_max_input_bytes: parse("NEXUS_MAX_INPUT_BYTES", 64 * 1024)?,
             tropibot_url,
             package_harness_worker_id,

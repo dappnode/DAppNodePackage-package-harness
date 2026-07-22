@@ -124,11 +124,7 @@ impl RunController {
             event = "run_started",
             run_id = %record.request.run_id,
             dnp_name = %package.dnp_name,
-            repository = %record.request.source.repository,
-            pull_request = record.request.source.pull_request,
-            candidate_ref = %package.candidate_ref,
-            baseline_ref = package.baseline_ref.as_ref().map_or("latest", crate::model::PackageRef::as_str),
-            "[job] Starting package validation run"
+            "Starting package validation run"
         );
 
         let algorithm_result = self
@@ -145,7 +141,7 @@ impl RunController {
                     verdict = ?failure.verdict,
                     reason = ?failure.reason,
                     summary = ?redact_and_bound(&failure.summary, 500),
-                    "[warn] Package workflow stopped; cleanup will still run when required"
+                    "Package workflow stopped; cleanup will still run when required"
                 );
                 record.errors.push(RunError {
                     code: failure.reason.clone(),
@@ -166,7 +162,7 @@ impl RunController {
                 dnp_name = %package.dnp_name,
                 recovery_plan = ?recovery_plan,
                 cleanup_timeout_ms = self.config.cleanup_timeout.as_millis() as u64,
-                "[cleanup] Applying the persisted cleanup plan"
+                "Applying the persisted cleanup plan"
             );
             record.cleanup = match &recovery_plan {
                 TargetRecoveryPlan::Restore { baseline_ref, .. } => {
@@ -249,7 +245,7 @@ impl RunController {
                     status = ?record.cleanup.status,
                     final_package_count = record.evidence.final_packages.len(),
                     leftover_packages = ?record.cleanup.leftover_packages,
-                    "[ok] Cleanup and final inventory verification completed"
+                    "Cleanup and final inventory verification completed"
                 );
             } else {
                 warn!(
@@ -259,7 +255,7 @@ impl RunController {
                     status = ?record.cleanup.status,
                     leftover_packages = ?record.cleanup.leftover_packages,
                     error = record.cleanup.error.as_deref().unwrap_or("unknown cleanup error"),
-                    "[error] Cleanup could not restore the expected node state"
+                    "Cleanup could not restore the expected node state"
                 );
             }
             self.save(&record).await?;
@@ -337,7 +333,7 @@ impl RunController {
             findings = result.log_analysis.new_findings.len(),
             analyzer_errors = ?result.log_analysis.analyzer_errors,
             summary = ?redact_and_bound(&result.summary, 500),
-            "[done] Package validation run finished"
+            "Package validation run finished"
         );
         Ok(())
     }
@@ -368,7 +364,7 @@ impl RunController {
             run_id = %record.request.run_id,
             dnp_name = %package.dnp_name,
             available_tools = tools.available.len(),
-            "[ok] Required Dappmanager tools are available"
+            "Required Dappmanager tools are available"
         );
         if package.dnp_name.as_str() == self.config.harness_dnp_name {
             return Err(Failure {
@@ -405,9 +401,9 @@ impl RunController {
             installed_package_count = packages.len(),
             target_already_installed = installed_baseline.is_some(),
             installed_version = installed_baseline.and_then(|package| package.version.as_deref()).unwrap_or("none"),
-            "[baseline] Inventory inspected"
+            "Inventory inspected"
         );
-        if let Some(installed_baseline) = installed_baseline {
+        let installed_baseline_ref = if let Some(installed_baseline) = installed_baseline {
             let version = installed_baseline
                 .version
                 .as_deref()
@@ -431,16 +427,19 @@ impl RunController {
                 .worker
                 .set_recovery_plan(TargetRecoveryPlan::Restore {
                     baseline_ref: baseline_ref.to_string(),
+                    expected_version: Some(version.to_owned()),
                     retained: false,
                 });
             self.save_failure(record).await?;
+            Some(baseline_ref)
         } else {
             // Persist removal as the safe fallback before the first install.
             // A retained package is promoted to Restore only after its exact
             // baseline version has been captured successfully.
             record.worker.set_recovery_plan(TargetRecoveryPlan::Remove);
             self.save_failure(record).await?;
-        }
+            None
+        };
 
         let reuse_installed_baseline = installed_baseline.is_some_and(|installed| {
             package
@@ -451,35 +450,67 @@ impl RunController {
 
         self.phase_failure(record, ExecutionPhase::BaselinePreview, progress)
             .await?;
+        let installed_baseline_preview = if let Some(installed_ref) = &installed_baseline_ref {
+            let preview = self
+                .package_manager
+                .preview_install(&package.dnp_name, Some(installed_ref))
+                .await
+                .map_err(infrastructure)?;
+            let restore_ref = preview
+                .resolved_ref
+                .as_deref()
+                .unwrap_or(installed_ref.as_str());
+            let restore_ref =
+                crate::model::PackageRef::parse(restore_ref).map_err(|error| Failure {
+                    verdict: Verdict::InfrastructureError,
+                    reason: ReasonCode::BaselineUnavailable,
+                    summary: truncate_utf8(
+                        &format!("resolved baseline reference is invalid: {error}"),
+                        500,
+                    ),
+                })?;
+            let expected_version = installed_baseline
+                .and_then(|installed| installed.version.clone())
+                .ok_or_else(|| Failure {
+                    verdict: Verdict::InfrastructureError,
+                    reason: ReasonCode::BaselineUnavailable,
+                    summary: "installed target has no version to verify after restoration"
+                        .to_owned(),
+                })?;
+            record
+                .worker
+                .set_recovery_plan(TargetRecoveryPlan::Restore {
+                    baseline_ref: restore_ref.to_string(),
+                    expected_version: Some(expected_version),
+                    retained: false,
+                });
+            self.save_failure(record).await?;
+            Some(preview)
+        } else {
+            None
+        };
         let baseline_preview = if reuse_installed_baseline {
-            info!(
-                event = "baseline_reused",
-                run_id = %record.request.run_id,
-                dnp_name = %package.dnp_name,
-                version = installed_baseline.and_then(|package| package.version.as_deref()).unwrap_or("unknown"),
-                "[baseline] Reusing the package already installed as the baseline"
-            );
-            crate::model::PreviewSummary {
-                package_name: Some(package.dnp_name.to_string()),
-                version: record.worker.baseline_restore_ref.clone(),
-                image_count: None,
-                requires_user_input: false,
-                summary: "using the target package already installed before this run".to_owned(),
-            }
+            installed_baseline_preview.ok_or_else(|| Failure {
+                verdict: Verdict::InfrastructureError,
+                reason: ReasonCode::BaselineUnavailable,
+                summary: "installed baseline preview was not captured".to_owned(),
+            })?
         } else {
             self.package_manager
                 .preview_install(&package.dnp_name, package.baseline_ref.as_ref())
                 .await
                 .map_err(infrastructure)?
         };
+        let baseline_resolved_ref = baseline_preview.resolved_ref.clone();
         info!(
             event = "baseline_preview_ready",
             run_id = %record.request.run_id,
             dnp_name = %package.dnp_name,
             requested_ref = package.baseline_ref.as_ref().map_or("latest", crate::model::PackageRef::as_str),
             resolved_version = baseline_preview.version.as_deref().unwrap_or("unknown"),
+            reused_existing = reuse_installed_baseline,
             requires_user_input = baseline_preview.requires_user_input,
-            "[ok] Baseline install preview ready"
+            "Baseline preview ready"
         );
         self.phase_failure(record, ExecutionPhase::BaselineInstall, progress)
             .await?;
@@ -526,7 +557,7 @@ impl RunController {
             dnp_name = %package.dnp_name,
             reused_existing = reuse_installed_baseline,
             duration_ms = baseline_install_ms,
-            "[ok] Baseline installation step completed"
+            "Baseline installation step completed"
         );
         self.phase_failure(record, ExecutionPhase::BaselineStabilization, progress)
             .await?;
@@ -588,7 +619,11 @@ impl RunController {
             record
                 .worker
                 .set_recovery_plan(TargetRecoveryPlan::Restore {
-                    baseline_ref: baseline_ref.to_string(),
+                    baseline_ref: baseline_resolved_ref
+                        .as_deref()
+                        .unwrap_or(baseline_ref.as_str())
+                        .to_owned(),
+                    expected_version: Some(baseline_ref.to_string()),
                     retained: true,
                 });
             info!(
@@ -596,7 +631,7 @@ impl RunController {
                 run_id = %record.request.run_id,
                 dnp_name = %package.dnp_name,
                 baseline_ref = %baseline_ref,
-                "[baseline] Baseline will be retained and restored for future runs"
+                "Baseline will be retained and restored for future runs"
             );
         }
         record.evidence.baseline = Some(baseline);
@@ -616,7 +651,7 @@ impl RunController {
             candidate_ref = %package.candidate_ref,
             resolved_version = candidate_preview.version.as_deref().unwrap_or("unknown"),
             requires_user_input = candidate_preview.requires_user_input,
-            "[ok] Candidate install preview ready"
+            "Candidate install preview ready"
         );
         self.phase_failure(record, ExecutionPhase::CandidateInstall, progress)
             .await?;
@@ -648,7 +683,7 @@ impl RunController {
             dnp_name = %package.dnp_name,
             candidate_ref = %package.candidate_ref,
             duration_ms = candidate_install_ms,
-            "[ok] Candidate update completed"
+            "Candidate update completed"
         );
         self.phase_failure(record, ExecutionPhase::CandidateStabilization, progress)
             .await?;
@@ -705,7 +740,7 @@ impl RunController {
             containers_added = ?comparison.containers_added,
             containers_removed = ?comparison.containers_removed,
             deterministic_regressions = comparison.deterministic_regressions.len(),
-            "[analysis] Baseline and candidate evidence compared"
+            "Baseline and candidate evidence compared"
         );
         record.evidence.comparison = Some(comparison);
         let input = analysis_input(baseline, candidate);
@@ -722,7 +757,7 @@ impl RunController {
             baseline_log_blocks = input.baseline.len(),
             candidate_log_blocks = input.candidate.len(),
             input_bytes = analysis_input_bytes,
-            "[analysis] Comparative log analysis started"
+            "Comparative log analysis started"
         );
         let analysis_started = self.clock.now();
         let analysis = self
@@ -740,7 +775,7 @@ impl RunController {
                 status = ?analysis.status,
                 findings = analysis.new_findings.len(),
                 duration_ms = analysis_duration_ms,
-                "[ok] Comparative log analysis completed"
+                "Comparative log analysis completed"
             );
         } else {
             warn!(
@@ -752,7 +787,7 @@ impl RunController {
                 findings = analysis.new_findings.len(),
                 duration_ms = analysis_duration_ms,
                 analyzer_errors = ?analysis.analyzer_errors,
-                "[warn] Log analysis completed with an advisory analyzer fallback"
+                "Log analysis completed with an advisory analyzer fallback"
             );
         }
         record.evidence.log_analysis = Some(analysis);
@@ -793,7 +828,7 @@ impl RunController {
                     dnp_name = %context.dnp_name,
                     side = context.side,
                     error = %error,
-                    "[warn] Package details were captured, but container logs were unavailable"
+                    "Package details were captured, but container logs were unavailable"
                 );
                 (None, Some(error))
             }
@@ -820,7 +855,7 @@ impl RunController {
             install_duration_ms,
             log_blocks,
             log_bytes,
-            "[capture] Package evidence captured"
+            "Package evidence captured"
         );
         Ok(CaptureEvidence {
             install_status: StepStatus::Passed,
@@ -841,31 +876,18 @@ impl RunController {
         phase: ExecutionPhase,
         progress: &dyn RunProgress,
     ) -> Result<(), ControllerError> {
-        let previous = record.phase_history.last().cloned();
         record.transition(phase);
-        let entered_at = record
-            .phase_history
-            .last()
-            .map_or_else(Utc::now, |transition| transition.at);
-        let previous_phase = previous
-            .as_ref()
-            .map_or("none", |transition| phase_name(transition.phase));
-        let previous_duration_ms = previous
-            .as_ref()
-            .map_or(0, |transition| elapsed_ms(transition.at, entered_at));
         self.save(record).await?;
         progress.publish(phase, record.worker.cleanup_required);
+        if phase == ExecutionPhase::Finished {
+            return Ok(());
+        }
         let label = phase_name(phase);
         info!(
             event = "phase_started",
             run_id = %record.request.run_id,
             phase = ?phase,
-            phase_name = label,
-            previous_phase,
-            previous_duration_ms,
-            dnp_name = %record.request.package.dnp_name,
-            cleanup_required = record.worker.cleanup_required,
-            "[phase] {label}"
+            "{label}"
         );
         Ok(())
     }

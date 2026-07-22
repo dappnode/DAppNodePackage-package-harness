@@ -31,7 +31,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let _ = dotenvy::dotenv();
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                EnvFilter::new("dappnode_package_harness=info,tower_http=info")
+            }),
         )
         // Event names and fields preserve machine-searchable structure. Hiding
         // Rust module targets makes the default Docker log view much easier to
@@ -44,11 +46,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let config = Arc::new(Config::from_env()?);
     info!(
         event = "harness_starting",
-        version = env!("CARGO_PKG_VERSION"),
+        version = %env!("CARGO_PKG_VERSION"),
         worker_id = %config.package_harness_worker_id,
         listen_addr = %config.listen_addr,
         data_dir = %config.data_dir.display(),
-        "[startup] Package Harness starting"
+        "Package Harness starting"
     );
     info!(
         event = "execution_policy_loaded",
@@ -66,7 +68,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         cleanup_timeout_ms = config.cleanup_timeout.as_millis() as u64,
         retained_baseline_packages = ?config.retain_baseline_packages,
         log_tail_lines = config.log_tail,
-        "  Execution policy loaded"
+        "Execution policy loaded"
     );
     info!(
         event = "integration_policy_loaded",
@@ -76,7 +78,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         nexus_model = %config.nexus_model,
         nexus_timeout_ms = config.nexus_timeout.as_millis() as u64,
         nexus_max_input_bytes = config.nexus_max_input_bytes,
-        "  Coordinator and analyzer policy loaded"
+        "Coordinator and analyzer policy loaded"
     );
     let package_manager = package_manager(&config);
     debug!(
@@ -87,10 +89,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return mcp_smoke(package_manager).await;
     }
     let store: Arc<dyn RunStore> = Arc::new(FileRunStore::new(config.data_dir.clone()).await?);
-    info!(
+    debug!(
         event = "run_store_ready",
         data_dir = %config.data_dir.display(),
-        "[ready] Local run store ready"
+        "Local run store ready"
     );
     let clock: Arc<dyn Clock> = Arc::new(TokioClock);
     let controller = Arc::new(RunController::new(
@@ -118,13 +120,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         config.package_harness_worker_token.clone(),
         config.tropibot_timeout,
     )?;
-    info!(
+    debug!(
         event = "coordinator_client_ready",
         tropibot_url = %config.tropibot_url,
         worker_id = %config.package_harness_worker_id,
         tropibot_timeout_ms = config.tropibot_timeout.as_millis() as u64,
         mcp_enabled = config.package_manager_mode == PackageManagerMode::Mcp,
-        "[ready] Tropibot coordinator client ready"
+        "Tropibot coordinator client ready"
     );
     let accepting = Arc::new(AtomicBool::new(true));
     let worker_readiness = WorkerReadiness::default();
@@ -156,9 +158,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
     info!(
-        address = %config.listen_addr,
         event = "supervision_server_started",
-        "[ready] Supervision server listening"
+        address = %config.listen_addr,
+        "Supervision server listening"
     );
     debug!(event = "supervision_server_binding_complete");
     axum::serve(listener, router(state))
@@ -166,13 +168,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .await?;
     info!(
         event = "supervision_server_stopped",
-        "[stop] Supervision server stopped"
+        "Supervision server stopped"
     );
     match tokio::time::timeout(Duration::from_secs(300), worker).await {
         Ok(result) => {
             info!(
                 event = "worker_shutdown_complete",
-                "[ok] Worker shutdown complete"
+                "Worker shutdown complete"
             );
             result?;
         }
@@ -180,7 +182,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             error!(
                 event = "worker_shutdown_timeout",
                 timeout_seconds = 300,
-                "[error] Worker did not stop within the shutdown deadline"
+                "Worker did not stop within the shutdown deadline"
             );
         }
     }
@@ -270,6 +272,6 @@ async fn shutdown_signal(accepting: Arc<AtomicBool>) {
     accepting.store(false, Ordering::SeqCst);
     info!(
         event = "shutdown_started",
-        "[shutdown] Shutdown requested; finishing safe work"
+        "Shutdown requested; finishing safe work"
     );
 }

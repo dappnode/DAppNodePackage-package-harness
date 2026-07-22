@@ -4,7 +4,7 @@ use futures_util::StreamExt;
 use reqwest::{Client, StatusCode, Url, header};
 use thiserror::Error;
 
-use crate::analysis::redaction::redact_and_bound;
+use crate::analysis::redaction::redact_and_bound_single_line;
 
 use super::protocol::{
     ClaimRequest, ClaimResponse, ClaimedJob, CompletionResponse, HeartbeatRequest,
@@ -245,7 +245,7 @@ impl CoordinatorClient {
             .send()
             .await
             .map_err(|error| CoordinatorError::Transient {
-                message: redact_and_bound(&error.to_string(), ERROR_PREVIEW_BYTES),
+                message: redact_and_bound_single_line(&error.to_string(), ERROR_PREVIEW_BYTES),
             })?;
         let status = response.status();
         let body = response_bytes(response).await?;
@@ -266,7 +266,7 @@ async fn response_bytes(response: reqwest::Response) -> Result<Vec<u8>, Coordina
     let mut bytes = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| CoordinatorError::Transient {
-            message: redact_and_bound(&error.to_string(), ERROR_PREVIEW_BYTES),
+            message: redact_and_bound_single_line(&error.to_string(), ERROR_PREVIEW_BYTES),
         })?;
         if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
             return Err(CoordinatorError::Protocol(format!(
@@ -286,7 +286,7 @@ fn transient_status(status: StatusCode) -> bool {
 
 fn status_message(status: StatusCode, body: &[u8]) -> String {
     let preview = String::from_utf8_lossy(body);
-    let preview = redact_and_bound(&preview, ERROR_PREVIEW_BYTES);
+    let preview = redact_and_bound_single_line(&preview, ERROR_PREVIEW_BYTES);
     if preview.is_empty() {
         status.to_string()
     } else {

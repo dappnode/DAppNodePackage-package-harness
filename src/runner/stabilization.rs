@@ -49,7 +49,7 @@ pub async fn stabilize(
         poll_interval_ms = config.poll_interval.as_millis() as u64,
         required_stable_samples = config.required_samples,
         max_attempts,
-        "[wait] Waiting for a stable, all-running container set"
+        "Waiting for a stable, all-running container set"
     );
 
     for attempt in 0..max_attempts {
@@ -106,7 +106,7 @@ pub async fn stabilize(
                     required_stable_samples = config.required_samples,
                     non_running = ?non_running,
                     elapsed_ms = elapsed_ms(started, clock.now()),
-                    "[sample] Container health sample collected"
+                    "Container health sample collected"
                 );
                 push_sample(
                     &mut samples,
@@ -127,7 +127,7 @@ pub async fn stabilize(
                         samples = attempt + 1,
                         stable_samples = consecutive,
                         container_count = details.containers.len(),
-                        "[ok] Containers are stable and running"
+                        "Containers are stable and running"
                     );
                     return StabilizationResult {
                         passed: true,
@@ -148,7 +148,7 @@ pub async fn stabilize(
                     max_attempts,
                     elapsed_ms = elapsed_ms(started, clock.now()),
                     error = %error,
-                    "[warn] Could not inspect containers; stability streak reset"
+                    "Could not inspect containers; stability streak reset"
                 );
                 push_sample(
                     &mut samples,
@@ -183,7 +183,7 @@ pub async fn stabilize(
         required_stable_samples = config.required_samples,
         last_non_running = ?last_non_running_states,
         control = ?control,
-        "[error] Containers did not reach the required stable state"
+        "Containers did not reach the required stable state"
     );
     StabilizationResult {
         passed: false,

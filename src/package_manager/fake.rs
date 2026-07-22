@@ -129,6 +129,7 @@ impl PackageManager for FakePackageManager {
                     .map(ToString::to_string)
                     .unwrap_or_else(|| "1.0.0-fake-baseline".to_owned()),
             ),
+            resolved_ref: version.map(ToString::to_string),
             image_count: Some(1),
             requires_user_input: false,
             summary: "fake install preview".to_owned(),

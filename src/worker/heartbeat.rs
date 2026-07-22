@@ -56,7 +56,7 @@ impl HeartbeatTask {
                                 run_id = %job_id,
                                 phase = heartbeat_phase(snapshot.phase),
                                 cleanup_required = snapshot.cleanup_required,
-                                "[heartbeat] Tropibot acknowledged; job is still active"
+                                "Tropibot acknowledged; job is still active"
                             );
                             successful_since_log = 0;
                             last_logged_phase = Some(snapshot.phase);
@@ -68,7 +68,7 @@ impl HeartbeatTask {
                             run_id = %job_id,
                             phase = heartbeat_phase(snapshot.phase),
                             cleanup_required = snapshot.cleanup_required,
-                            "[warn] Tropibot requested cancellation; stopping at the next safe boundary"
+                            "Tropibot requested cancellation; stopping at the next safe boundary"
                         );
                         progress.request_cancellation();
                     }
@@ -78,7 +78,7 @@ impl HeartbeatTask {
                             run_id = %job_id,
                             phase = heartbeat_phase(snapshot.phase),
                             cleanup_required = snapshot.cleanup_required,
-                            "[error] Tropibot no longer recognizes this claim; cleanup will be reconciled"
+                            "Tropibot no longer recognizes this claim; cleanup will be reconciled"
                         );
                         progress.mark_claim_lost();
                     }
@@ -88,7 +88,7 @@ impl HeartbeatTask {
                             event = "heartbeat_authentication_failed",
                             phase = heartbeat_phase(snapshot.phase),
                             error = %error,
-                            "[warn] Tropibot rejected heartbeat authentication"
+                            "Tropibot rejected heartbeat authentication"
                         );
                     }
                     Err(error) => {
@@ -97,7 +97,7 @@ impl HeartbeatTask {
                             event = "heartbeat_failed",
                             error = %error,
                             transient = error.is_transient(),
-                            "[warn] Heartbeat failed; package execution continues with local recovery protection"
+                            "Heartbeat failed; package execution continues with local recovery protection"
                         );
                     }
                 }

@@ -13,7 +13,7 @@ services:
       PACKAGE_MANAGER_MODE: mcp
       DAPPMANAGER_MCP_URL: "http://my.dappnode/mcp"
       DAPPMANAGER_MCP_TOKEN: ""
-      MCP_TIMEOUT_MS: "30000"
+      MCP_TIMEOUT_MS: "300000"
       MCP_MUTATION_TIMEOUT_MS: "1800000"
       MCP_MUTATION_ATTEMPTS: "3"
       MCP_MUTATION_RETRY_DELAY_MS: "5000"
@@ -26,6 +26,7 @@ services:
       PACKAGE_HARNESS_HEARTBEAT_SECONDS: "20"
       NEXUS_API_KEY: ""
       NEXUS_MODEL: nexus/auto
+      NEXUS_TIMEOUT_MS: "300000"
       RUST_LOG: dappnode_package_harness=info,tower_http=info
     expose:
       - "8080"

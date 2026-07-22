@@ -30,6 +30,13 @@ pub fn redact_and_bound(input: &str, maximum_bytes: usize) -> String {
     truncate_utf8(&output, maximum_bytes)
 }
 
+/// Redacts an untrusted value and makes it safe for one-line text logs.
+pub fn redact_and_bound_single_line(input: &str, maximum_bytes: usize) -> String {
+    let redacted = redact_and_bound(input, maximum_bytes.saturating_mul(2));
+    let normalized = redacted.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_utf8(&normalized, maximum_bytes)
+}
+
 pub fn sha256_hex(input: &str) -> String {
     hex::encode(Sha256::digest(input.as_bytes()))
 }
@@ -66,4 +73,19 @@ fn redact_long_tokens(input: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_and_bound_single_line;
+
+    #[test]
+    fn log_values_are_redacted_and_kept_on_one_line() {
+        let value = redact_and_bound_single_line(
+            "502 Bad Gateway\nAuthorization: Bearer sensitive-value\ntry again",
+            200,
+        );
+
+        assert_eq!(value, "502 Bad Gateway Authorization: [REDACTED] try again");
+    }
 }

@@ -47,6 +47,10 @@ pub struct PackageLogs {
 pub struct PreviewSummary {
     pub package_name: Option<String>,
     pub version: Option<String>,
+    /// Exact immutable reference resolved by DAppManager. Used only while
+    /// building the local rollback plan, not as persisted test evidence.
+    #[serde(skip)]
+    pub resolved_ref: Option<String>,
     pub image_count: Option<usize>,
     pub requires_user_input: bool,
     pub summary: String,

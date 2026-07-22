@@ -10,7 +10,9 @@ use std::{
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use dappnode_package_harness::{
-    analysis::{CompositeLogAnalyzer, HeuristicLogAnalyzer, LogAnalyzer, NexusLogAnalyzer},
+    analysis::{
+        AnalyzerError, CompositeLogAnalyzer, HeuristicLogAnalyzer, LogAnalyzer, NexusLogAnalyzer,
+    },
     clock::Clock,
     coordinator::protocol::{ClaimResponse, CompleteRequest, HeartbeatRequest},
     coordinator::{ClaimOutcome, CompletionDisposition, CoordinatorClient, HeartbeatOutcome},
@@ -193,6 +195,7 @@ impl PackageManager for ScriptedPackageManager {
         Ok(PreviewSummary {
             package_name: Some(dnp_name.to_string()),
             version: version.map(ToString::to_string),
+            resolved_ref: version.map(ToString::to_string),
             image_count: Some(1),
             requires_user_input: false,
             summary: "preview".to_owned(),
@@ -730,6 +733,40 @@ async fn malformed_nexus_response_falls_back_to_heuristic() -> Result<(), Box<dy
         result.status,
         dappnode_package_harness::model::AnalyzerStatus::Clean
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn slow_nexus_response_is_reported_as_timeout() -> Result<(), Box<dyn Error>> {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(100))
+                .set_body_json(json!({"choices": []})),
+        )
+        .mount(&server)
+        .await;
+    let nexus = NexusLogAnalyzer::new(
+        "test-key".to_owned(),
+        server.uri(),
+        "test-model".to_owned(),
+        Duration::from_millis(20),
+        4096,
+    )?;
+
+    let error = match nexus
+        .analyze(&LogAnalysisInput {
+            baseline: Vec::new(),
+            candidate: Vec::new(),
+        })
+        .await
+    {
+        Ok(_) => return Err("a delayed Nexus response did not exceed the deadline".into()),
+        Err(error) => error,
+    };
+
+    assert_eq!(error, AnalyzerError::Timeout);
     Ok(())
 }
 

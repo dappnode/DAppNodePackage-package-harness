@@ -144,6 +144,70 @@ impl DappmanagerPackageManager {
         }
         unreachable!("mutation attempts are validated to be non-zero")
     }
+
+    async fn install_package_with_options(
+        &self,
+        dnp_name: &DnpName,
+        version: Option<&PackageRef>,
+        bypass_signature: bool,
+    ) -> Result<(), PackageManagerError> {
+        let options = install_options(version, bypass_signature);
+        let user_settings = serde_json::Map::new();
+        match self
+            .retry_mutation(
+                "dappnode_install_package",
+                dnp_name,
+                version.map(PackageRef::as_str),
+                || {
+                    self.mutation_client
+                        .install_package(dnp_name, version, &user_settings, options)
+                },
+                || async { self.client.get_package_details(dnp_name).await.is_ok() },
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) if required_setup_error(&error.to_string()) => {
+                Err(PackageManagerError::RequiredSetup)
+            }
+            Err(error) if operation_in_progress_error(&error.to_string()) => Ok(()),
+            Err(error) => Err(package_error(error)),
+        }
+    }
+
+    async fn update_package_with_options(
+        &self,
+        dnp_name: &DnpName,
+        version: &PackageRef,
+        bypass_signature: bool,
+    ) -> Result<(), PackageManagerError> {
+        let options = install_options(Some(version), bypass_signature);
+        self.retry_mutation(
+            "dappnode_update_package",
+            dnp_name,
+            Some(version.as_str()),
+            || {
+                self.mutation_client
+                    .update_package(dnp_name, Some(version), options)
+            },
+            || async {
+                self.client
+                    .get_package_details(dnp_name)
+                    .await
+                    .ok()
+                    .and_then(|details| details.version)
+                    .is_some_and(|installed| installed.to_string() == version.as_str())
+            },
+        )
+        .await
+        .or_else(|error| {
+            if operation_in_progress_error(&error.to_string()) {
+                Ok(())
+            } else {
+                Err(package_error(error))
+            }
+        })
+    }
 }
 
 #[async_trait]
@@ -269,28 +333,17 @@ impl PackageManager for DappmanagerPackageManager {
         dnp_name: &DnpName,
         version: Option<&PackageRef>,
     ) -> Result<(), PackageManagerError> {
-        let options = install_options(version);
-        let user_settings = serde_json::Map::new();
-        match self
-            .retry_mutation(
-                "dappnode_install_package",
-                dnp_name,
-                version.map(PackageRef::as_str),
-                || {
-                    self.mutation_client
-                        .install_package(dnp_name, version, &user_settings, options)
-                },
-                || async { self.client.get_package_details(dnp_name).await.is_ok() },
-            )
+        self.install_package_with_options(dnp_name, version, false)
             .await
-        {
-            Ok(()) => Ok(()),
-            Err(error) if required_setup_error(&error.to_string()) => {
-                Err(PackageManagerError::RequiredSetup)
-            }
-            Err(error) if operation_in_progress_error(&error.to_string()) => Ok(()),
-            Err(error) => Err(package_error(error)),
-        }
+    }
+
+    async fn install_package_bypassing_signature(
+        &self,
+        dnp_name: &DnpName,
+        version: Option<&PackageRef>,
+    ) -> Result<(), PackageManagerError> {
+        self.install_package_with_options(dnp_name, version, true)
+            .await
     }
 
     async fn update_package(
@@ -298,32 +351,17 @@ impl PackageManager for DappmanagerPackageManager {
         dnp_name: &DnpName,
         version: &PackageRef,
     ) -> Result<(), PackageManagerError> {
-        let options = install_options(Some(version));
-        self.retry_mutation(
-            "dappnode_update_package",
-            dnp_name,
-            Some(version.as_str()),
-            || {
-                self.mutation_client
-                    .update_package(dnp_name, Some(version), options)
-            },
-            || async {
-                self.client
-                    .get_package_details(dnp_name)
-                    .await
-                    .ok()
-                    .and_then(|details| details.version)
-                    .is_some_and(|installed| installed.to_string() == version.as_str())
-            },
-        )
-        .await
-        .or_else(|error| {
-            if operation_in_progress_error(&error.to_string()) {
-                Ok(())
-            } else {
-                Err(package_error(error))
-            }
-        })
+        self.update_package_with_options(dnp_name, version, false)
+            .await
+    }
+
+    async fn update_package_bypassing_signature(
+        &self,
+        dnp_name: &DnpName,
+        version: &PackageRef,
+    ) -> Result<(), PackageManagerError> {
+        self.update_package_with_options(dnp_name, version, true)
+            .await
     }
 
     async fn remove_package(
@@ -390,12 +428,17 @@ fn container_state(state: ContainerState) -> String {
     .to_owned()
 }
 
-fn install_options(version: Option<&PackageRef>) -> InstallOptions {
-    match version {
+fn install_options(version: Option<&PackageRef>, bypass_signature: bool) -> InstallOptions {
+    let options = match version {
         Some(version) if version.is_ipfs() => {
             InstallOptions::default().with_bypass_signed_restriction()
         }
         _ => InstallOptions::default(),
+    };
+    if bypass_signature {
+        options.with_bypass_signed_restriction()
+    } else {
+        options
     }
 }
 
@@ -506,7 +549,7 @@ mod tests {
     #[test]
     fn ipfs_update_bypasses_signed_restriction() -> Result<(), Box<dyn Error>> {
         let request = request_with_candidate("/ipfs/QmCandidate")?;
-        let options = install_options(Some(&request.package.candidate_ref));
+        let options = install_options(Some(&request.package.candidate_ref), false);
         assert!(options.bypass_signed_restriction);
         assert!(!options.bypass_core_restriction);
         assert!(!options.bypass_resolver);
@@ -516,20 +559,32 @@ mod tests {
     #[test]
     fn registry_update_does_not_bypass_signed_restriction() -> Result<(), Box<dyn Error>> {
         let request = request_with_candidate("0.1.56")?;
-        assert!(install_options(Some(&request.package.candidate_ref)).is_empty());
+        assert!(install_options(Some(&request.package.candidate_ref), false).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn signature_retry_explicitly_bypasses_registry_restriction() -> Result<(), Box<dyn Error>> {
+        let request = request_with_candidate("0.1.56")?;
+        let options = install_options(Some(&request.package.candidate_ref), true);
+        assert!(options.bypass_signed_restriction);
+        assert!(!options.bypass_core_restriction);
+        assert!(!options.bypass_resolver);
         Ok(())
     }
 
     #[test]
     fn ipfs_install_bypasses_signed_restriction() -> Result<(), Box<dyn Error>> {
         let request = request_with_candidate("ipfs://QmCandidate")?;
-        assert!(install_options(Some(&request.package.candidate_ref)).bypass_signed_restriction);
+        assert!(
+            install_options(Some(&request.package.candidate_ref), false).bypass_signed_restriction
+        );
         Ok(())
     }
 
     #[test]
     fn latest_install_does_not_bypass_signed_restriction() {
-        assert!(install_options(None).is_empty());
+        assert!(install_options(None, false).is_empty());
     }
 
     fn request_with_candidate(candidate_ref: &str) -> Result<RunRequest, Box<dyn Error>> {

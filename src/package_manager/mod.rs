@@ -99,6 +99,24 @@ impl PackageManagerError {
             Self::InvalidResponse { .. } | Self::RequiredSetup | Self::NotFound => false,
         }
     }
+
+    /// Whether DAppManager rejected a package because its signature was not safe.
+    pub fn is_signature_rejection(&self) -> bool {
+        let message = self.to_string().to_ascii_lowercase();
+        let mentions_signature = message.contains("signature")
+            || message.contains("signed restriction")
+            || message.contains("not signed")
+            || message.contains("unsigned");
+        let indicates_rejection = message.contains("invalid")
+            || message.contains("bad")
+            || message.contains("unsafe")
+            || message.contains("not signed")
+            || message.contains("unsigned")
+            || message.contains("restriction")
+            || message.contains("reject")
+            || message.contains("bypass_signed_restriction");
+        mentions_signature && indicates_rejection
+    }
 }
 
 pub(crate) fn retryable_transport_message(message: &str) -> bool {
@@ -165,6 +183,15 @@ pub trait PackageManager: Send + Sync {
         version: Option<&PackageRef>,
     ) -> Result<(), PackageManagerError>;
 
+    /// Installs a baseline after its signature rejection has been reported.
+    async fn install_package_bypassing_signature(
+        &self,
+        dnp_name: &DnpName,
+        version: Option<&PackageRef>,
+    ) -> Result<(), PackageManagerError> {
+        self.install_package(dnp_name, version).await
+    }
+
     /// Updates an installed package to the candidate reference.
     async fn update_package(
         &self,
@@ -172,10 +199,44 @@ pub trait PackageManager: Send + Sync {
         version: &PackageRef,
     ) -> Result<(), PackageManagerError>;
 
+    /// Updates to a baseline after its signature rejection has been reported.
+    async fn update_package_bypassing_signature(
+        &self,
+        dnp_name: &DnpName,
+        version: &PackageRef,
+    ) -> Result<(), PackageManagerError> {
+        self.update_package(dnp_name, version).await
+    }
+
     /// Removes the package after a run.
     async fn remove_package(
         &self,
         dnp_name: &DnpName,
         delete_volumes: bool,
     ) -> Result<(), PackageManagerError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PackageManagerError;
+
+    #[test]
+    fn identifies_signature_rejections_without_matching_unrelated_errors() {
+        let invalid_signature = PackageManagerError::Tool {
+            tool: "dappnode_install_package".to_owned(),
+            message: "unsafe origin, bad signature".to_owned(),
+        };
+        let unsigned = PackageManagerError::Tool {
+            tool: "dappnode_install_package".to_owned(),
+            message: "package is not signed; set BYPASS_SIGNED_RESTRICTION".to_owned(),
+        };
+        let invalid_manifest = PackageManagerError::Tool {
+            tool: "dappnode_install_package".to_owned(),
+            message: "package manifest is invalid".to_owned(),
+        };
+
+        assert!(invalid_signature.is_signature_rejection());
+        assert!(unsigned.is_signature_rejection());
+        assert!(!invalid_manifest.is_signature_rejection());
+    }
 }

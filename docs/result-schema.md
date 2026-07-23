@@ -20,6 +20,12 @@ Top-level fields:
 | `cleanup` | Cleanup status, bounded error, and packages not present in the initial snapshot. |
 | `errors` | Bounded typed run errors with the phase where each occurred. |
 
+If Dappmanager rejects the baseline package signature, the harness retries that
+baseline mutation with the signed-package restriction bypass. A successful
+retry continues the comparison, changes an otherwise passing verdict to
+`warning` with reason code `baseline_signature_invalid`, and preserves the
+original rejection in `errors`.
+
 Representative successful result:
 
 ```json

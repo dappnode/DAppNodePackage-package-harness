@@ -9,6 +9,7 @@ pub enum ReasonCode {
     CandidateInstallFailed,
     BaselineContainersUnstable,
     BaselineInstallFailed,
+    BaselineSignatureInvalid,
     BaselineUnavailable,
     UnsupportedRequiredSetup,
     CorePackageRefused,

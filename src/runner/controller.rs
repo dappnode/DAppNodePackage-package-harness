@@ -308,6 +308,23 @@ impl RunController {
                 phase: ExecutionPhase::Cleanup,
             });
         }
+        if record
+            .errors
+            .iter()
+            .any(|error| error.code == ReasonCode::BaselineSignatureInvalid)
+        {
+            match verdict {
+                Verdict::Passed => {
+                    verdict = Verdict::Warning;
+                    reason = ReasonCode::BaselineSignatureInvalid;
+                    summary = format!("{summary}; baseline signature validation was bypassed");
+                }
+                Verdict::Warning => {
+                    summary = format!("{summary}; baseline signature validation was bypassed");
+                }
+                Verdict::Failed | Verdict::Inconclusive | Verdict::InfrastructureError => {}
+            }
+        }
 
         let finished = Utc::now();
         record.status = ExecutionStatus::Completed;
@@ -535,6 +552,46 @@ impl RunController {
                         .install_package(&package.dnp_name, package.baseline_ref.as_ref())
                         .await
                 }
+            };
+            let install_result = match install_result {
+                Err(error) if error.is_signature_rejection() => {
+                    let warning = truncate_utf8(
+                        &format!("baseline signature validation failed and was bypassed: {error}"),
+                        500,
+                    );
+                    warn!(
+                        event = "baseline_signature_bypassed",
+                        run_id = %record.request.run_id,
+                        dnp_name = %package.dnp_name,
+                        error = %warning,
+                        "Baseline signature was rejected; retrying with the signed-package restriction bypass"
+                    );
+                    let retry = match (installed_baseline, package.baseline_ref.as_ref()) {
+                        (Some(_), Some(baseline_ref)) => {
+                            self.package_manager
+                                .update_package_bypassing_signature(&package.dnp_name, baseline_ref)
+                                .await
+                        }
+                        _ => {
+                            self.package_manager
+                                .install_package_bypassing_signature(
+                                    &package.dnp_name,
+                                    package.baseline_ref.as_ref(),
+                                )
+                                .await
+                        }
+                    };
+                    if retry.is_ok() {
+                        record.errors.push(RunError {
+                            code: ReasonCode::BaselineSignatureInvalid,
+                            message: warning,
+                            phase: ExecutionPhase::BaselineInstall,
+                        });
+                        self.save_failure(record).await?;
+                    }
+                    retry
+                }
+                result => result,
             };
             match install_result {
                 Ok(()) => {}

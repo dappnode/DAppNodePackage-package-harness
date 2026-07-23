@@ -68,6 +68,7 @@ struct ScriptedPackageManager {
     list_packages_delay: Duration,
     package_details_delay: Duration,
     remove_leaves_installed: bool,
+    baseline_signature_rejected: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -78,6 +79,7 @@ struct ScriptedState {
     install_calls: usize,
     update_versions: Vec<String>,
     cleanup_calls: usize,
+    signature_bypass_calls: usize,
 }
 
 impl ScriptedPackageManager {
@@ -96,6 +98,7 @@ impl ScriptedPackageManager {
             list_packages_delay: Duration::ZERO,
             package_details_delay: Duration::ZERO,
             remove_leaves_installed: false,
+            baseline_signature_rejected: false,
         }
     }
 
@@ -133,6 +136,32 @@ impl ScriptedPackageManager {
 
     fn update_versions(&self) -> Result<Vec<String>, PackageManagerError> {
         Ok(self.state()?.update_versions.clone())
+    }
+
+    fn signature_bypass_calls(&self) -> Result<usize, PackageManagerError> {
+        Ok(self.state()?.signature_bypass_calls)
+    }
+
+    fn install_baseline(
+        &self,
+        version: Option<&PackageRef>,
+        bypass_signature: bool,
+    ) -> Result<(), PackageManagerError> {
+        let mut state = self.state()?;
+        state.install_calls = state.install_calls.saturating_add(1);
+        if self.baseline_signature_rejected && !bypass_signature {
+            return Err(PackageManagerError::Tool {
+                tool: "dappnode_install_package".to_owned(),
+                message: "unsafe origin, bad signature".to_owned(),
+            });
+        }
+        if bypass_signature {
+            state.signature_bypass_calls = state.signature_bypass_calls.saturating_add(1);
+        }
+        state.installed = true;
+        state.candidate = false;
+        state.version = version.map_or_else(|| "baseline".to_owned(), ToString::to_string);
+        Ok(())
     }
 }
 
@@ -231,12 +260,15 @@ impl PackageManager for ScriptedPackageManager {
         _dnp_name: &DnpName,
         version: Option<&PackageRef>,
     ) -> Result<(), PackageManagerError> {
-        let mut state = self.state()?;
-        state.install_calls = state.install_calls.saturating_add(1);
-        state.installed = true;
-        state.candidate = false;
-        state.version = version.map_or_else(|| "baseline".to_owned(), ToString::to_string);
-        Ok(())
+        self.install_baseline(version, false)
+    }
+
+    async fn install_package_bypassing_signature(
+        &self,
+        _dnp_name: &DnpName,
+        version: Option<&PackageRef>,
+    ) -> Result<(), PackageManagerError> {
+        self.install_baseline(version, true)
     }
 
     async fn update_package(
@@ -419,6 +451,28 @@ async fn normal_run_persists_result_and_cleans_up() -> Result<(), Box<dyn Error>
     );
     assert_eq!(record.cleanup.status, CleanupStatus::Passed);
     assert_eq!(observation.cleanup_calls()?, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_baseline_signature_is_bypassed_and_reported_as_warning()
+-> Result<(), Box<dyn Error>> {
+    let request = request("baseline-signature-warning")?;
+    let mut manager = ScriptedPackageManager::new(request.package.dnp_name.clone());
+    manager.baseline_signature_rejected = true;
+    let observation = Arc::new(manager);
+    let (_directory, _store, record) =
+        execute_with(request, observation.clone(), &NoopRunProgress).await?;
+    let result = record.result.ok_or("missing result")?;
+
+    assert_eq!(result.verdict, Verdict::Warning);
+    assert_eq!(result.reason_code, ReasonCode::BaselineSignatureInvalid);
+    assert!(result.errors.iter().any(|error| {
+        error.code == ReasonCode::BaselineSignatureInvalid
+            && error.message.contains("unsafe origin, bad signature")
+    }));
+    assert_eq!(observation.signature_bypass_calls()?, 1);
+    assert_eq!(record.cleanup.status, CleanupStatus::Passed);
     Ok(())
 }
 

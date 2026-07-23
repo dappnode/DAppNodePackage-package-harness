@@ -852,6 +852,105 @@ async fn malformed_nexus_response_falls_back_to_heuristic() -> Result<(), Box<dy
 }
 
 #[tokio::test]
+async fn nexus_accepts_useful_responses_over_the_original_bounds() -> Result<(), Box<dyn Error>> {
+    let server = MockServer::start().await;
+    let findings = (0..25)
+        .map(|_| {
+            json!({
+                "severity": "warning",
+                "container": "service-".to_owned() + &"x".repeat(292),
+                "evidence": "e".repeat(1_500),
+                "reason": "r".repeat(1_500)
+            })
+        })
+        .collect::<Vec<_>>();
+    let content = json!({
+        "analyzer": "nexus",
+        "status": "suspicious",
+        "summary": "s".repeat(1_500),
+        "baseline": {"status": "clean", "summary": "b".repeat(1_500)},
+        "candidate": {"status": "suspicious", "summary": "c".repeat(1_500)},
+        "newFindings": findings,
+        "analyzerErrors": ["model-supplied internal error"],
+        "components": [{
+            "analyzer": "nexus",
+            "status": "clean",
+            "summary": "model-supplied internal component",
+            "newFindings": [],
+            "error": null
+        }]
+    })
+    .to_string();
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": content}}]
+        })))
+        .mount(&server)
+        .await;
+    let nexus = NexusLogAnalyzer::new(
+        "test-key".to_owned(),
+        server.uri(),
+        "test-model".to_owned(),
+        Duration::from_secs(1),
+        4096,
+    )?;
+
+    let result = nexus
+        .analyze(&LogAnalysisInput {
+            baseline: Vec::new(),
+            candidate: Vec::new(),
+        })
+        .await?;
+
+    assert_eq!(result.summary.len(), 1_000);
+    assert_eq!(result.baseline.summary.len(), 1_000);
+    assert_eq!(result.candidate.summary.len(), 1_000);
+    assert_eq!(result.new_findings.len(), 20);
+    assert_eq!(result.new_findings[0].evidence.len(), 1_000);
+    assert_eq!(result.new_findings[0].reason.len(), 1_000);
+    assert_eq!(
+        result.new_findings[0].container.as_ref().map(String::len),
+        Some(255)
+    );
+    assert!(result.analyzer_errors.is_empty());
+    assert!(result.components.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn oversized_nexus_http_response_is_rejected() -> Result<(), Box<dyn Error>> {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(257 * 1024)))
+        .mount(&server)
+        .await;
+    let nexus = NexusLogAnalyzer::new(
+        "test-key".to_owned(),
+        server.uri(),
+        "test-model".to_owned(),
+        Duration::from_secs(1),
+        4096,
+    )?;
+
+    let error = match nexus
+        .analyze(&LogAnalysisInput {
+            baseline: Vec::new(),
+            candidate: Vec::new(),
+        })
+        .await
+    {
+        Ok(_) => return Err("an oversized Nexus response was accepted".into()),
+        Err(error) => error,
+    };
+
+    assert_eq!(
+        error,
+        AnalyzerError::InvalidResponse("Nexus response exceeds 262144 bytes".to_owned())
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn slow_nexus_response_is_reported_as_timeout() -> Result<(), Box<dyn Error>> {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

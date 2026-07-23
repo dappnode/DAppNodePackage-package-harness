@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="avatar-bg" x1="70" y1="30" x2="442" y2="482" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#092449"/>
+      <stop offset="1" stop-color="#031126"/>
+    </linearGradient>
+    <linearGradient id="dappnode-purple" x1="2.345" y1="5.53" x2="129.31" y2="126.8" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#5231C6"/>
+      <stop offset="1" stop-color="#E60AF6"/>
+    </linearGradient>
+    <linearGradient id="belt-orange" x1="64" y1="346" x2="448" y2="424" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFB900"/>
+      <stop offset="1" stop-color="#FC7A16"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="512" height="512" fill="#06172F"/>
+  <rect x="8" y="8" width="496" height="496" rx="86" fill="url(#avatar-bg)"/>
+  <rect x="16" y="16" width="480" height="480" rx="78" fill="none" stroke="#102F59" stroke-width="5"/>
+
+  <!-- Official DAppNode logo paths from https://docs.dappnode.io/img/logo.svg -->
+  <g transform="translate(122 44) scale(2)">
+    <path d="M64.8794 111.756L9.81192 56.6882C3.27064 50.1469 0 41.5735 0 33.0001C0 28.6364 0.847293 24.2727 2.54188 20.177C0.903992 24.1268 0 28.4579 0 33.0001V100C0 118.502 14.9985 133.5 33.5 133.5C47.8651 133.5 60.1184 124.458 64.8794 111.756Z" fill="#007DFC"/>
+    <path d="M67 33V100C67 118.502 81.9985 133.5 100.5 133.5C119.002 133.5 134 118.502 134 100V33C134 51.5015 119.002 66.5 100.5 66.5C81.9985 66.5 67 51.5015 67 33Z" fill="#FC9E22"/>
+    <path fill-rule="evenodd" clip-rule="evenodd" d="M9.81192 9.31192C22.8945 -3.77064 44.1055 -3.77064 57.1881 9.31192L124.188 76.3119C137.271 89.3945 137.271 110.606 124.188 123.688C111.106 136.771 89.8945 136.771 76.8119 123.688L9.81192 56.6881C-3.27064 43.6055 -3.27064 22.3945 9.81192 9.31192Z" fill="url(#dappnode-purple)"/>
+    <path d="M64.8791 111.756L21.7441 68.6206C25.4019 67.2497 29.3632 66.5 33.4997 66.5C52.0012 66.5 66.9997 81.4985 66.9997 100C66.9997 104.136 66.25 108.098 64.8791 111.756Z" fill="#06D4E7"/>
+    <path d="M69.1206 21.2444L112.256 64.3794C108.598 65.7503 104.636 66.5 100.5 66.5C81.9985 66.5 67 51.5015 67 33C67 28.8636 67.7497 24.9022 69.1206 21.2444Z" fill="#FF397F"/>
+    <path d="M112.256 64.3794C124.958 59.6184 134 47.3651 134 33C134 14.4985 119.002 -0.5 100.5 -0.5C86.1349 -0.5 73.8816 8.54167 69.1206 21.2445L112.256 64.3794Z" fill="#FFB900"/>
+    <path d="M21.7445 68.6206C9.04167 73.3816 0 85.6349 0 100C0 118.502 14.9985 133.5 33.5 133.5C47.8651 133.5 60.1184 124.458 64.8794 111.756L21.7445 68.6206Z" fill="#00B1F4"/>
+  </g>
+
+  <!-- Industrial test harness -->
+  <g transform="matrix(.85 0 0 .85 38 0)">
+  <path d="M64 335C170 410 342 410 448 335V385C338 455 174 455 64 385Z"
+        fill="url(#belt-orange)" stroke="#04142C" stroke-width="12" stroke-linejoin="round"/>
+  <path d="M72 346C180 405 332 405 440 346" fill="none" stroke="#FFD45C" stroke-width="7" stroke-linecap="round" opacity="0.8"/>
+
+  <g fill="#FF9918" stroke="#04142C" stroke-width="10">
+    <rect x="139" y="365" width="37" height="67" rx="9" transform="rotate(7 157.5 398.5)"/>
+    <rect x="336" y="365" width="37" height="67" rx="9" transform="rotate(-7 354.5 398.5)"/>
+    <rect x="207" y="378" width="98" height="63" rx="14"/>
+  </g>
+  <rect x="225" y="393" width="62" height="30" rx="7" fill="#FFB900" stroke="#04142C" stroke-width="8"/>
+  <rect x="265" y="402" width="9" height="12" rx="3" fill="#04142C"/>
+
+  <!-- Wrench and pouch -->
+  <g transform="translate(0 -40)">
+  <path d="M72 377V427C72 448 89 461 110 461H126C143 461 156 448 156 431V394Z"
+        fill="#FC8B17" stroke="#04142C" stroke-width="11" stroke-linejoin="round"/>
+  <path d="M115 392L121 344C138 334 146 315 139 297L124 318L109 313L105 296L120 276C99 273 80 286 76 307C73 322 79 336 91 345L86 393Z"
+        fill="#FFB900" stroke="#04142C" stroke-width="11" stroke-linejoin="round"/>
+  </g>
+
+  <!-- Verified badge -->
+  <g transform="translate(0 -40)">
+  <circle cx="414" cy="405" r="50" fill="#FC8B17" stroke="#04142C" stroke-width="12"/>
+  <circle cx="414" cy="405" r="38" fill="#FF9E1A" stroke="#FFC64B" stroke-width="5"/>
+  <path d="M392 405L407 420L437 388" fill="none" stroke="#FFFFFF" stroke-width="13" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  </g>
+</svg>

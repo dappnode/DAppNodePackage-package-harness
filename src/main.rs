@@ -20,7 +20,10 @@ use dappnode_package_harness::{
     },
     runner::{RunController, RunnerConfig, stabilization::StabilizationConfig},
     storage::{FileRunStore, RunStore},
-    worker::{PackageHarnessWorker, WorkerConfig, WorkerDependencies, WorkerReadiness},
+    worker::{
+        PackageHarnessWorker, WorkerConfig, WorkerDependencies, WorkerReadiness,
+        WorkerRecoveryControl,
+    },
 };
 use tracing::{debug, error, info};
 use tracing_subscriber::EnvFilter;
@@ -130,6 +133,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     let accepting = Arc::new(AtomicBool::new(true));
     let worker_readiness = WorkerReadiness::default();
+    let worker_recovery_control = WorkerRecoveryControl::default();
     worker_readiness.set_not_ready("worker is reconciling local state");
     let worker = PackageHarnessWorker::new(
         coordinator,
@@ -147,6 +151,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             cleanup_timeout: config.cleanup_timeout,
         },
         worker_readiness.clone(),
+        worker_recovery_control.clone(),
         Arc::clone(&accepting),
     );
     let worker = tokio::spawn(worker.run());
@@ -154,7 +159,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let state = ApiState {
         config: Arc::clone(&config),
         package_manager,
+        store,
         worker_readiness,
+        worker_recovery_control: worker_recovery_control.clone(),
     };
     let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
     info!(
@@ -164,7 +171,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     debug!(event = "supervision_server_binding_complete");
     axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown_signal(Arc::clone(&accepting)))
+        .with_graceful_shutdown(shutdown_signal(
+            Arc::clone(&accepting),
+            worker_recovery_control,
+        ))
         .await?;
     info!(
         event = "supervision_server_stopped",
@@ -248,7 +258,10 @@ async fn mcp_smoke(package_manager: Arc<dyn PackageManager>) -> Result<(), Box<d
     Ok(())
 }
 
-async fn shutdown_signal(accepting: Arc<AtomicBool>) {
+async fn shutdown_signal(
+    accepting: Arc<AtomicBool>,
+    worker_recovery_control: WorkerRecoveryControl,
+) {
     let ctrl_c = async {
         if let Err(signal_error) = tokio::signal::ctrl_c().await {
             error!(event = "signal_error", error = %signal_error);
@@ -270,6 +283,7 @@ async fn shutdown_signal(accepting: Arc<AtomicBool>) {
         () = terminate => {}
     }
     accepting.store(false, Ordering::SeqCst);
+    worker_recovery_control.resume();
     info!(
         event = "shutdown_started",
         "Shutdown requested; finishing safe work"

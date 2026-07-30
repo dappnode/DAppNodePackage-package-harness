@@ -9,6 +9,7 @@ services:
     environment:
       PORT: "8080"
       DATA_DIR: /data
+      HARNESS_DNP_NAME: package-harness.dnp.dappnode.eth
       ALLOW_DESTRUCTIVE_PACKAGE_TESTS: "true"
 
       PACKAGE_MANAGER_MODE: mcp

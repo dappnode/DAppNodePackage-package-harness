@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta name="theme-color" content="#11100f">
+    <title>Package Harness · Operator Console</title>
+    <link rel="stylesheet" href="/dashboard.css">
+    <script src="/dashboard.js" defer></script>
+  </head>
+  <body>
+    <div class="ambient ambient-one"></div>
+    <div class="ambient ambient-two"></div>
+    <main class="shell">
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="Package Harness dashboard">
+          <span class="brand-mark" aria-hidden="true">H</span>
+          <span>
+            <strong>Package Harness</strong>
+            <small>Operator console</small>
+          </span>
+        </a>
+        <div class="worker-state" id="worker-state" aria-live="polite">
+          <span class="state-dot"></span>
+          <span id="worker-label">Connecting</span>
+        </div>
+      </header>
+
+      <section class="hero">
+        <div>
+          <p class="eyebrow">DAppNode validation operations</p>
+          <h1>Jobs, recovery, and delivery<br>in one place.</h1>
+          <p class="hero-copy" id="worker-message">
+            Loading the local worker state…
+          </p>
+        </div>
+        <div class="hero-actions">
+          <button class="button button-secondary" id="refresh-button" type="button">
+            Refresh now
+          </button>
+          <span class="updated" id="last-updated">Not updated yet</span>
+        </div>
+      </section>
+
+      <section class="metrics" aria-label="Job overview">
+        <article class="metric">
+          <span>Total jobs</span>
+          <strong id="metric-total">—</strong>
+          <small>Persisted locally</small>
+        </article>
+        <article class="metric metric-attention">
+          <span>Needs attention</span>
+          <strong id="metric-attention">—</strong>
+          <small>Operator action required</small>
+        </article>
+        <article class="metric">
+          <span>In progress</span>
+          <strong id="metric-active">—</strong>
+          <small>Queued or running</small>
+        </article>
+        <article class="metric">
+          <span>Delivered</span>
+          <strong id="metric-delivered">—</strong>
+          <small>Acknowledged by Tropibot</small>
+        </article>
+      </section>
+
+      <section class="jobs-section">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Local run history</p>
+            <h2>Package jobs</h2>
+          </div>
+          <div class="controls">
+            <label class="search">
+              <span class="sr-only">Search jobs</span>
+              <input id="search-input" type="search" placeholder="Search package or run ID">
+            </label>
+            <div class="filters" role="group" aria-label="Filter jobs">
+              <button class="filter is-active" data-filter="all" type="button">All</button>
+              <button class="filter" data-filter="attention" type="button">Needs action</button>
+              <button class="filter" data-filter="active" type="button">Active</button>
+              <button class="filter" data-filter="completed" type="button">Completed</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="notice is-hidden" id="error-notice" role="alert"></div>
+        <div class="jobs" id="jobs" aria-live="polite" aria-busy="true"></div>
+
+        <div class="empty is-hidden" id="empty-state">
+          <span class="empty-mark" aria-hidden="true">◎</span>
+          <h3>No matching jobs</h3>
+          <p>Try another filter or wait for Tropibot to assign work.</p>
+        </div>
+      </section>
+    </main>
+
+    <div class="toast-region" id="toast-region" aria-live="assertive"></div>
+  </body>
+</html>

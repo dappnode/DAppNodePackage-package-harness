@@ -13,6 +13,7 @@ use dappnode_package_harness::{
     analysis::{
         AnalyzerError, CompositeLogAnalyzer, HeuristicLogAnalyzer, LogAnalyzer, NexusLogAnalyzer,
     },
+    api::routes::{OperatorRecoveryError, acknowledge_cleanup_recovery},
     clock::{Clock, TokioClock},
     coordinator::protocol::{ClaimResponse, CompleteRequest, HeartbeatRequest},
     coordinator::{ClaimOutcome, CompletionDisposition, CoordinatorClient, HeartbeatOutcome},
@@ -31,7 +32,7 @@ use dappnode_package_harness::{
     storage::{FileRunStore, RunStore},
     worker::{
         PackageHarnessWorker, WorkerConfig, WorkerDependencies, WorkerReadiness,
-        progress::WorkerProgress,
+        WorkerRecoveryControl, progress::WorkerProgress,
     },
 };
 use serde_json::json;
@@ -441,6 +442,22 @@ fn worker_for(
     manager: Arc<dyn PackageManager>,
     accepting: Arc<AtomicBool>,
 ) -> Result<PackageHarnessWorker, Box<dyn Error>> {
+    worker_for_with_recovery_control(
+        server,
+        store,
+        manager,
+        accepting,
+        WorkerRecoveryControl::default(),
+    )
+}
+
+fn worker_for_with_recovery_control(
+    server: &MockServer,
+    store: Arc<FileRunStore>,
+    manager: Arc<dyn PackageManager>,
+    accepting: Arc<AtomicBool>,
+    recovery_control: WorkerRecoveryControl,
+) -> Result<PackageHarnessWorker, Box<dyn Error>> {
     let clock: Arc<dyn Clock> = Arc::new(ImmediateClock);
     let store_port: Arc<dyn RunStore> = store;
     let controller = Arc::new(RunController::new(
@@ -473,6 +490,7 @@ fn worker_for(
             cleanup_timeout: Duration::from_millis(10),
         },
         WorkerReadiness::default(),
+        recovery_control,
         accepting,
     ))
 }
@@ -1396,6 +1414,98 @@ async fn polling_worker_claims_executes_and_acknowledges_before_next_claim()
         Some("recorded")
     );
     assert!(record.worker.pending_completion_body.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn operator_cleanup_acknowledgement_resumes_worker_without_restart()
+-> Result<(), Box<dyn Error>> {
+    let request = request("operator-cleanup-recovery")?;
+    let mut failing_manager = ScriptedPackageManager::new(request.package.dnp_name.clone());
+    failing_manager.cleanup_failure = true;
+    let (_directory, store, mut record) =
+        execute_with(request.clone(), Arc::new(failing_manager), &NoopRunProgress).await?;
+    assert_eq!(record.cleanup.status, CleanupStatus::Failed);
+    record.worker.claim_token =
+        Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned());
+    record.worker.manual_recovery_reason =
+        Some("target cleanup failed; operator action is required".to_owned());
+    store.save(&record).await?;
+
+    let server = MockServer::start().await;
+    let accepting = Arc::new(AtomicBool::new(true));
+    let stop_after_completion = Arc::clone(&accepting);
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1/package-harness/jobs/operator-cleanup-recovery/complete",
+        ))
+        .respond_with(move |_: &wiremock::Request| {
+            stop_after_completion.store(false, Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(json!({
+                "schemaVersion": 1,
+                "disposition": "recorded"
+            }))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let recovery_control = WorkerRecoveryControl::default();
+    let manager: Arc<dyn PackageManager> = Arc::new(ScriptedPackageManager::new(
+        request.package.dnp_name.clone(),
+    ));
+    let worker = worker_for_with_recovery_control(
+        &server,
+        Arc::clone(&store),
+        manager,
+        Arc::clone(&accepting),
+        recovery_control.clone(),
+    )?;
+    let worker_task = tokio::spawn(worker.run());
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    acknowledge_cleanup_recovery(store.as_ref(), &recovery_control, &request.run_id).await?;
+    tokio::time::timeout(Duration::from_secs(2), worker_task).await??;
+
+    let recovered = store
+        .get(&request.run_id)
+        .await?
+        .ok_or("missing recovered worker record")?;
+    assert!(recovered.worker.manual_recovery_reason.is_none());
+    assert!(recovered.worker.completion_acknowledged);
+    assert_eq!(
+        recovered.worker.completion_disposition.as_deref(),
+        Some("recorded")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn operator_cleanup_acknowledgement_rejects_non_cleanup_holds() -> Result<(), Box<dyn Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let store = Arc::new(FileRunStore::new(directory.path().to_path_buf()).await?);
+    let request = request("operator-conflict-recovery")?;
+    let mut record = RunRecord::claimed(request.clone(), "claim-token".to_owned());
+    record.worker.cleanup_required = true;
+    record.worker.manual_recovery_reason =
+        Some("Tropibot completion conflict requires operator recovery".to_owned());
+    store.create(&record).await?;
+
+    let error = acknowledge_cleanup_recovery(
+        store.as_ref(),
+        &WorkerRecoveryControl::default(),
+        &request.run_id,
+    )
+    .await
+    .err()
+    .ok_or("non-cleanup hold was unexpectedly acknowledged")?;
+    assert!(matches!(error, OperatorRecoveryError::NotCleanup));
+    let preserved = store
+        .get(&request.run_id)
+        .await?
+        .ok_or("missing preserved worker record")?;
+    assert!(preserved.worker.manual_recovery_reason.is_some());
     Ok(())
 }
 

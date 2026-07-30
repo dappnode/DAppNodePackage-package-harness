@@ -13,8 +13,8 @@
   "description": "Polls Tropibot for deterministic baseline-to-candidate Dappnode package tests on a dedicated disposable node. It captures bounded evidence, performs advisory log analysis, cleans up the target package, and reliably delivers the result back to Tropibot.",
   "exposable": [
     {
-      "description": "Local health and readiness endpoints for package supervision only; jobs are polled outbound from Tropibot.",
-      "name": "Package Harness supervision",
+      "description": "Operator dashboard with package job status, cleanup recovery, health, and readiness.",
+      "name": "Package Harness operator console",
       "port": 8080,
       "serviceName": "package-harness"
     }
@@ -28,7 +28,8 @@
   ],
   "license": "GPL-3.0",
   "links": {
-    "homepage": "https://github.com/dappnode/DAppNodePackage-package-harness"
+    "homepage": "https://github.com/dappnode/DAppNodePackage-package-harness",
+    "ui": "http://package-harness.dappnode:8080/"
   },
   "name": "package-harness.dnp.dappnode.eth",
   "repository": {

@@ -12,7 +12,7 @@ Tropibot claim → atomically persist claim → execute one package job
     → retry completion until Tropibot acknowledges it
 ```
 
-The harness has no public job-submission or GitHub API. It needs outbound HTTPS access to Tropibot. `GET /healthz` is a process check; `GET /readyz` also checks Dappmanager tool availability and unresolved local recovery state.
+The harness has no public job-submission or GitHub API. It needs outbound HTTPS access to Tropibot. Its package UI opens an embedded operator dashboard at `/` with local job history, worker state, cleanup and delivery status, and cleanup-recovery controls. `GET /api/jobs` supplies the dashboard without exposing claim tokens or credentials. `GET /healthz` is a process check; `GET /readyz` also checks Dappmanager tool availability and unresolved local recovery state.
 
 For every accepted job, the deterministic controller:
 
@@ -80,6 +80,18 @@ Every request carries `Authorization: Bearer <PACKAGE_HARNESS_WORKER_TOKEN>`, `C
 Before mutating, the worker atomically persists the full claim and opaque claim token under `DATA_DIR`. It persists every recovery-relevant phase and, before network delivery, the exact serialized completion JSON. Transient failures and coordinator compatibility rejections retry the same bytes with capped backoff and worker-specific jitter, so a coordinator upgrade heals delivery without a worker restart. Successful delivery clears legacy delivery-recovery markers. The worker never claims another job until completion is acknowledged as `recorded` or `duplicate`.
 
 On restart, a pending completion is retried first. An interrupted job is never rerun: if it may have mutated the target, the worker inspects Dappmanager, performs bounded cleanup, then sends an `interrupted` worker-error completion. A lost claim is released locally after cleanup succeeds; if Tropibot still holds unresolved coordinator state, the next claim receives a conflict and polling stops without inventing new local recovery work. Manual recovery is reserved for failed cleanup, ambiguous local records, or a conflicting completion that proves Tropibot already holds different state for the claim.
+
+After manually completing a failed target cleanup, acknowledge that exact run through the internal supervision API:
+
+```bash
+curl --fail-with-body \
+  --request POST \
+  --header 'content-type: application/json' \
+  --data '{"runId":"gh-pr-177-f33e0a37375d-f0181f51d12f8734"}' \
+  http://HARNESS_HOST:8080/operator/recovery/continue
+```
+
+The endpoint accepts only cleanup-related manual holds. It preserves the claim token and stored result, clears the persisted hold, and wakes the paused worker without a container restart. It does not override coordinator completion conflicts.
 
 Heartbeats run independently of package execution. A cancellation request is observed at safe phase boundaries and inside stabilization polling. It prevents a new mutating phase but never bypasses required cleanup. If Tropibot no longer recognizes the claim, the worker finishes the current operation, reconciles cleanup, and releases the obsolete local claim when the target is safe.
 

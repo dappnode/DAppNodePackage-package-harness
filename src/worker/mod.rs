@@ -10,6 +10,7 @@ use std::{
     },
     time::Duration,
 };
+use tokio::sync::Notify;
 
 use tracing::{debug, error, info, warn};
 
@@ -87,6 +88,22 @@ impl WorkerReadiness {
     }
 }
 
+/// Wakes a worker paused on a cleanup-related operator recovery hold.
+#[derive(Clone, Debug, Default)]
+pub struct WorkerRecoveryControl {
+    notify: Arc<Notify>,
+}
+
+impl WorkerRecoveryControl {
+    pub fn resume(&self) {
+        self.notify.notify_one();
+    }
+
+    async fn wait(&self) {
+        self.notify.notified().await;
+    }
+}
+
 /// Polls Tropibot, drives exactly one local run at a time, and only claims
 /// again after the previous completion has been acknowledged.
 pub struct PackageHarnessWorker {
@@ -97,6 +114,7 @@ pub struct PackageHarnessWorker {
     clock: Arc<dyn Clock>,
     config: WorkerConfig,
     readiness: WorkerReadiness,
+    recovery_control: WorkerRecoveryControl,
     accepting: Arc<AtomicBool>,
 }
 
@@ -106,6 +124,7 @@ impl PackageHarnessWorker {
         dependencies: WorkerDependencies,
         config: WorkerConfig,
         readiness: WorkerReadiness,
+        recovery_control: WorkerRecoveryControl,
         accepting: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -116,6 +135,7 @@ impl PackageHarnessWorker {
             clock: dependencies.clock,
             config,
             readiness,
+            recovery_control,
             accepting,
         }
     }
@@ -124,106 +144,137 @@ impl PackageHarnessWorker {
     /// action is needed. Errors that make another claim unsafe become a local
     /// not-ready reason instead of being silently skipped.
     pub async fn run(self) {
-        debug!(
-            event = "worker_recovery_started",
-            worker_id = %self.config.worker_id,
-            "Checking local state before polling for work"
-        );
-        if let Err(error) = self.recover().await {
-            error!(
-                event = "worker_recovery_failed",
+        'resume: loop {
+            debug!(
+                event = "worker_recovery_started",
                 worker_id = %self.config.worker_id,
-                error = %error,
-                "Worker requires operator recovery and will not claim work"
+                "Checking local state before polling for work"
             );
-            self.readiness.set_not_ready(error);
-            return;
-        }
-        self.readiness.clear();
-        info!(
-            event = "worker_polling_started",
-            "Ready; polling Tropibot for package jobs"
-        );
-        let mut transient_attempt = 0_u32;
-        while self.accepting.load(Ordering::SeqCst) {
-            match self.coordinator.claim().await {
-                Ok(ClaimOutcome::NoWork) => {
-                    transient_attempt = 0;
-                    debug!(
-                        event = "claim_no_work",
-                        poll_interval_seconds = self.config.poll_interval.as_secs(),
-                    );
-                    tokio::time::sleep(self.config.poll_interval).await;
+            if let Err(error) = self.recover().await {
+                error!(
+                    event = "worker_recovery_failed",
+                    worker_id = %self.config.worker_id,
+                    error = %error,
+                    "Worker requires operator recovery and is not claiming work"
+                );
+                self.readiness.set_not_ready(&error);
+                if self.wait_for_cleanup_acknowledgement(&error).await {
+                    continue 'resume;
                 }
-                Ok(ClaimOutcome::Claimed(job)) => {
-                    transient_attempt = 0;
-                    info!(
-                        event = "claim_succeeded",
-                        run_id = %job.request.run_id,
-                        dnp_name = %job.request.package.dnp_name,
-                        repository = %job.request.source.repository,
-                        pull_request = job.request.source.pull_request,
-                        candidate_ref = %job.request.package.candidate_ref,
-                        baseline_ref = job.request.package.baseline_ref.as_ref().map_or("latest", PackageRef::as_str),
-                        "Claimed package validation job"
-                    );
-                    if let Err(error) = self.process_claim(job).await {
-                        error!(
-                            event = "claim_processing_failed",
-                            error = %error,
-                            "Claimed job could not be completed safely"
+                return;
+            }
+            self.readiness.clear();
+            info!(
+                event = "worker_polling_started",
+                "Ready; polling Tropibot for package jobs"
+            );
+            let mut transient_attempt = 0_u32;
+            while self.accepting.load(Ordering::SeqCst) {
+                match self.coordinator.claim().await {
+                    Ok(ClaimOutcome::NoWork) => {
+                        transient_attempt = 0;
+                        debug!(
+                            event = "claim_no_work",
+                            poll_interval_seconds = self.config.poll_interval.as_secs(),
                         );
-                        self.readiness.set_not_ready(error);
+                        tokio::time::sleep(self.config.poll_interval).await;
+                    }
+                    Ok(ClaimOutcome::Claimed(job)) => {
+                        transient_attempt = 0;
+                        info!(
+                            event = "claim_succeeded",
+                            run_id = %job.request.run_id,
+                            dnp_name = %job.request.package.dnp_name,
+                            repository = %job.request.source.repository,
+                            pull_request = job.request.source.pull_request,
+                            candidate_ref = %job.request.package.candidate_ref,
+                            baseline_ref = job.request.package.baseline_ref.as_ref().map_or("latest", PackageRef::as_str),
+                            "Claimed package validation job"
+                        );
+                        if let Err(error) = self.process_claim(job).await {
+                            error!(
+                                event = "claim_processing_failed",
+                                error = %error,
+                                "Claimed job could not be completed safely"
+                            );
+                            self.readiness.set_not_ready(&error);
+                            if self.wait_for_cleanup_acknowledgement(&error).await {
+                                continue 'resume;
+                            }
+                            return;
+                        }
+                    }
+                    Err(CoordinatorError::Authentication { status }) => {
+                        error!(
+                            event = "claim_authentication_failed",
+                            status = status.as_u16(),
+                            "Tropibot rejected worker authentication; polling stopped"
+                        );
+                        self.readiness.set_not_ready(
+                            "Tropibot rejected worker authentication; polling stopped",
+                        );
+                        return;
+                    }
+                    Err(CoordinatorError::UnresolvedJob) => {
+                        error!(
+                            event = "claim_unresolved_job",
+                            "Tropibot reports an unresolved job with no matching local record"
+                        );
+                        self.readiness.set_not_ready(
+                        "Tropibot reports an unresolved job but no recoverable local record exists",
+                    );
+                        return;
+                    }
+                    Err(error) if error.is_transient() => {
+                        transient_attempt = transient_attempt.saturating_add(1);
+                        warn!(
+                            event = "claim_transient_failure",
+                            attempt = transient_attempt,
+                            error = %error,
+                            "Tropibot claim failed transiently; polling will retry"
+                        );
+                        tokio::time::sleep(retry_delay(
+                            self.config.poll_interval,
+                            transient_attempt,
+                            &self.config.worker_id,
+                        ))
+                        .await;
+                    }
+                    Err(error) => {
+                        error!(
+                            event = "claim_failed",
+                            error = %error,
+                            "Tropibot claim failed permanently; polling stopped"
+                        );
+                        self.readiness
+                            .set_not_ready(format!("Tropibot claim failed: {error}"));
                         return;
                     }
                 }
-                Err(CoordinatorError::Authentication { status }) => {
-                    error!(
-                        event = "claim_authentication_failed",
-                        status = status.as_u16(),
-                        "Tropibot rejected worker authentication; polling stopped"
-                    );
-                    self.readiness
-                        .set_not_ready("Tropibot rejected worker authentication; polling stopped");
-                    return;
-                }
-                Err(CoordinatorError::UnresolvedJob) => {
-                    error!(
-                        event = "claim_unresolved_job",
-                        "Tropibot reports an unresolved job with no matching local record"
-                    );
-                    self.readiness.set_not_ready(
-                        "Tropibot reports an unresolved job but no recoverable local record exists",
-                    );
-                    return;
-                }
-                Err(error) if error.is_transient() => {
-                    transient_attempt = transient_attempt.saturating_add(1);
-                    warn!(
-                        event = "claim_transient_failure",
-                        attempt = transient_attempt,
-                        error = %error,
-                        "Tropibot claim failed transiently; polling will retry"
-                    );
-                    tokio::time::sleep(retry_delay(
-                        self.config.poll_interval,
-                        transient_attempt,
-                        &self.config.worker_id,
-                    ))
-                    .await;
-                }
-                Err(error) => {
-                    error!(
-                        event = "claim_failed",
-                        error = %error,
-                        "Tropibot claim failed permanently; polling stopped"
-                    );
-                    self.readiness
-                        .set_not_ready(format!("Tropibot claim failed: {error}"));
-                    return;
-                }
             }
+            return;
         }
+    }
+
+    async fn wait_for_cleanup_acknowledgement(&self, error: &str) -> bool {
+        if !cleanup_recovery_hold(error) || !self.accepting.load(Ordering::SeqCst) {
+            return false;
+        }
+        info!(
+            event = "worker_waiting_for_cleanup_acknowledgement",
+            worker_id = %self.config.worker_id,
+            "Worker is paused until an operator acknowledges completed manual cleanup"
+        );
+        self.recovery_control.wait().await;
+        if !self.accepting.load(Ordering::SeqCst) {
+            return false;
+        }
+        info!(
+            event = "worker_cleanup_acknowledgement_received",
+            worker_id = %self.config.worker_id,
+            "Operator acknowledgement received; retrying local recovery"
+        );
+        true
     }
 
     async fn process_claim(&self, job: ClaimedJob) -> Result<(), String> {
@@ -789,6 +840,10 @@ fn cleanup_failed(record: &RunRecord) -> bool {
         record.cleanup.status,
         CleanupStatus::Failed | CleanupStatus::TimedOut
     )
+}
+
+fn cleanup_recovery_hold(error: &str) -> bool {
+    error.contains("cleanup")
 }
 
 fn worker_error_cleanup_status(record: &RunRecord) -> CleanupStatus {

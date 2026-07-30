@@ -13,9 +13,9 @@ use crate::{
     model::{
         AnalysisSide, AnalyzerKind, AnalyzerStatus, CaptureEvidence, CleanupStatus,
         ComparisonEvidence, ExecutionPhase, ExecutionStatus, HardCheckResult, HarnessResult,
-        InstallResult, LogAnalysisInput, LogAnalysisResult, LogCollectionResult, PackageResolver,
-        ReasonCode, ResultExecution, ResultPackage, ResultSide, ResultSource, RunError, RunId,
-        RunRecord, StabilizationResult, StepStatus, TargetRecoveryPlan, Verdict,
+        InstallResult, LogAnalysisInput, LogAnalysisResult, LogCollectionResult, PackageRef,
+        PackageResolver, ReasonCode, ResultExecution, ResultPackage, ResultSide, ResultSource,
+        RunError, RunId, RunRecord, StabilizationResult, StepStatus, TargetRecoveryPlan, Verdict,
     },
     package_manager::{PackageManager, PackageManagerError},
     runner::{
@@ -40,7 +40,7 @@ pub struct RunnerConfig {
     pub cleanup_enabled: bool,
     /// Maximum time spent trying to remove the target package.
     pub cleanup_timeout: Duration,
-    /// DNP names whose newly installed baseline is restored and retained.
+    /// DNP names whose resolved published baseline is restored and retained.
     pub retain_baseline_packages: BTreeSet<String>,
 }
 
@@ -425,7 +425,13 @@ impl RunController {
             installed_version = installed_baseline.and_then(|package| package.version.as_deref()).unwrap_or("none"),
             "Inventory inspected"
         );
-        let installed_baseline_ref = if let Some(installed_baseline) = installed_baseline {
+        let retain_baseline = self
+            .config
+            .retain_baseline_packages
+            .contains(package.dnp_name.as_str());
+        let installed_baseline_ref = if let Some(installed_baseline) =
+            installed_baseline.filter(|_| !retain_baseline)
+        {
             let version = installed_baseline
                 .version
                 .as_deref()
@@ -455,24 +461,17 @@ impl RunController {
             self.save_failure(record).await?;
             Some(baseline_ref)
         } else {
-            // Persist removal as the safe fallback before the first install.
-            // A retained package is promoted to Restore only after its exact
-            // baseline version has been captured successfully.
+            // Persist removal as the safe fallback before the first mutation.
+            // Retained packages are promoted to an exact Restore plan after
+            // the canonical baseline has been resolved.
             record.worker.set_recovery_plan(TargetRecoveryPlan::Remove);
             self.save_failure(record).await?;
             None
         };
 
-        let reuse_installed_baseline = installed_baseline.is_some_and(|installed| {
-            package
-                .baseline_ref
-                .as_ref()
-                .is_none_or(|requested| installed.version.as_deref() == Some(requested.as_str()))
-        });
-
         self.phase_failure(record, ExecutionPhase::BaselinePreview, progress)
             .await?;
-        let installed_baseline_preview = if let Some(installed_ref) = &installed_baseline_ref {
+        if let Some(installed_ref) = &installed_baseline_ref {
             let preview = self
                 .package_manager
                 .preview_install(&package.dnp_name, Some(installed_ref))
@@ -507,23 +506,30 @@ impl RunController {
                     retained: false,
                 });
             self.save_failure(record).await?;
-            Some(preview)
-        } else {
-            None
-        };
-        let baseline_preview = if reuse_installed_baseline {
-            installed_baseline_preview.ok_or_else(|| Failure {
-                verdict: Verdict::InfrastructureError,
-                reason: ReasonCode::BaselineUnavailable,
-                summary: "installed baseline preview was not captured".to_owned(),
-            })?
-        } else {
-            self.package_manager
-                .preview_install(&package.dnp_name, package.baseline_ref.as_ref())
-                .await
-                .map_err(infrastructure)?
-        };
+        }
+        // An omitted baselineRef always means the latest published release.
+        // Installed node state must not silently replace that request.
+        let baseline_preview = self
+            .package_manager
+            .preview_install(&package.dnp_name, package.baseline_ref.as_ref())
+            .await
+            .map_err(infrastructure)?;
         let baseline_resolved_ref = baseline_preview.resolved_ref.clone();
+        let baseline_expected_version = baseline_preview.version.clone();
+        let reuse_installed_baseline = installed_baseline.is_some_and(|installed| {
+            let Some(installed_version) = installed.version.as_deref() else {
+                return false;
+            };
+            baseline_expected_version.as_deref().map_or_else(
+                || {
+                    package
+                        .baseline_ref
+                        .as_ref()
+                        .is_some_and(|requested| requested.as_str() == installed_version)
+                },
+                |resolved_version| resolved_version == installed_version,
+            )
+        });
         info!(
             event = "baseline_preview_ready",
             run_id = %record.request.run_id,
@@ -539,6 +545,37 @@ impl RunController {
             .await?;
         let baseline_started = self.clock.now();
         if !reuse_installed_baseline {
+            if retain_baseline && installed_baseline.is_some() {
+                let expected_version =
+                    baseline_expected_version
+                        .as_deref()
+                        .ok_or_else(|| Failure {
+                            verdict: Verdict::InfrastructureError,
+                            reason: ReasonCode::BaselineUnavailable,
+                            summary: "latest baseline preview did not report its resolved version"
+                                .to_owned(),
+                        })?;
+                let restore_ref = baseline_resolved_ref
+                    .as_deref()
+                    .or_else(|| package.baseline_ref.as_ref().map(PackageRef::as_str))
+                    .unwrap_or(expected_version);
+                crate::model::PackageRef::parse(restore_ref).map_err(|error| Failure {
+                    verdict: Verdict::InfrastructureError,
+                    reason: ReasonCode::BaselineUnavailable,
+                    summary: truncate_utf8(
+                        &format!("resolved retained baseline reference is invalid: {error}"),
+                        500,
+                    ),
+                })?;
+                record
+                    .worker
+                    .set_recovery_plan(TargetRecoveryPlan::Restore {
+                        baseline_ref: restore_ref.to_owned(),
+                        expected_version: Some(expected_version.to_owned()),
+                        retained: true,
+                    });
+                self.save_failure(record).await?;
+            }
             self.authorize_cleanup(record, cleanup_authorized, progress)
                 .await?;
             let install_result = match (installed_baseline, package.baseline_ref.as_ref()) {
@@ -653,12 +690,7 @@ impl RunController {
                 reason: ReasonCode::BaselineUnavailable,
                 summary: error,
             })?;
-        if installed_baseline.is_none()
-            && self
-                .config
-                .retain_baseline_packages
-                .contains(package.dnp_name.as_str())
-        {
+        if retain_baseline {
             let baseline_ref = baseline
                 .details
                 .as_ref()

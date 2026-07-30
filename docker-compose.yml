@@ -9,7 +9,6 @@ services:
     environment:
       PORT: "8080"
       DATA_DIR: /data
-      HARNESS_DNP_NAME: package-harness.dnp.dappnode.eth
       PACKAGE_MANAGER_MODE: mcp
       DAPPMANAGER_MCP_URL: "http://my.dappnode/mcp"
       DAPPMANAGER_MCP_TOKEN: ""

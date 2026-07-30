@@ -65,6 +65,7 @@ struct ScriptedPackageManager {
     leave_extra_package: bool,
     core: bool,
     restore_resolution: Option<(String, String)>,
+    latest_release: (String, String),
     list_packages_delay: Duration,
     package_details_delay: Duration,
     remove_leaves_installed: bool,
@@ -80,6 +81,7 @@ struct ScriptedState {
     update_versions: Vec<String>,
     cleanup_calls: usize,
     signature_bypass_calls: usize,
+    preview_requests: Vec<Option<String>>,
 }
 
 impl ScriptedPackageManager {
@@ -95,6 +97,7 @@ impl ScriptedPackageManager {
             leave_extra_package: false,
             core: false,
             restore_resolution: None,
+            latest_release: ("baseline".to_owned(), "/ipfs/QmLatestBaseline".to_owned()),
             list_packages_delay: Duration::ZERO,
             package_details_delay: Duration::ZERO,
             remove_leaves_installed: false,
@@ -125,6 +128,11 @@ impl ScriptedPackageManager {
         self
     }
 
+    fn with_latest_release(mut self, version: &str, resolved_ref: &str) -> Self {
+        self.latest_release = (version.to_owned(), resolved_ref.to_owned());
+        self
+    }
+
     fn installed_version(&self) -> Result<Option<String>, PackageManagerError> {
         let state = self.state()?;
         Ok(state.installed.then(|| state.version.clone()))
@@ -140,6 +148,10 @@ impl ScriptedPackageManager {
 
     fn signature_bypass_calls(&self) -> Result<usize, PackageManagerError> {
         Ok(self.state()?.signature_bypass_calls)
+    }
+
+    fn preview_requests(&self) -> Result<Vec<Option<String>>, PackageManagerError> {
+        Ok(self.state()?.preview_requests.clone())
     }
 
     fn install_baseline(
@@ -160,7 +172,16 @@ impl ScriptedPackageManager {
         }
         state.installed = true;
         state.candidate = false;
-        state.version = version.map_or_else(|| "baseline".to_owned(), ToString::to_string);
+        state.version = version.map_or_else(
+            || self.latest_release.0.clone(),
+            |version| {
+                if version.as_str() == self.latest_release.1 {
+                    self.latest_release.0.clone()
+                } else {
+                    version.to_string()
+                }
+            },
+        );
         Ok(())
     }
 }
@@ -240,15 +261,32 @@ impl PackageManager for ScriptedPackageManager {
         dnp_name: &DnpName,
         version: Option<&PackageRef>,
     ) -> Result<PreviewSummary, PackageManagerError> {
+        self.state()?
+            .preview_requests
+            .push(version.map(ToString::to_string));
+        let (version, resolved_ref) = version.map_or_else(
+            || {
+                (
+                    Some(self.latest_release.0.clone()),
+                    Some(self.latest_release.1.clone()),
+                )
+            },
+            |version| {
+                (
+                    Some(version.to_string()),
+                    Some(
+                        self.restore_resolution
+                            .as_ref()
+                            .filter(|(expected, _)| expected == version.as_str())
+                            .map_or_else(|| version.to_string(), |(_, resolved)| resolved.clone()),
+                    ),
+                )
+            },
+        );
         Ok(PreviewSummary {
             package_name: Some(dnp_name.to_string()),
-            version: version.map(ToString::to_string),
-            resolved_ref: version.map(|version| {
-                self.restore_resolution
-                    .as_ref()
-                    .filter(|(expected, _)| expected == version.as_str())
-                    .map_or_else(|| version.to_string(), |(_, resolved)| resolved.clone())
-            }),
+            version,
+            resolved_ref,
             image_count: Some(1),
             requires_user_input: false,
             summary: "preview".to_owned(),
@@ -286,11 +324,14 @@ impl PackageManager for ScriptedPackageManager {
         state.installed =
             !(self.candidate_removes_target && version.as_str() == "/ipfs/QmCandidate");
         state.candidate = version.as_str() == "/ipfs/QmCandidate";
-        state.version = self
-            .restore_resolution
-            .as_ref()
-            .filter(|(_, resolved)| resolved == version.as_str())
-            .map_or_else(|| version.to_string(), |(expected, _)| expected.clone());
+        state.version = if version.as_str() == self.latest_release.1 {
+            self.latest_release.0.clone()
+        } else {
+            self.restore_resolution
+                .as_ref()
+                .filter(|(_, resolved)| resolved == version.as_str())
+                .map_or_else(|| version.to_string(), |(expected, _)| expected.clone())
+        };
         Ok(())
     }
 
@@ -528,7 +569,7 @@ async fn deterministic_candidate_install_failure_is_failed() -> Result<(), Box<d
 }
 
 #[tokio::test]
-async fn installed_target_is_used_as_baseline_and_restored() -> Result<(), Box<dyn Error>> {
+async fn installed_target_is_restored_after_latest_baseline_test() -> Result<(), Box<dyn Error>> {
     let request = request("installed-baseline")?;
     let manager = Arc::new(
         ScriptedPackageManager::new(request.package.dnp_name.clone())
@@ -622,6 +663,44 @@ async fn expensive_baseline_is_retained_then_reused() -> Result<(), Box<dyn Erro
         "second run must reuse baseline"
     );
     assert_eq!(manager.installed_version()?.as_deref(), Some("1.0.0"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn retained_package_resolves_omitted_baseline_as_latest() -> Result<(), Box<dyn Error>> {
+    let request = request("retained-latest-baseline")?;
+    let manager = Arc::new(
+        ScriptedPackageManager::new(request.package.dnp_name.clone())
+            .with_installed_baseline("0.3.1")?
+            .with_latest_release("0.3.0", "/ipfs/QmPublishedBaseline"),
+    );
+    let mut config = runner_config();
+    config
+        .retain_baseline_packages
+        .insert(request.package.dnp_name.to_string());
+
+    let (_directory, _store, record) =
+        execute_with_config(request, manager.clone(), &NoopRunProgress, config).await?;
+
+    assert_eq!(record.cleanup.status, CleanupStatus::Passed);
+    assert_eq!(
+        manager.preview_requests()?,
+        vec![None, Some("/ipfs/QmCandidate".to_owned())],
+        "the installed manifest version must not be sent as the baseline request"
+    );
+    assert_eq!(
+        manager.update_versions()?,
+        vec!["/ipfs/QmCandidate", "/ipfs/QmPublishedBaseline"]
+    );
+    assert_eq!(manager.installed_version()?.as_deref(), Some("0.3.0"));
+    assert!(matches!(
+        record.worker.target_recovery,
+        Some(TargetRecoveryPlan::Restore {
+            baseline_ref,
+            expected_version: Some(expected_version),
+            retained: true,
+        }) if baseline_ref == "/ipfs/QmPublishedBaseline" && expected_version == "0.3.0"
+    ));
     Ok(())
 }
 

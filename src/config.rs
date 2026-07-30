@@ -41,8 +41,8 @@ pub struct Config {
     pub log_tail: usize,
     pub cleanup_enabled: bool,
     pub cleanup_timeout: Duration,
-    /// Packages whose first successful baseline should remain installed and
-    /// be restored after subsequent candidate tests.
+    /// Packages whose resolved published baseline should remain installed and
+    /// be restored after candidate tests.
     pub retain_baseline_packages: BTreeSet<String>,
     pub nexus_api_key: Option<String>,
     pub nexus_base_url: String,

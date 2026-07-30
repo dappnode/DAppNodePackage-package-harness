@@ -9,6 +9,8 @@ services:
     environment:
       PORT: "8080"
       DATA_DIR: /data
+      ALLOW_DESTRUCTIVE_PACKAGE_TESTS: "true"
+
       PACKAGE_MANAGER_MODE: mcp
       DAPPMANAGER_MCP_URL: "http://my.dappnode/mcp"
       DAPPMANAGER_MCP_TOKEN: ""
@@ -16,16 +18,24 @@ services:
       MCP_MUTATION_TIMEOUT_MS: "1800000"
       MCP_MUTATION_ATTEMPTS: "3"
       MCP_MUTATION_RETRY_DELAY_MS: "5000"
+      STABILIZATION_TIMEOUT_MS: "180000"
+      STABILIZATION_POLL_MS: "5000"
+      STABILIZATION_REQUIRED_SAMPLES: "3"
+      LOG_TAIL: "300"
+      CLEANUP_ENABLED: "true"
+      CLEANUP_TIMEOUT_MS: "60000"
       RETAIN_BASELINE_PACKAGES: "near.dnp.dappnode.eth"
-      ALLOW_DESTRUCTIVE_PACKAGE_TESTS: "true"
       TROPIBOT_URL: ""
       PACKAGE_HARNESS_WORKER_ID: ""
       PACKAGE_HARNESS_WORKER_TOKEN: ""
       PACKAGE_HARNESS_POLL_SECONDS: "10"
       PACKAGE_HARNESS_HEARTBEAT_SECONDS: "20"
+      TROPIBOT_TIMEOUT_MS: "15000"
       NEXUS_API_KEY: ""
+      NEXUS_BASE_URL: "https://nexus-api.dappnode.com/v1"
       NEXUS_MODEL: nexus/auto
       NEXUS_TIMEOUT_MS: "300000"
+      NEXUS_MAX_INPUT_BYTES: "65536"
       RUST_LOG: dappnode_package_harness=info,tower_http=info
     expose:
       - "8080"

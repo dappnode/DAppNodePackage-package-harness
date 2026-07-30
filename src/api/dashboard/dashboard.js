@@ -3,6 +3,8 @@ const state = {
   filter: "all",
   query: "",
   loading: false,
+  jobsFingerprint: "",
+  expandedJobs: loadExpandedJobs(),
 };
 
 const elements = {
@@ -66,6 +68,25 @@ function node(tag, className, text) {
   return element;
 }
 
+function loadExpandedJobs() {
+  try {
+    return new Set(JSON.parse(sessionStorage.getItem("expandedHarnessJobs") || "[]"));
+  } catch {
+    return new Set();
+  }
+}
+
+function persistExpandedJobs() {
+  try {
+    sessionStorage.setItem(
+      "expandedHarnessJobs",
+      JSON.stringify([...state.expandedJobs]),
+    );
+  } catch {
+    // The dashboard still works when browser storage is unavailable.
+  }
+}
+
 function badge(value) {
   return node("span", `badge ${value || "pending"}`, humanize(value || "pending"));
 }
@@ -104,6 +125,16 @@ function renderMetrics() {
 
 function renderJob(job) {
   const card = node("details", `job${job.requiresAttention ? " needs-attention" : ""}`);
+  card.dataset.runId = job.runId;
+  card.open = state.expandedJobs.has(job.runId);
+  card.addEventListener("toggle", () => {
+    if (card.open) {
+      state.expandedJobs.add(job.runId);
+    } else {
+      state.expandedJobs.delete(job.runId);
+    }
+    persistExpandedJobs();
+  });
   const summary = node("summary");
 
   const packageCell = node("div", "package-cell");
@@ -205,10 +236,15 @@ async function loadJobs({ quiet = false } = {}) {
     });
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || `Request failed (${response.status})`);
+    const jobsFingerprint = JSON.stringify(payload.jobs);
+    const jobsChanged = jobsFingerprint !== state.jobsFingerprint;
     state.jobs = payload.jobs;
+    state.jobsFingerprint = jobsFingerprint;
     renderWorker(payload.worker);
-    renderMetrics();
-    renderJobs();
+    if (jobsChanged) {
+      renderMetrics();
+      renderJobs();
+    }
     elements.updated.textContent = `Updated ${new Intl.DateTimeFormat(undefined, {
       hour: "2-digit",
       minute: "2-digit",

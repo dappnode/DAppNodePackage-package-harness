@@ -68,7 +68,7 @@ pub struct HeartbeatRequest<'a> {
     pub cleanup_required: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HeartbeatResponse {
     pub schema_version: u8,
@@ -77,7 +77,7 @@ pub struct HeartbeatResponse {
 
 /// Completion payload. Its serialized form is persisted exactly before the
 /// first network attempt and reused verbatim for all retries.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompleteRequest {
     pub schema_version: u8,
@@ -86,14 +86,14 @@ pub struct CompleteRequest {
     pub outcome: CompletionOutcome,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CompletionOutcome {
     Result { result: Box<HarnessResult> },
     WorkerError(WorkerErrorCompletion),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerErrorCompletion {
     pub code: WorkerErrorCode,
@@ -111,7 +111,7 @@ impl From<&WorkerError> for WorkerErrorCompletion {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CompletionResponse {
     pub schema_version: u8,

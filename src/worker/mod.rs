@@ -244,13 +244,13 @@ impl PackageHarnessWorker {
             Err(error) => {
                 self.set_worker_error(&mut record, WorkerErrorCode::UnexpectedError, error)
                     .await?;
-                return self.deliver_or_require_manual_recovery(&mut record).await;
+                return self.deliver_or_pause(&mut record).await;
             }
         };
         if let Some(summary) = unsupported_job {
             self.set_worker_error(&mut record, WorkerErrorCode::UnsupportedJob, summary)
                 .await?;
-            return self.deliver_or_require_manual_recovery(&mut record).await;
+            return self.deliver_or_pause(&mut record).await;
         }
 
         let progress = WorkerProgress::new();
@@ -323,12 +323,7 @@ impl PackageHarnessWorker {
                     .await?;
                 return Err(reason);
             }
-            return Err(self
-                .mark_manual_recovery(
-                    &mut record,
-                    "Tropibot no longer recognizes this claim; cleanup was reconciled locally and operator review is required",
-                )
-                .await?);
+            return self.release_reconciled_claim(&mut record).await;
         }
 
         if cleanup_failed(&record) {
@@ -340,7 +335,7 @@ impl PackageHarnessWorker {
                 .await?);
         }
 
-        self.deliver_or_require_manual_recovery(&mut record).await
+        self.deliver_or_pause(&mut record).await
     }
 
     async fn recover(&self) -> Result<(), String> {
@@ -380,6 +375,9 @@ impl PackageHarnessWorker {
             pending_completion = record.worker.pending_completion_body.is_some(),
             "Found an unresolved local job; reconciling before polling"
         );
+        if record.worker.pending_completion_body.is_some() {
+            return self.deliver_or_pause(&mut record).await;
+        }
         if record.worker.manual_recovery_reason.is_some() {
             return Err(record
                 .worker
@@ -387,11 +385,8 @@ impl PackageHarnessWorker {
                 .clone()
                 .unwrap_or_else(|| "manual recovery is required".to_owned()));
         }
-        if record.worker.pending_completion_body.is_some() {
-            return self.deliver_or_require_manual_recovery(&mut record).await;
-        }
         if record.status == ExecutionStatus::Completed && record.result.is_some() {
-            return self.deliver_or_require_manual_recovery(&mut record).await;
+            return self.deliver_or_pause(&mut record).await;
         }
 
         record.interrupt();
@@ -418,7 +413,7 @@ impl PackageHarnessWorker {
             "worker restarted before this job completed; the job was not rerun".to_owned(),
         )
         .await?;
-        self.deliver_or_require_manual_recovery(&mut record).await
+        self.deliver_or_pause(&mut record).await
     }
 
     async fn unsupported_job_reason(&self, record: &RunRecord) -> Result<Option<String>, String> {
@@ -593,7 +588,7 @@ impl PackageHarnessWorker {
             return Ok(());
         }
         self.prepare_completion(record).await?;
-        let mut transient_attempt = 0_u32;
+        let mut delivery_attempt = 0_u32;
         loop {
             let body = record
                 .worker
@@ -605,7 +600,7 @@ impl PackageHarnessWorker {
             info!(
                 event = "completion_delivery_started",
                 run_id = %record.request.run_id,
-                attempt = transient_attempt.saturating_add(1),
+                attempt = delivery_attempt.saturating_add(1),
                 payload_bytes = body.len(),
                 "Delivering persisted completion to Tropibot"
             );
@@ -621,6 +616,7 @@ impl PackageHarnessWorker {
                         CompletionDisposition::Duplicate => "duplicate".to_owned(),
                     });
                     record.worker.pending_completion_body = None;
+                    record.worker.manual_recovery_reason = None;
                     self.store.save(record).await.map_err(|error| {
                         format!("cannot persist completion acknowledgement: {error}")
                     })?;
@@ -633,17 +629,17 @@ impl PackageHarnessWorker {
                     return Ok(());
                 }
                 Err(error) if error.is_transient() => {
-                    transient_attempt = transient_attempt.saturating_add(1);
+                    delivery_attempt = delivery_attempt.saturating_add(1);
                     warn!(
                         run_id = %record.request.run_id,
                         event = "completion_transient_failure",
-                        attempt = transient_attempt,
+                        attempt = delivery_attempt,
                         error = %error,
                         "Result delivery failed transiently; identical payload will be retried"
                     );
                     tokio::time::sleep(retry_delay(
                         self.config.poll_interval,
-                        transient_attempt,
+                        delivery_attempt,
                         &self.config.worker_id,
                     ))
                     .await;
@@ -666,29 +662,61 @@ impl PackageHarnessWorker {
                         status = status.as_u16(),
                         "Tropibot rejected the result as conflicting"
                     );
-                    return Err("Tropibot rejected the persisted completion as conflicting; operator recovery is required".to_owned());
+                    return Err(self
+                        .mark_manual_recovery(
+                            record,
+                            "Tropibot rejected the persisted completion as conflicting; operator recovery is required",
+                        )
+                        .await?);
                 }
                 Err(error) => {
-                    error!(
+                    delivery_attempt = delivery_attempt.saturating_add(1);
+                    warn!(
                         run_id = %record.request.run_id,
-                        event = "completion_failed",
+                        event = "completion_compatibility_retry",
+                        attempt = delivery_attempt,
                         error = %error,
-                        "Result delivery failed permanently"
+                        "Tropibot rejected the persisted completion; retrying with capped backoff"
                     );
-                    return Err(format!("Tropibot completion failed: {error}"));
+                    tokio::time::sleep(retry_delay(
+                        self.config.poll_interval,
+                        delivery_attempt,
+                        &self.config.worker_id,
+                    ))
+                    .await;
                 }
             }
         }
     }
 
-    async fn deliver_or_require_manual_recovery(
-        &self,
-        record: &mut RunRecord,
-    ) -> Result<(), String> {
-        match self.deliver_until_terminal(record).await {
-            Ok(()) => Ok(()),
-            Err(error) => Err(self.mark_manual_recovery(record, error).await?),
-        }
+    async fn deliver_or_pause(&self, record: &mut RunRecord) -> Result<(), String> {
+        self.deliver_until_terminal(record).await.inspect_err(|error| {
+            warn!(
+                event = "completion_delivery_deferred",
+                run_id = %record.request.run_id,
+                dnp_name = %record.request.package.dnp_name,
+                error = %redact_and_bound(error, 500),
+                "Completion delivery stopped; polling remains paused with local recovery state preserved"
+            );
+        })
+    }
+
+    async fn release_reconciled_claim(&self, record: &mut RunRecord) -> Result<(), String> {
+        record.worker.claim_token = None;
+        record.worker.pending_completion_body = None;
+        record.worker.manual_recovery_reason = None;
+        self.store
+            .save(record)
+            .await
+            .map_err(|error| format!("cannot persist reconciled lost claim: {error}"))?;
+        warn!(
+            event = "claim_loss_reconciled",
+            run_id = %record.request.run_id,
+            dnp_name = %record.request.package.dnp_name,
+            cleanup = ?record.cleanup.status,
+            "Lost claim was released locally after cleanup reconciliation"
+        );
+        Ok(())
     }
 
     async fn mark_manual_recovery(

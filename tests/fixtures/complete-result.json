@@ -1,0 +1,130 @@
+{
+  "schemaVersion": 1,
+  "workerId": "worker-01",
+  "claimToken": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "outcome": {
+    "type": "result",
+    "result": {
+      "schemaVersion": 1,
+      "runId": "gh-pr-42-0123456789ab-abcdef1234567890",
+      "source": {
+        "repository": "dappnode/DAppNodePackage-example",
+        "pullRequest": 42,
+        "headSha": "0123456789abcdef0123456789abcdef01234567"
+      },
+      "package": {
+        "dnpName": "example.dnp.dappnode.eth",
+        "baselineRequestedRef": null,
+        "baselineResolvedVersion": "1.0.0",
+        "candidateRef": "/ipfs/QmCandidate",
+        "candidateReportedVersion": "1.0.1"
+      },
+      "execution": {
+        "status": "completed",
+        "startedAt": "2026-07-10T12:00:00Z",
+        "finishedAt": "2026-07-10T12:01:00Z",
+        "durationMs": 60000
+      },
+      "verdict": "failed",
+      "reasonCode": "candidate_install_failed",
+      "summary": "The candidate package could not be installed",
+      "baseline": {
+        "install": {
+          "status": "passed",
+          "durationMs": 1000
+        },
+        "hardCheck": {
+          "passed": true,
+          "reasonCodes": [],
+          "containerCount": 1,
+          "stableSamples": 3
+        },
+        "containers": [
+          {
+            "name": "example-api",
+            "serviceName": "api",
+            "state": "running",
+            "running": true,
+            "image": "example/api:1.0.0",
+            "created": "2026-07-10T11:59:10Z"
+          }
+        ],
+        "logCollection": {
+          "status": "passed",
+          "containerCount": 1
+        }
+      },
+      "candidate": {
+        "install": {
+          "status": "failed",
+          "durationMs": 1200
+        },
+        "hardCheck": {
+          "passed": false,
+          "reasonCodes": [
+            "candidate_containers_unstable"
+          ],
+          "containerCount": 0,
+          "stableSamples": 0
+        },
+        "containers": [],
+        "logCollection": {
+          "status": "failed",
+          "containerCount": 0
+        }
+      },
+      "comparison": {
+        "baselineHardCheck": true,
+        "candidateHardCheck": false,
+        "baselineContainers": [
+          "example-api"
+        ],
+        "candidateContainers": [],
+        "containersAdded": [],
+        "containersRemoved": [
+          "example-api"
+        ],
+        "baselineVersion": "1.0.0",
+        "candidateVersion": null,
+        "baselineStabilizationMs": 10000,
+        "candidateStabilizationMs": 0,
+        "baselineLastNonRunningStates": [],
+        "candidateLastNonRunningStates": [],
+        "baselineLogsCollected": true,
+        "candidateLogsCollected": false,
+        "deterministicRegressions": [
+          "candidate hard check failed"
+        ]
+      },
+      "logAnalysis": {
+        "analyzer": "heuristic",
+        "status": "inconclusive",
+        "summary": "Log analysis was unavailable",
+        "baseline": {
+          "status": "inconclusive",
+          "summary": "Analysis unavailable"
+        },
+        "candidate": {
+          "status": "inconclusive",
+          "summary": "Analysis unavailable"
+        },
+        "newFindings": [],
+        "analyzerErrors": [
+          "run ended before comparative log analysis"
+        ]
+      },
+      "cleanup": {
+        "status": "passed",
+        "leftoverPackages": [],
+        "error": null
+      },
+      "errors": [
+        {
+          "code": "candidate_install_failed",
+          "message": "Candidate installation returned a detailed package-manager error",
+          "phase": "candidate_install"
+        }
+      ]
+    }
+  }
+}

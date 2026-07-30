@@ -307,10 +307,5 @@ fn normalize_result(result: &mut LogAnalysisResult) {
 }
 
 fn bound_text(input: &str, maximum_bytes: usize) -> String {
-    const TRUNCATION_SUFFIX_BYTES: usize = "…[truncated]".len();
-    if input.len() <= maximum_bytes {
-        input.to_owned()
-    } else {
-        truncate_utf8(input, maximum_bytes.saturating_sub(TRUNCATION_SUFFIX_BYTES))
-    }
+    truncate_utf8(input, maximum_bytes)
 }

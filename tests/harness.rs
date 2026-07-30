@@ -1055,6 +1055,21 @@ fn claim_fixture_is_strictly_validated() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn claim_request_fixture_matches_the_protocol_shape() -> Result<(), Box<dyn Error>> {
+    let actual = serde_json::to_value(
+        dappnode_package_harness::coordinator::protocol::ClaimRequest {
+            schema_version: 1,
+            worker_id: "worker-01",
+        },
+    )?;
+    let expected: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/claim-request.json"))?;
+
+    assert_eq!(actual, expected);
+    Ok(())
+}
+
+#[test]
 fn complete_fixture_matches_the_protocol_shape() -> Result<(), Box<dyn Error>> {
     let completion = CompleteRequest {
         schema_version: 1,
@@ -1076,6 +1091,18 @@ fn complete_fixture_matches_the_protocol_shape() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn complete_result_fixture_matches_the_protocol_shape() -> Result<(), Box<dyn Error>> {
+    let completion: CompleteRequest =
+        serde_json::from_str(include_str!("fixtures/complete-result.json"))?;
+    let actual = serde_json::to_value(completion)?;
+    let expected: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/complete-result.json"))?;
+
+    assert_eq!(actual, expected);
+    Ok(())
+}
+
+#[test]
 fn heartbeat_fixture_matches_the_protocol_shape() -> Result<(), Box<dyn Error>> {
     let heartbeat = HeartbeatRequest {
         schema_version: 1,
@@ -1088,6 +1115,26 @@ fn heartbeat_fixture_matches_the_protocol_shape() -> Result<(), Box<dyn Error>> 
     let expected: serde_json::Value =
         serde_json::from_str(include_str!("fixtures/heartbeat-request.json"))?;
     assert_eq!(actual, expected);
+    Ok(())
+}
+
+#[test]
+fn coordinator_response_fixtures_match_the_protocol_shape() -> Result<(), Box<dyn Error>> {
+    let heartbeat: dappnode_package_harness::coordinator::protocol::HeartbeatResponse =
+        serde_json::from_str(include_str!("fixtures/heartbeat-response.json"))?;
+    let completion: dappnode_package_harness::coordinator::protocol::CompletionResponse =
+        serde_json::from_str(include_str!("fixtures/complete-response.json"))?;
+
+    assert_eq!(
+        serde_json::to_value(heartbeat)?,
+        serde_json::from_str::<serde_json::Value>(include_str!(
+            "fixtures/heartbeat-response.json"
+        ))?
+    );
+    assert_eq!(
+        serde_json::to_value(completion)?,
+        serde_json::from_str::<serde_json::Value>(include_str!("fixtures/complete-response.json"))?
+    );
     Ok(())
 }
 
@@ -1270,6 +1317,242 @@ async fn polling_worker_claims_executes_and_acknowledges_before_next_claim()
         Some("recorded")
     );
     assert!(record.worker.pending_completion_body.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn polling_worker_retries_a_rejected_completion_without_manual_recovery()
+-> Result<(), Box<dyn Error>> {
+    let server = MockServer::start().await;
+    let accepting = Arc::new(AtomicBool::new(true));
+    Mock::given(method("POST"))
+        .and(path("/v1/package-harness/jobs/claim"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(include_str!("fixtures/claim-response.json")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1/package-harness/jobs/gh-pr-42-0123456789ab-abcdef1234567890/heartbeat",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "schemaVersion": 1,
+            "cancelRequested": false
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1/package-harness/jobs/gh-pr-42-0123456789ab-abcdef1234567890/complete",
+        ))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "schemaVersion": 1,
+            "error": "run error is too large"
+        })))
+        .with_priority(1)
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    let stop_after_completion = Arc::clone(&accepting);
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1/package-harness/jobs/gh-pr-42-0123456789ab-abcdef1234567890/complete",
+        ))
+        .respond_with(move |_: &wiremock::Request| {
+            stop_after_completion.store(false, Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(json!({
+                "schemaVersion": 1,
+                "disposition": "recorded"
+            }))
+        })
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let directory = tempfile::tempdir()?;
+    let store = Arc::new(FileRunStore::new(directory.path().to_path_buf()).await?);
+    let request = request("worker-observation")?;
+    let manager: Arc<dyn PackageManager> = Arc::new(ScriptedPackageManager::new(
+        request.package.dnp_name.clone(),
+    ));
+    let worker = worker_for(&server, Arc::clone(&store), manager, accepting)?;
+    tokio::time::timeout(Duration::from_secs(2), worker.run()).await?;
+
+    let job_id =
+        dappnode_package_harness::model::RunId::parse("gh-pr-42-0123456789ab-abcdef1234567890")?;
+    let record = store.get(&job_id).await?.ok_or("missing worker record")?;
+    assert!(record.worker.completion_acknowledged);
+    assert!(record.worker.pending_completion_body.is_none());
+    assert!(record.worker.manual_recovery_reason.is_none());
+    assert!(!record.requires_worker_attention());
+    Ok(())
+}
+
+#[tokio::test]
+async fn polling_worker_requires_manual_recovery_for_a_conflicting_completion()
+-> Result<(), Box<dyn Error>> {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/package-harness/jobs/claim"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(include_str!("fixtures/claim-response.json")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1/package-harness/jobs/gh-pr-42-0123456789ab-abcdef1234567890/heartbeat",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "schemaVersion": 1,
+            "cancelRequested": false
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1/package-harness/jobs/gh-pr-42-0123456789ab-abcdef1234567890/complete",
+        ))
+        .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+            "schemaVersion": 1,
+            "error": "job or claim conflict"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let directory = tempfile::tempdir()?;
+    let store = Arc::new(FileRunStore::new(directory.path().to_path_buf()).await?);
+    let request = request("worker-observation")?;
+    let manager: Arc<dyn PackageManager> = Arc::new(ScriptedPackageManager::new(
+        request.package.dnp_name.clone(),
+    ));
+    let worker = worker_for(
+        &server,
+        Arc::clone(&store),
+        manager,
+        Arc::new(AtomicBool::new(true)),
+    )?;
+    tokio::time::timeout(Duration::from_secs(2), worker.run()).await?;
+
+    let job_id =
+        dappnode_package_harness::model::RunId::parse("gh-pr-42-0123456789ab-abcdef1234567890")?;
+    let record = store.get(&job_id).await?.ok_or("missing worker record")?;
+    assert!(!record.worker.completion_acknowledged);
+    assert!(record.worker.pending_completion_body.is_some());
+    assert!(
+        record
+            .worker
+            .manual_recovery_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("conflicting"))
+    );
+    assert!(record.requires_worker_attention());
+    Ok(())
+}
+
+#[tokio::test]
+async fn polling_worker_releases_a_lost_claim_after_safe_reconciliation()
+-> Result<(), Box<dyn Error>> {
+    let server = MockServer::start().await;
+    let accepting = Arc::new(AtomicBool::new(true));
+    Mock::given(method("POST"))
+        .and(path("/v1/package-harness/jobs/claim"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(include_str!("fixtures/claim-response.json")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let stop_after_heartbeat = Arc::clone(&accepting);
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1/package-harness/jobs/gh-pr-42-0123456789ab-abcdef1234567890/heartbeat",
+        ))
+        .respond_with(move |_: &wiremock::Request| {
+            stop_after_heartbeat.store(false, Ordering::SeqCst);
+            ResponseTemplate::new(409)
+        })
+        .mount(&server)
+        .await;
+
+    let directory = tempfile::tempdir()?;
+    let store = Arc::new(FileRunStore::new(directory.path().to_path_buf()).await?);
+    let request = request("worker-observation")?;
+    let manager: Arc<dyn PackageManager> = Arc::new(ScriptedPackageManager {
+        list_packages_delay: Duration::from_millis(20),
+        ..ScriptedPackageManager::new(request.package.dnp_name.clone())
+    });
+    let worker = worker_for(&server, Arc::clone(&store), manager, accepting)?;
+    tokio::time::timeout(Duration::from_secs(2), worker.run()).await?;
+
+    let job_id =
+        dappnode_package_harness::model::RunId::parse("gh-pr-42-0123456789ab-abcdef1234567890")?;
+    let record = store.get(&job_id).await?.ok_or("missing worker record")?;
+    assert!(record.worker.claim_token.is_none());
+    assert!(record.worker.pending_completion_body.is_none());
+    assert!(record.worker.manual_recovery_reason.is_none());
+    assert!(!record.requires_worker_attention());
+    Ok(())
+}
+
+#[tokio::test]
+async fn polling_worker_retries_a_persisted_completion_after_legacy_delivery_recovery()
+-> Result<(), Box<dyn Error>> {
+    let server = MockServer::start().await;
+    let accepting = Arc::new(AtomicBool::new(true));
+    let stop_after_completion = Arc::clone(&accepting);
+    Mock::given(method("POST"))
+        .and(path("/v1/package-harness/jobs/delivery-recovery/complete"))
+        .respond_with(move |_: &wiremock::Request| {
+            stop_after_completion.store(false, Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(json!({
+                "schemaVersion": 1,
+                "disposition": "recorded"
+            }))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let directory = tempfile::tempdir()?;
+    let store = Arc::new(FileRunStore::new(directory.path().to_path_buf()).await?);
+    let request = request("delivery-recovery")?;
+    let mut record = RunRecord::claimed(
+        request.clone(),
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+    );
+    record.worker.pending_completion_body =
+        Some(include_str!("fixtures/complete-worker-error.json").to_owned());
+    record.worker.manual_recovery_reason =
+        Some("coordinator previously rejected completion".to_owned());
+    store.create(&record).await?;
+
+    let manager: Arc<dyn PackageManager> = Arc::new(ScriptedPackageManager::new(
+        request.package.dnp_name.clone(),
+    ));
+    let worker = worker_for(&server, Arc::clone(&store), manager, accepting)?;
+    tokio::time::timeout(Duration::from_secs(2), worker.run()).await?;
+
+    let recovered = store
+        .get(&request.run_id)
+        .await?
+        .ok_or("missing recovered worker record")?;
+    assert!(recovered.worker.completion_acknowledged);
+    assert_eq!(
+        recovered.worker.completion_disposition.as_deref(),
+        Some("recorded")
+    );
+    assert!(recovered.worker.pending_completion_body.is_none());
+    assert!(recovered.worker.manual_recovery_reason.is_none());
     Ok(())
 }
 

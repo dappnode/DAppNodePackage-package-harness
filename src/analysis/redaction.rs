@@ -2,6 +2,7 @@ use regex::Regex;
 use sha2::{Digest, Sha256};
 
 const REDACTED: &str = "[REDACTED]";
+const TRUNCATION_SUFFIX: &str = "…[truncated]";
 
 pub fn redact_and_bound(input: &str, maximum_bytes: usize) -> String {
     let mut output = input.to_owned();
@@ -45,11 +46,16 @@ pub fn truncate_utf8(input: &str, maximum_bytes: usize) -> String {
     if input.len() <= maximum_bytes {
         return input.to_owned();
     }
-    let mut boundary = maximum_bytes;
+    let suffix = if TRUNCATION_SUFFIX.len() <= maximum_bytes {
+        TRUNCATION_SUFFIX
+    } else {
+        ""
+    };
+    let mut boundary = maximum_bytes.saturating_sub(suffix.len());
     while boundary > 0 && !input.is_char_boundary(boundary) {
         boundary -= 1;
     }
-    format!("{}…[truncated]", &input[..boundary])
+    format!("{}{suffix}", &input[..boundary])
 }
 
 fn redact_long_tokens(input: &str) -> String {
@@ -77,7 +83,7 @@ fn redact_long_tokens(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::redact_and_bound_single_line;
+    use super::{TRUNCATION_SUFFIX, redact_and_bound_single_line, truncate_utf8};
 
     #[test]
     fn log_values_are_redacted_and_kept_on_one_line() {
@@ -87,5 +93,30 @@ mod tests {
         );
 
         assert_eq!(value, "502 Bad Gateway Authorization: [REDACTED] try again");
+    }
+
+    #[test]
+    fn truncation_never_exceeds_its_byte_limit() {
+        for maximum_bytes in 0..64 {
+            for input in [
+                "a".repeat(128),
+                "é".repeat(128),
+                "🦀".repeat(128),
+                format!("prefix-{}", "🦀éa".repeat(64)),
+            ] {
+                let bounded = truncate_utf8(&input, maximum_bytes);
+                assert!(bounded.len() <= maximum_bytes);
+                assert!(input.starts_with(bounded.trim_end_matches(TRUNCATION_SUFFIX)));
+                assert!(bounded.is_char_boundary(bounded.len()));
+            }
+        }
+    }
+
+    #[test]
+    fn truncation_reserves_space_for_the_suffix() {
+        let bounded = truncate_utf8(&"x".repeat(1_000), 500);
+
+        assert_eq!(bounded.len(), 500);
+        assert!(bounded.ends_with(TRUNCATION_SUFFIX));
     }
 }

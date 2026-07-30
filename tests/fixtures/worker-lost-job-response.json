@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "jobId": "gh-pr-42-0123456789ab-abcdef1234567890",
+  "workerId": "worker-01",
+  "source": {
+    "repository": "dappnode/DAppNodePackage-example",
+    "pullRequest": 42,
+    "headSha": "0123456789abcdef0123456789abcdef01234567"
+  },
+  "package": {
+    "dnpName": "example.dnp.dappnode.eth",
+    "candidateRef": "/ipfs/QmCandidate",
+    "baselineRef": null
+  },
+  "phase": "cleanup",
+  "cleanupRequired": true,
+  "lastHeartbeatAtMs": 1785321600000
+}

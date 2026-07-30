@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "disposition": "recorded",
+  "jobId": "gh-pr-42-0123456789ab-abcdef1234567890",
+  "workerId": "worker-01",
+  "package": "example.dnp.dappnode.eth",
+  "retryDisposition": "enqueued",
+  "retryPackages": [
+    "example.dnp.dappnode.eth"
+  ],
+  "blockingJobIds": []
+}

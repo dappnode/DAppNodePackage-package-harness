@@ -3,7 +3,10 @@ const state = {
   filter: "all",
   query: "",
   loading: false,
+  coordinatorLoading: false,
   jobsFingerprint: "",
+  lostJob: null,
+  lostJobFingerprint: "",
   expandedJobs: loadExpandedJobs(),
 };
 
@@ -22,6 +25,13 @@ const elements = {
   active: document.querySelector("#metric-active"),
   delivered: document.querySelector("#metric-delivered"),
   toastRegion: document.querySelector("#toast-region"),
+  coordinatorRecovery: document.querySelector("#coordinator-recovery"),
+  lostJobPackage: document.querySelector("#lost-job-package"),
+  lostJobId: document.querySelector("#lost-job-id"),
+  lostJobPhase: document.querySelector("#lost-job-phase"),
+  lostJobHeartbeat: document.querySelector("#lost-job-heartbeat"),
+  readyAndRetry: document.querySelector("#ready-and-retry"),
+  readyWithoutRetry: document.querySelector("#ready-without-retry"),
 };
 
 function humanize(value) {
@@ -111,8 +121,16 @@ function jobMatches(job) {
 
 function renderMetrics() {
   elements.total.textContent = String(state.jobs.length);
+  const localAttention = state.jobs.filter((job) => job.requiresAttention).length;
+  const coordinatorAttention =
+    state.lostJob &&
+    !state.jobs.some(
+      (job) => job.runId === state.lostJob.jobId && job.requiresAttention,
+    )
+      ? 1
+      : 0;
   elements.attention.textContent = String(
-    state.jobs.filter((job) => job.requiresAttention).length,
+    localAttention + coordinatorAttention,
   );
   elements.active.textContent = String(
     state.jobs.filter((job) => job.status === "queued" || job.status === "running")
@@ -121,6 +139,18 @@ function renderMetrics() {
   elements.delivered.textContent = String(
     state.jobs.filter((job) => job.completionAcknowledged).length,
   );
+}
+
+function renderCoordinatorRecovery() {
+  const job = state.lostJob;
+  elements.coordinatorRecovery.classList.toggle("is-hidden", !job);
+  if (!job) return;
+  elements.lostJobPackage.textContent = job.package.dnpName;
+  elements.lostJobId.textContent = job.jobId;
+  elements.lostJobPhase.textContent = humanize(job.phase);
+  elements.lostJobHeartbeat.textContent = job.lastHeartbeatAtMs
+    ? `${formatDate(job.lastHeartbeatAtMs)} · ${relativeTime(job.lastHeartbeatAtMs)}`
+    : "Not reported";
 }
 
 function renderJob(job) {
@@ -259,6 +289,86 @@ async function loadJobs({ quiet = false } = {}) {
   }
 }
 
+async function loadCoordinatorRecovery({ quiet = false } = {}) {
+  if (state.coordinatorLoading) return;
+  state.coordinatorLoading = true;
+  try {
+    const response = await fetch("/api/coordinator/lost-job", {
+      headers: { accept: "application/json" },
+      cache: "no-store",
+    });
+    let lostJob = null;
+    if (response.status !== 204) {
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(
+          payload.error || `Tropibot recovery check failed (${response.status})`,
+        );
+      }
+      lostJob = payload;
+    }
+    const fingerprint = JSON.stringify(lostJob);
+    if (fingerprint !== state.lostJobFingerprint) {
+      state.lostJob = lostJob;
+      state.lostJobFingerprint = fingerprint;
+      renderCoordinatorRecovery();
+      renderMetrics();
+    }
+  } catch (error) {
+    if (!quiet) {
+      elements.error.textContent =
+        error instanceof Error ? error.message : String(error);
+      elements.error.classList.remove("is-hidden");
+    }
+  } finally {
+    state.coordinatorLoading = false;
+  }
+}
+
+async function markCoordinatorReady(retry, button) {
+  const job = state.lostJob;
+  if (!job) return;
+  const action = retry ? "release the worker and retry this package" : "release the worker without retrying";
+  const confirmed = window.confirm(
+    `Confirm the old worker process is stopped and cleanup for ${job.package.dnpName} is complete.\n\nThis will ${action}.`,
+  );
+  if (!confirmed) return;
+
+  const originalLabel = button.textContent;
+  button.disabled = true;
+  elements.readyAndRetry.disabled = true;
+  elements.readyWithoutRetry.disabled = true;
+  button.textContent = retry ? "Releasing & retrying…" : "Releasing…";
+  try {
+    const response = await fetch("/operator/coordinator/ready", {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ jobId: job.jobId, retry }),
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `Request failed (${response.status})`);
+    const retryResult = humanize(payload.retryDisposition);
+    const blocked = payload.blockingJobIds?.length
+      ? ` Blocking jobs: ${payload.blockingJobIds.join(", ")}.`
+      : "";
+    toast(`Worker released. Retry: ${retryResult}.${blocked}`, "success");
+    state.lostJob = null;
+    state.lostJobFingerprint = "null";
+    renderCoordinatorRecovery();
+    renderMetrics();
+    await Promise.all([loadJobs(), loadCoordinatorRecovery()]);
+  } catch (error) {
+    toast(error instanceof Error ? error.message : String(error), "error");
+  } finally {
+    button.textContent = originalLabel;
+    elements.readyAndRetry.disabled = false;
+    elements.readyWithoutRetry.disabled = false;
+  }
+}
+
 async function continueRecovery(job, button) {
   const confirmed = window.confirm(
     `Confirm that manual cleanup for ${job.dnpName} is complete and allow the worker to continue?`,
@@ -292,7 +402,16 @@ function toast(message, kind) {
   window.setTimeout(() => item.remove(), 5000);
 }
 
-elements.refresh.addEventListener("click", () => loadJobs());
+elements.refresh.addEventListener("click", () => {
+  loadJobs();
+  loadCoordinatorRecovery();
+});
+elements.readyAndRetry.addEventListener("click", () =>
+  markCoordinatorReady(true, elements.readyAndRetry),
+);
+elements.readyWithoutRetry.addEventListener("click", () =>
+  markCoordinatorReady(false, elements.readyWithoutRetry),
+);
 elements.search.addEventListener("input", (event) => {
   state.query = event.target.value.trim().toLowerCase();
   renderJobs();
@@ -308,4 +427,8 @@ document.querySelectorAll(".filter").forEach((button) => {
 });
 
 loadJobs();
-window.setInterval(() => loadJobs({ quiet: true }), 5000);
+loadCoordinatorRecovery();
+window.setInterval(() => {
+  loadJobs({ quiet: true });
+  loadCoordinatorRecovery({ quiet: true });
+}, 5000);

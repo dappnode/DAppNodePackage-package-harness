@@ -16,6 +16,7 @@ use tracing::info;
 use crate::{
     analysis::redaction::truncate_utf8,
     config::Config,
+    coordinator::{CoordinatorClient, CoordinatorError},
     model::{
         CleanupStatus, ExecutionPhase, ExecutionStatus, ReasonCode, RunId, RunRecord, Verdict,
     },
@@ -30,6 +31,7 @@ pub struct ApiState {
     pub config: Arc<Config>,
     pub package_manager: Arc<dyn PackageManager>,
     pub store: Arc<dyn RunStore>,
+    pub coordinator: CoordinatorClient,
     pub worker_readiness: WorkerReadiness,
     pub worker_recovery_control: WorkerRecoveryControl,
 }
@@ -40,9 +42,11 @@ pub fn router(state: ApiState) -> Router {
         .route("/dashboard.css", get(dashboard_css))
         .route("/dashboard.js", get(dashboard_js))
         .route("/api/jobs", get(jobs))
+        .route("/api/coordinator/lost-job", get(coordinator_lost_job))
         .route("/healthz", get(health))
         .route("/readyz", get(ready))
         .route("/operator/recovery/continue", post(continue_recovery))
+        .route("/operator/coordinator/ready", post(coordinator_ready))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -176,6 +180,51 @@ async fn jobs(State(state): State<ApiState>) -> Response {
         jobs: records.into_iter().map(job_summary).collect(),
     })
     .into_response()
+}
+
+async fn coordinator_lost_job(State(state): State<ApiState>) -> Response {
+    match state.coordinator.worker_lost_job().await {
+        Ok(Some(job)) => Json(job).into_response(),
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => coordinator_operator_error(error),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CoordinatorReadyRequest {
+    job_id: String,
+    retry: bool,
+}
+
+async fn coordinator_ready(
+    State(state): State<ApiState>,
+    Json(request): Json<CoordinatorReadyRequest>,
+) -> Response {
+    if let Err(error) = RunId::parse(&request.job_id) {
+        return operator_error(StatusCode::BAD_REQUEST, format!("invalid jobId: {error}"));
+    }
+    match state
+        .coordinator
+        .worker_ready(&request.job_id, request.retry)
+        .await
+    {
+        Ok(response) => {
+            info!(
+                event = "operator_coordinator_worker_ready",
+                job_id = %response.job_id,
+                worker_id = %response.worker_id,
+                package = %response.package,
+                retry = request.retry,
+                disposition = ?response.disposition,
+                retry_disposition = ?response.retry_disposition,
+                "Operator confirmed cleanup and released the Tropibot worker"
+            );
+            state.worker_recovery_control.resume();
+            Json(response).into_response()
+        }
+        Err(error) => coordinator_operator_error(error),
+    }
 }
 
 fn job_summary(record: RunRecord) -> JobSummary {
@@ -335,6 +384,21 @@ fn operator_error(status: StatusCode, error: impl Into<String>) -> Response {
         .into_response()
 }
 
+fn coordinator_operator_error(error: CoordinatorError) -> Response {
+    let status = match &error {
+        CoordinatorError::Transient { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        CoordinatorError::Rejected { status, .. } if status.is_client_error() => *status,
+        CoordinatorError::UnresolvedJob
+        | CoordinatorError::ClaimLost { .. }
+        | CoordinatorError::CompletionConflict { .. } => StatusCode::CONFLICT,
+        CoordinatorError::Authentication { .. }
+        | CoordinatorError::Rejected { .. }
+        | CoordinatorError::Protocol(_)
+        | CoordinatorError::Url(_) => StatusCode::BAD_GATEWAY,
+    };
+    operator_error(status, error.to_string())
+}
+
 fn not_ready(message: String) -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -437,6 +501,12 @@ mod tests {
             config: Arc::new(config()?),
             package_manager,
             store: Arc::clone(&store),
+            coordinator: CoordinatorClient::new(
+                "https://tropibot.example",
+                "worker-01".to_owned(),
+                "worker-token".to_owned(),
+                Duration::from_secs(1),
+            )?,
             worker_readiness: WorkerReadiness::default(),
             worker_recovery_control: WorkerRecoveryControl::default(),
         });

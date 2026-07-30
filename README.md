@@ -12,7 +12,7 @@ Tropibot claim → atomically persist claim → execute one package job
     → retry completion until Tropibot acknowledges it
 ```
 
-The harness has no public job-submission or GitHub API. It needs outbound HTTPS access to Tropibot. Its package UI opens an embedded operator dashboard at `/` with local job history, worker state, cleanup and delivery status, and cleanup-recovery controls. `GET /api/jobs` supplies the dashboard without exposing claim tokens or credentials. `GET /healthz` is a process check; `GET /readyz` also checks Dappmanager tool availability and unresolved local recovery state.
+The harness has no public job-submission or GitHub API. It needs outbound HTTPS access to Tropibot. Its package UI opens an embedded operator dashboard at `/` with local job history, worker state, cleanup and delivery status, and cleanup-recovery controls. The dashboard can also read the current worker-lost record from Tropibot and, after the operator confirms the old process is fenced and cleanup is complete, either release the worker or release it and requeue the package. These requests are proxied by the harness backend; the shared worker token is never exposed to browser JavaScript. `GET /api/jobs` supplies local history and `GET /api/coordinator/lost-job` supplies the coordinator recovery state. `GET /healthz` is a process check; `GET /readyz` also checks Dappmanager tool availability and unresolved local recovery state.
 
 For every accepted job, the deterministic controller:
 
@@ -80,6 +80,8 @@ Every request carries `Authorization: Bearer <PACKAGE_HARNESS_WORKER_TOKEN>`, `C
 Before mutating, the worker atomically persists the full claim and opaque claim token under `DATA_DIR`. It persists every recovery-relevant phase and, before network delivery, the exact serialized completion JSON. Transient failures and coordinator compatibility rejections retry the same bytes with capped backoff and worker-specific jitter, so a coordinator upgrade heals delivery without a worker restart. Successful delivery clears legacy delivery-recovery markers. The worker never claims another job until completion is acknowledged as `recorded` or `duplicate`.
 
 On restart, a pending completion is retried first. An interrupted job is never rerun: if it may have mutated the target, the worker inspects Dappmanager, performs bounded cleanup, then sends an `interrupted` worker-error completion. A lost claim is released locally after cleanup succeeds; if Tropibot still holds unresolved coordinator state, the next claim receives a conflict and polling stops without inventing new local recovery work. Manual recovery is reserved for failed cleanup, ambiguous local records, or a conflicting completion that proves Tropibot already holds different state for the claim.
+
+If Tropibot has marked this worker lost, the dashboard shows the exact fenced job and its last phase. The operator may choose **Cleanup done — release & retry** or **Cleanup done — release only**. The backend calls Tropibot's authenticated `POST /v1/package-harness/jobs/{jobId}/ready` endpoint with explicit cleanup confirmation, displays Tropibot's retry disposition, and wakes the paused polling task so no package restart is required. The emergency operator-token abandonment endpoint remains a separate Tropibot operation.
 
 After manually completing a failed target cleanup, acknowledge that exact run through the internal supervision API:
 

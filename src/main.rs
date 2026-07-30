@@ -136,7 +136,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let worker_recovery_control = WorkerRecoveryControl::default();
     worker_readiness.set_not_ready("worker is reconciling local state");
     let worker = PackageHarnessWorker::new(
-        coordinator,
+        coordinator.clone(),
         WorkerDependencies {
             controller,
             package_manager: Arc::clone(&package_manager),
@@ -160,6 +160,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         config: Arc::clone(&config),
         package_manager,
         store,
+        coordinator,
         worker_readiness,
         worker_recovery_control: worker_recovery_control.clone(),
     };

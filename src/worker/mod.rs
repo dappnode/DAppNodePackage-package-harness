@@ -221,8 +221,24 @@ impl PackageHarnessWorker {
                             "Tropibot reports an unresolved job with no matching local record"
                         );
                         self.readiness.set_not_ready(
-                        "Tropibot reports an unresolved job but no recoverable local record exists",
-                    );
+                            "Tropibot reports an unresolved job but no recoverable local record exists",
+                        );
+                        if self.accepting.load(Ordering::SeqCst) {
+                            info!(
+                                event = "worker_waiting_for_coordinator_recovery",
+                                worker_id = %self.config.worker_id,
+                                "Worker is paused until an operator releases the lost job in Tropibot"
+                            );
+                            self.recovery_control.wait().await;
+                            if self.accepting.load(Ordering::SeqCst) {
+                                info!(
+                                    event = "worker_coordinator_recovery_received",
+                                    worker_id = %self.config.worker_id,
+                                    "Coordinator recovery received; resuming worker polling"
+                                );
+                                continue 'resume;
+                            }
+                        }
                         return;
                     }
                     Err(error) if error.is_transient() => {

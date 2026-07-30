@@ -8,8 +8,9 @@ use crate::analysis::redaction::redact_and_bound_single_line;
 
 use super::protocol::{
     ClaimRequest, ClaimResponse, ClaimedJob, CompletionResponse, HeartbeatRequest,
-    HeartbeatResponse,
+    HeartbeatResponse, WorkerLostJobResponse, WorkerReadyRequest, WorkerReadyResponse,
 };
+use crate::model::RunId;
 
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const ERROR_PREVIEW_BYTES: usize = 500;
@@ -224,6 +225,116 @@ impl CoordinatorClient {
                 message: status_message(status, &response_body),
             }),
         }
+    }
+
+    pub async fn worker_lost_job(&self) -> Result<Option<WorkerLostJobResponse>, CoordinatorError> {
+        let (status, body) = self
+            .get(&format!(
+                "v1/package-harness/workers/{}/lost-job",
+                self.worker_id
+            ))
+            .await?;
+        match status {
+            StatusCode::NO_CONTENT => Ok(None),
+            StatusCode::OK => {
+                let response: WorkerLostJobResponse = serde_json::from_slice(&body)
+                    .map_err(|error| CoordinatorError::Protocol(error.to_string()))?;
+                if response.schema_version != 1 {
+                    return Err(CoordinatorError::Protocol(
+                        "worker lost-job schemaVersion must be 1".to_owned(),
+                    ));
+                }
+                if response.worker_id != self.worker_id {
+                    return Err(CoordinatorError::Protocol(
+                        "worker lost-job response belongs to a different worker".to_owned(),
+                    ));
+                }
+                RunId::parse(&response.job_id)
+                    .map_err(|error| CoordinatorError::Protocol(error.to_string()))?;
+                Ok(Some(response))
+            }
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                Err(CoordinatorError::Authentication { status })
+            }
+            status if transient_status(status) => Err(CoordinatorError::Transient {
+                message: status_message(status, &body),
+            }),
+            _ => Err(CoordinatorError::Rejected {
+                status,
+                message: status_message(status, &body),
+            }),
+        }
+    }
+
+    pub async fn worker_ready(
+        &self,
+        job_id: &str,
+        retry: bool,
+    ) -> Result<WorkerReadyResponse, CoordinatorError> {
+        let job_id =
+            RunId::parse(job_id).map_err(|error| CoordinatorError::Protocol(error.to_string()))?;
+        let body = serde_json::to_vec(&WorkerReadyRequest {
+            schema_version: 1,
+            worker_id: &self.worker_id,
+            cleanup_confirmed: true,
+            retry,
+        })
+        .map_err(|error| CoordinatorError::Protocol(error.to_string()))?;
+        let (status, body) = self
+            .request(&format!("v1/package-harness/jobs/{job_id}/ready"), body)
+            .await?;
+        match status {
+            StatusCode::OK => {
+                let response: WorkerReadyResponse = serde_json::from_slice(&body)
+                    .map_err(|error| CoordinatorError::Protocol(error.to_string()))?;
+                if response.schema_version != 1 {
+                    return Err(CoordinatorError::Protocol(
+                        "worker ready schemaVersion must be 1".to_owned(),
+                    ));
+                }
+                if response.job_id != job_id.as_str() || response.worker_id != self.worker_id {
+                    return Err(CoordinatorError::Protocol(
+                        "worker ready response does not match the requested job and worker"
+                            .to_owned(),
+                    ));
+                }
+                Ok(response)
+            }
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                Err(CoordinatorError::Authentication { status })
+            }
+            StatusCode::CONFLICT => Err(CoordinatorError::Rejected {
+                status,
+                message: status_message(status, &body),
+            }),
+            status if transient_status(status) => Err(CoordinatorError::Transient {
+                message: status_message(status, &body),
+            }),
+            _ => Err(CoordinatorError::Rejected {
+                status,
+                message: status_message(status, &body),
+            }),
+        }
+    }
+
+    async fn get(&self, path: &str) -> Result<(StatusCode, Vec<u8>), CoordinatorError> {
+        let url = self
+            .base_url
+            .join(path)
+            .map_err(|error| CoordinatorError::Url(error.to_string()))?;
+        let response = self
+            .client
+            .get(url)
+            .header(header::AUTHORIZATION, format!("Bearer {}", self.token))
+            .header(header::USER_AGENT, &self.user_agent)
+            .send()
+            .await
+            .map_err(|error| CoordinatorError::Transient {
+                message: redact_and_bound_single_line(&error.to_string(), ERROR_PREVIEW_BYTES),
+            })?;
+        let status = response.status();
+        let body = response_bytes(response).await?;
+        Ok((status, body))
     }
 
     async fn request(

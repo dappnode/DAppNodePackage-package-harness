@@ -10,4 +10,7 @@ pub mod protocol;
 pub use client::{
     ClaimOutcome, CompletionDisposition, CoordinatorClient, CoordinatorError, HeartbeatOutcome,
 };
-pub use protocol::{ClaimedJob, CompletionOutcome, WorkerErrorCompletion};
+pub use protocol::{
+    ClaimedJob, CompletionOutcome, WorkerErrorCompletion, WorkerLostJobResponse,
+    WorkerReadyDisposition, WorkerReadyResponse, WorkerReadyRetryDisposition,
+};

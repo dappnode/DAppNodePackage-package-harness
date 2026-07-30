@@ -66,6 +66,46 @@
         </article>
       </section>
 
+      <section class="coordinator-recovery is-hidden" id="coordinator-recovery" aria-live="polite">
+        <div class="recovery-heading">
+          <div>
+            <p class="eyebrow">Tropibot worker recovery</p>
+            <h2>Coordinator has fenced this worker</h2>
+          </div>
+          <span class="badge failed">Action required</span>
+        </div>
+        <p class="coordinator-recovery-copy">
+          Tropibot will not assign more work until you confirm the old worker is stopped
+          and package cleanup is complete.
+        </p>
+        <div class="recovery-context">
+          <div>
+            <span>Package</span>
+            <strong id="lost-job-package">—</strong>
+          </div>
+          <div>
+            <span>Job</span>
+            <strong id="lost-job-id">—</strong>
+          </div>
+          <div>
+            <span>Last phase</span>
+            <strong id="lost-job-phase">—</strong>
+          </div>
+          <div>
+            <span>Last heartbeat</span>
+            <strong id="lost-job-heartbeat">—</strong>
+          </div>
+        </div>
+        <div class="recovery-actions">
+          <button class="button button-primary" id="ready-and-retry" type="button">
+            Cleanup done — release &amp; retry
+          </button>
+          <button class="button button-secondary" id="ready-without-retry" type="button">
+            Cleanup done — release only
+          </button>
+        </div>
+      </section>
+
       <section class="jobs-section">
         <div class="section-heading">
           <div>

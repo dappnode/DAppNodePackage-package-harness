@@ -75,6 +75,59 @@ pub struct HeartbeatResponse {
     pub cancel_requested: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkerLostJobResponse {
+    pub schema_version: u8,
+    pub job_id: String,
+    pub worker_id: String,
+    pub source: SourceDto,
+    pub package: PackageRequestDto,
+    pub phase: Option<String>,
+    pub cleanup_required: bool,
+    pub last_heartbeat_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerReadyRequest<'a> {
+    pub schema_version: u8,
+    pub worker_id: &'a str,
+    pub cleanup_confirmed: bool,
+    pub retry: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerReadyDisposition {
+    Recorded,
+    Duplicate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerReadyRetryDisposition {
+    NotRequested,
+    Enqueued,
+    Duplicate,
+    Active,
+    WorkerLost,
+    NoMatchingJobs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkerReadyResponse {
+    pub schema_version: u8,
+    pub disposition: WorkerReadyDisposition,
+    pub job_id: String,
+    pub worker_id: String,
+    pub package: String,
+    pub retry_disposition: WorkerReadyRetryDisposition,
+    pub retry_packages: Vec<String>,
+    pub blocking_job_ids: Vec<String>,
+}
+
 /// Completion payload. Its serialized form is persisted exactly before the
 /// first network attempt and reused verbatim for all retries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

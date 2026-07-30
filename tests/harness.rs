@@ -16,7 +16,10 @@ use dappnode_package_harness::{
     api::routes::{OperatorRecoveryError, acknowledge_cleanup_recovery},
     clock::{Clock, TokioClock},
     coordinator::protocol::{ClaimResponse, CompleteRequest, HeartbeatRequest},
-    coordinator::{ClaimOutcome, CompletionDisposition, CoordinatorClient, HeartbeatOutcome},
+    coordinator::{
+        ClaimOutcome, CompletionDisposition, CoordinatorClient, HeartbeatOutcome,
+        WorkerReadyDisposition, WorkerReadyRetryDisposition,
+    },
     model::{
         CleanupStatus, ContainerLog, ContainerSnapshot, DnpName, ExecutionStatus,
         ExplicitPackageResolver, LogAnalysisInput, PackageDetails, PackageLogs, PackageRef,
@@ -1352,6 +1355,127 @@ async fn coordinator_recognizes_lost_claim() -> Result<(), Box<dyn Error>> {
         client.heartbeat("job-1", "claim", "analysis", true).await?,
         HeartbeatOutcome::ClaimLost
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn coordinator_reads_worker_lost_job_and_maps_no_content() -> Result<(), Box<dyn Error>> {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/package-harness/workers/worker-01/lost-job"))
+        .and(header("authorization", "Bearer worker-secret"))
+        .and(header("user-agent", "dappnode-package-harness/0.1.1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(include_str!("fixtures/worker-lost-job-response.json")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = CoordinatorClient::new(
+        &server.uri(),
+        "worker-01".to_owned(),
+        "worker-secret".to_owned(),
+        Duration::from_secs(1),
+    )?;
+    let lost = client
+        .worker_lost_job()
+        .await?
+        .ok_or("expected a lost job")?;
+    assert_eq!(lost.job_id, "gh-pr-42-0123456789ab-abcdef1234567890");
+    assert_eq!(lost.package.dnp_name, "example.dnp.dappnode.eth");
+
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/package-harness/workers/worker-01/lost-job"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert!(client.worker_lost_job().await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn coordinator_confirms_cleanup_and_optionally_retries_lost_job() -> Result<(), Box<dyn Error>>
+{
+    let server = MockServer::start().await;
+    let job_id = "gh-pr-42-0123456789ab-abcdef1234567890";
+    Mock::given(method("POST"))
+        .and(path(format!("/v1/package-harness/jobs/{job_id}/ready")))
+        .and(header("authorization", "Bearer worker-secret"))
+        .and(header("content-type", "application/json"))
+        .and(body_json(json!({
+            "schemaVersion": 1,
+            "workerId": "worker-01",
+            "cleanupConfirmed": true,
+            "retry": true
+        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(include_str!("fixtures/worker-ready-response.json")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = CoordinatorClient::new(
+        &server.uri(),
+        "worker-01".to_owned(),
+        "worker-secret".to_owned(),
+        Duration::from_secs(1),
+    )?;
+    let response = client.worker_ready(job_id, true).await?;
+    assert_eq!(response.disposition, WorkerReadyDisposition::Recorded);
+    assert_eq!(
+        response.retry_disposition,
+        WorkerReadyRetryDisposition::Enqueued
+    );
+    assert_eq!(response.retry_packages, vec!["example.dnp.dappnode.eth"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn polling_worker_resumes_after_coordinator_recovery_without_restart()
+-> Result<(), Box<dyn Error>> {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/package-harness/jobs/claim"))
+        .respond_with(ResponseTemplate::new(409))
+        .with_priority(1)
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    let accepting = Arc::new(AtomicBool::new(true));
+    let stop_after_resumed_claim = Arc::clone(&accepting);
+    Mock::given(method("POST"))
+        .and(path("/v1/package-harness/jobs/claim"))
+        .respond_with(move |_: &wiremock::Request| {
+            stop_after_resumed_claim.store(false, Ordering::SeqCst);
+            ResponseTemplate::new(204)
+        })
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let directory = tempfile::tempdir()?;
+    let store = Arc::new(FileRunStore::new(directory.path().to_path_buf()).await?);
+    let request = request("coordinator-recovery")?;
+    let manager: Arc<dyn PackageManager> = Arc::new(ScriptedPackageManager::new(
+        request.package.dnp_name.clone(),
+    ));
+    let recovery_control = WorkerRecoveryControl::default();
+    let worker = worker_for_with_recovery_control(
+        &server,
+        store,
+        manager,
+        accepting,
+        recovery_control.clone(),
+    )?;
+    let worker_task = tokio::spawn(worker.run());
+    recovery_control.resume();
+    tokio::time::timeout(Duration::from_secs(2), worker_task).await??;
     Ok(())
 }
 

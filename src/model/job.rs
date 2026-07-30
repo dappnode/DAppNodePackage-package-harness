@@ -51,7 +51,7 @@ pub struct RunRequestDto {
     pub package: PackageRequestDto,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SourceDto {
     pub repository: String,
@@ -59,7 +59,7 @@ pub struct SourceDto {
     pub head_sha: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PackageRequestDto {
     pub dnp_name: String,

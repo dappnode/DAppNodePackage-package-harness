@@ -880,8 +880,10 @@ mod tests {
         let mut record = RunRecord::claimed(request.clone(), "secret-claim-token".to_owned());
         record.worker.cleanup_required = true;
         record.worker.set_recovery_plan(TargetRecoveryPlan::Remove);
-        record.worker.manual_recovery_reason =
-            Some("target cleanup failed; operator action is required".to_owned());
+        record.worker.set_manual_recovery(
+            ManualRecoveryKind::Cleanup,
+            "operator verification is required".to_owned(),
+        );
         record.cleanup.status = CleanupStatus::Failed;
         record.cleanup.error = Some("target remained installed".to_owned());
         file_store.create(&record).await?;
@@ -912,6 +914,12 @@ mod tests {
             Some(&header::HeaderValue::from_static(
                 "text/html; charset=utf-8"
             ))
+        );
+        assert!(
+            dashboard
+                .headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .is_some()
         );
 
         let jobs = app

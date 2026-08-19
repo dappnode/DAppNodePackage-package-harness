@@ -117,7 +117,12 @@ impl Config {
         let package_harness_heartbeat = required_seconds("PACKAGE_HARNESS_HEARTBEAT_SECONDS")?;
         let stabilization_timeout = millis("STABILIZATION_TIMEOUT_MS", 180_000)?;
         let stabilization_poll = millis("STABILIZATION_POLL_MS", 5_000)?;
-        let intervals = u32::try_from(required_samples.saturating_sub(1)).unwrap_or(19);
+        let intervals = u32::try_from(required_samples.saturating_sub(1)).map_err(|error| {
+            ConfigError::Invalid {
+                name: "STABILIZATION_REQUIRED_SAMPLES",
+                message: error.to_string(),
+            }
+        })?;
         let minimum_stabilization_window = stabilization_poll.saturating_mul(intervals);
         if stabilization_timeout < minimum_stabilization_window {
             return Err(ConfigError::Invalid {

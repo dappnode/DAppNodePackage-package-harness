@@ -21,7 +21,7 @@ use dappnode_package_harness::{
         WorkerReadyDisposition, WorkerReadyRetryDisposition,
     },
     model::{
-        CleanupStatus, ContainerLog, ContainerSnapshot, DnpName, ExecutionStatus,
+        CleanupStatus, ContainerLog, ContainerSnapshot, DnpName, ExecutionPhase, ExecutionStatus,
         ExplicitPackageResolver, LogAnalysisInput, PackageDetails, PackageLogs, PackageRef,
         PackageSummary, PreviewSummary, ReasonCode, RunRecord, RunRequest, RunRequestDto,
         TargetRecoveryPlan, Verdict, WorkerErrorCode, WorkerState,
@@ -1538,6 +1538,61 @@ async fn polling_worker_claims_executes_and_acknowledges_before_next_claim()
         Some("recorded")
     );
     assert!(record.worker.pending_completion_body.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn unsupported_claim_is_persisted_as_terminal_after_delivery() -> Result<(), Box<dyn Error>> {
+    let server = MockServer::start().await;
+    let accepting = Arc::new(AtomicBool::new(true));
+    Mock::given(method("POST"))
+        .and(path("/v1/package-harness/jobs/claim"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(include_str!("fixtures/claim-response.json")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let stop_after_completion = Arc::clone(&accepting);
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1/package-harness/jobs/gh-pr-42-0123456789ab-abcdef1234567890/complete",
+        ))
+        .respond_with(move |_: &wiremock::Request| {
+            stop_after_completion.store(false, Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(json!({
+                "schemaVersion": 1,
+                "disposition": "recorded"
+            }))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let directory = tempfile::tempdir()?;
+    let store = Arc::new(FileRunStore::new(directory.path().to_path_buf()).await?);
+    let request = request("worker-observation")?;
+    let mut scripted_manager = ScriptedPackageManager::new(request.package.dnp_name.clone());
+    scripted_manager.core = true;
+    let manager: Arc<dyn PackageManager> = Arc::new(scripted_manager);
+    let worker = worker_for(&server, Arc::clone(&store), manager, accepting)?;
+    tokio::time::timeout(Duration::from_secs(2), worker.run()).await?;
+
+    let job_id =
+        dappnode_package_harness::model::RunId::parse("gh-pr-42-0123456789ab-abcdef1234567890")?;
+    let record = store.get(&job_id).await?.ok_or("missing worker record")?;
+    assert_eq!(record.status, ExecutionStatus::Completed);
+    assert_eq!(record.phase, ExecutionPhase::Finished);
+    assert!(record.finished_at.is_some());
+    assert_eq!(record.cleanup.status, CleanupStatus::Skipped);
+    assert_eq!(
+        record.worker.worker_error.as_ref().map(|error| error.code),
+        Some(WorkerErrorCode::UnsupportedJob)
+    );
+    assert!(record.worker.completion_acknowledged);
+    assert!(record.worker.claim_token.is_none());
+    assert!(!record.requires_worker_attention());
     Ok(())
 }
 

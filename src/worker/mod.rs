@@ -12,6 +12,7 @@ use std::{
 };
 use tokio::sync::Notify;
 
+use chrono::Utc;
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -22,8 +23,8 @@ use crate::{
         CoordinatorError, WorkerErrorCompletion,
     },
     model::{
-        CleanupResult, CleanupStatus, ExecutionStatus, PackageRef, RunRecord, TargetRecoveryPlan,
-        WorkerError, WorkerErrorCode,
+        CleanupResult, CleanupStatus, ExecutionPhase, ExecutionStatus, PackageRef, RunRecord,
+        TargetRecoveryPlan, WorkerError, WorkerErrorCode,
     },
     package_manager::PackageManager,
     runner::{
@@ -639,6 +640,16 @@ impl PackageHarnessWorker {
         code: WorkerErrorCode,
         summary: String,
     ) -> Result<(), String> {
+        if record.status != ExecutionStatus::Completed {
+            record.status = ExecutionStatus::Completed;
+            record.finished_at = Some(Utc::now());
+        }
+        if record.phase != ExecutionPhase::Finished {
+            record.transition(ExecutionPhase::Finished);
+        }
+        if record.cleanup.status == CleanupStatus::Pending {
+            record.cleanup.status = worker_error_cleanup_status(record);
+        }
         record.worker.worker_error = Some(WorkerError {
             code,
             summary: redact_and_bound(&summary, 500),
@@ -684,6 +695,7 @@ impl PackageHarnessWorker {
                     });
                     record.worker.pending_completion_body = None;
                     record.worker.manual_recovery_reason = None;
+                    record.worker.claim_token = None;
                     self.store.save(record).await.map_err(|error| {
                         format!("cannot persist completion acknowledgement: {error}")
                     })?;

@@ -18,7 +18,10 @@ use crate::{
     config::Config,
     coordinator::{CoordinatorClient, CoordinatorError},
     model::{
-        CleanupStatus, ExecutionPhase, ExecutionStatus, ReasonCode, RunId, RunRecord, Verdict,
+        CaptureEvidence, CleanupStatus, ComparisonEvidence, ContainerSnapshot, ExecutionPhase,
+        ExecutionStatus, LogAnalysisResult, PackageSummary, PhaseTransition, PreviewSummary,
+        ReasonCode, RunError, RunId, RunRecord, StabilizationResult, StepStatus,
+        TargetRecoveryPlan, Verdict, WorkerError,
     },
     package_manager::PackageManager,
     storage::RunStore,
@@ -137,6 +140,7 @@ struct JobSummary {
     dnp_name: String,
     repository: String,
     pull_request: u64,
+    head_sha: String,
     candidate_ref: String,
     baseline_ref: Option<String>,
     status: ExecutionStatus,
@@ -159,6 +163,38 @@ struct JobSummary {
     has_claim: bool,
     completion_acknowledged: bool,
     completion_disposition: Option<String>,
+    diagnostics: ExpertDiagnostics,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExpertDiagnostics {
+    phase_history: Vec<PhaseTransition>,
+    errors: Vec<RunError>,
+    worker_error: Option<WorkerError>,
+    cleanup_required: bool,
+    blocks_worker: bool,
+    target_recovery: Option<TargetRecoveryPlan>,
+    initial_packages: Vec<PackageSummary>,
+    final_packages: Vec<PackageSummary>,
+    baseline: Option<CaptureDiagnostics>,
+    candidate: Option<CaptureDiagnostics>,
+    comparison: Option<ComparisonEvidence>,
+    log_analysis: Option<LogAnalysisResult>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CaptureDiagnostics {
+    install_status: StepStatus,
+    install_duration_ms: u64,
+    preview: Option<PreviewSummary>,
+    containers: Vec<ContainerSnapshot>,
+    stabilization: StabilizationResult,
+    log_entry_count: usize,
+    log_error: Option<String>,
+    started_at: String,
+    finished_at: String,
 }
 
 async fn jobs(State(state): State<ApiState>) -> Response {
@@ -242,7 +278,10 @@ async fn coordinator_ready(
 
 fn job_summary(record: RunRecord) -> JobSummary {
     let manual_recovery_reason = record.worker.manual_recovery_reason.clone();
-    let requires_attention = record.requires_worker_attention();
+    // "Needs action" is an operator-facing classification. A normal running
+    // claim blocks the worker from claiming a second job, but needs no human
+    // intervention and must remain only in the Active classification.
+    let requires_attention = manual_recovery_reason.is_some();
     let can_continue_after_cleanup = record.worker.cleanup_required
         && manual_recovery_reason
             .as_deref()
@@ -256,11 +295,49 @@ fn job_summary(record: RunRecord) -> JobSummary {
             "manual"
         }
     });
+    // Versions before 0.1.2 could acknowledge an early worker error while
+    // leaving the execution fields at their initial queued/pending values.
+    // Normalize those persisted records for the dashboard as well as fixing
+    // the write path for all new records.
+    let terminal_worker_error =
+        record.worker.completion_acknowledged && record.worker.worker_error.is_some();
+    let status = if terminal_worker_error {
+        ExecutionStatus::Completed
+    } else {
+        record.status
+    };
+    let phase = if terminal_worker_error {
+        ExecutionPhase::Finished
+    } else {
+        record.phase
+    };
+    let cleanup_status = if terminal_worker_error && record.cleanup.status == CleanupStatus::Pending
+    {
+        record
+            .worker
+            .worker_error
+            .as_ref()
+            .map_or(record.cleanup.status, |error| error.cleanup_status)
+    } else {
+        record.cleanup.status
+    };
+    let summary = record.result.as_ref().map_or_else(
+        || {
+            record
+                .worker
+                .worker_error
+                .as_ref()
+                .map(|error| error.summary.clone())
+        },
+        |result| Some(result.summary.clone()),
+    );
+    let diagnostics = expert_diagnostics(&record);
     JobSummary {
         run_id: record.request.run_id.to_string(),
         dnp_name: record.request.package.dnp_name.to_string(),
         repository: record.request.source.repository.to_string(),
         pull_request: record.request.source.pull_request,
+        head_sha: record.request.source.head_sha.to_string(),
         candidate_ref: record.request.package.candidate_ref.to_string(),
         baseline_ref: record
             .request
@@ -268,29 +345,64 @@ fn job_summary(record: RunRecord) -> JobSummary {
             .baseline_ref
             .as_ref()
             .map(ToString::to_string),
-        status: record.status,
-        phase: record.phase,
+        status,
+        phase,
         verdict: record.result.as_ref().map(|result| result.verdict),
         reason_code: record
             .result
             .as_ref()
             .map(|result| result.reason_code.clone()),
-        summary: record.result.as_ref().map(|result| result.summary.clone()),
-        cleanup_status: record.cleanup.status,
+        summary,
+        cleanup_status,
         cleanup_error: record.cleanup.error,
         leftover_packages: record.cleanup.leftover_packages,
         created_at: record.created_at,
         started_at: record.started_at,
         finished_at: record.finished_at,
-        error_count: record.errors.len(),
+        error_count: record.errors.len() + usize::from(record.worker.worker_error.is_some()),
         requires_attention,
         manual_recovery_reason,
         recovery_kind,
         can_continue_after_cleanup,
         pending_completion: record.worker.pending_completion_body.is_some(),
-        has_claim: record.worker.claim_token.is_some(),
+        has_claim: record.worker.claim_token.is_some() && !record.worker.completion_acknowledged,
         completion_acknowledged: record.worker.completion_acknowledged,
         completion_disposition: record.worker.completion_disposition,
+        diagnostics,
+    }
+}
+
+fn expert_diagnostics(record: &RunRecord) -> ExpertDiagnostics {
+    ExpertDiagnostics {
+        phase_history: record.phase_history.clone(),
+        errors: record.errors.clone(),
+        worker_error: record.worker.worker_error.clone(),
+        cleanup_required: record.worker.cleanup_required,
+        blocks_worker: record.requires_worker_attention(),
+        target_recovery: record.worker.target_recovery.clone(),
+        initial_packages: record.evidence.initial_packages.clone(),
+        final_packages: record.evidence.final_packages.clone(),
+        baseline: record.evidence.baseline.as_ref().map(capture_diagnostics),
+        candidate: record.evidence.candidate.as_ref().map(capture_diagnostics),
+        comparison: record.evidence.comparison.clone(),
+        log_analysis: record.evidence.log_analysis.clone(),
+    }
+}
+
+fn capture_diagnostics(capture: &CaptureEvidence) -> CaptureDiagnostics {
+    CaptureDiagnostics {
+        install_status: capture.install_status,
+        install_duration_ms: capture.install_duration_ms,
+        preview: capture.preview.clone(),
+        containers: capture
+            .details
+            .as_ref()
+            .map_or_else(Vec::new, |details| details.containers.clone()),
+        stabilization: capture.stabilization.clone(),
+        log_entry_count: capture.logs.as_ref().map_or(0, |logs| logs.entries.len()),
+        log_error: capture.log_error.clone(),
+        started_at: capture.started_at.clone(),
+        finished_at: capture.finished_at.clone(),
     }
 }
 
@@ -782,6 +894,46 @@ mod tests {
             Some("operator_accepted_coordinator")
         );
         assert!(!released.requires_worker_attention());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_acknowledged_worker_error_is_reported_as_terminal() -> Result<(), Box<dyn Error>> {
+        let request = request("legacy-worker-error")?;
+        let mut record = RunRecord::claimed(request, "old-claim-token".to_owned());
+        record.worker.worker_error = Some(WorkerError {
+            code: crate::model::WorkerErrorCode::UnsupportedJob,
+            summary: "refused to test a core Dappnode package".to_owned(),
+            cleanup_status: CleanupStatus::Skipped,
+        });
+        record.worker.completion_acknowledged = true;
+        record.worker.completion_disposition = Some("recorded".to_owned());
+
+        let summary = job_summary(record);
+        assert_eq!(summary.status, ExecutionStatus::Completed);
+        assert_eq!(summary.phase, ExecutionPhase::Finished);
+        assert_eq!(summary.cleanup_status, CleanupStatus::Skipped);
+        assert_eq!(
+            summary.summary.as_deref(),
+            Some("refused to test a core Dappnode package")
+        );
+        assert_eq!(summary.error_count, 1);
+        assert!(!summary.has_claim);
+        Ok(())
+    }
+
+    #[test]
+    fn normal_running_claim_is_active_without_operator_attention() -> Result<(), Box<dyn Error>> {
+        let request = request("normal-running")?;
+        let mut record = RunRecord::claimed(request, "active-claim-token".to_owned());
+        record.start();
+        record.transition(ExecutionPhase::CandidateInstall);
+
+        let summary = job_summary(record);
+        assert_eq!(summary.status, ExecutionStatus::Running);
+        assert!(!summary.requires_attention);
+        assert!(summary.diagnostics.blocks_worker);
+        assert!(summary.has_claim);
         Ok(())
     }
 }

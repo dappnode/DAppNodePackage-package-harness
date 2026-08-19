@@ -25,7 +25,7 @@ use crate::{
     },
     package_manager::PackageManager,
     storage::RunStore,
-    worker::{WorkerReadiness, WorkerRecoveryControl},
+    worker::{WorkerDrainControl, WorkerDrainState, WorkerReadiness, WorkerRecoveryControl},
 };
 
 /// State for local process supervision and explicit operator recovery.
@@ -37,6 +37,7 @@ pub struct ApiState {
     pub coordinator: CoordinatorClient,
     pub worker_readiness: WorkerReadiness,
     pub worker_recovery_control: WorkerRecoveryControl,
+    pub worker_drain_control: WorkerDrainControl,
 }
 
 pub fn router(state: ApiState) -> Router {
@@ -51,6 +52,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/operator/recovery/continue", post(continue_recovery))
         .route("/operator/recovery/action", post(recovery_action))
         .route("/operator/coordinator/ready", post(coordinator_ready))
+        .route("/operator/worker/drain", post(worker_drain))
+        .route("/operator/worker/resume", post(worker_resume))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -108,6 +111,13 @@ async fn ready(State(state): State<ApiState>) -> Response {
     if let Some(message) = state.worker_readiness.reason() {
         return not_ready(message);
     }
+    match state.worker_drain_control.state() {
+        WorkerDrainState::Accepting => {}
+        WorkerDrainState::Draining => return not_ready("worker is draining".to_owned()),
+        WorkerDrainState::Drained => {
+            return not_ready("worker is drained and safe to restart".to_owned());
+        }
+    }
     match state.package_manager.verify_tools().await {
         Ok(tools) if tools.ready() => Json(ReadyResponse {
             status: "ready",
@@ -131,6 +141,8 @@ struct JobsResponse {
 struct WorkerSummary {
     status: &'static str,
     message: String,
+    lifecycle: &'static str,
+    safe_to_restart: bool,
 }
 
 #[derive(Serialize)]
@@ -208,20 +220,41 @@ async fn jobs(State(state): State<ApiState>) -> Response {
         }
     };
     records.reverse();
+    let drain_state = state.worker_drain_control.state();
     let worker = if let Some(message) = state.config.acceptance_error() {
         WorkerSummary {
             status: "blocked",
             message,
+            lifecycle: drain_state_name(drain_state),
+            safe_to_restart: false,
         }
     } else if let Some(message) = state.worker_readiness.reason() {
         WorkerSummary {
             status: "paused",
             message,
+            lifecycle: drain_state_name(drain_state),
+            safe_to_restart: false,
+        }
+    } else if drain_state == WorkerDrainState::Draining {
+        WorkerSummary {
+            status: "draining",
+            message: "Finishing the current job before restart".to_owned(),
+            lifecycle: "draining",
+            safe_to_restart: false,
+        }
+    } else if drain_state == WorkerDrainState::Drained {
+        WorkerSummary {
+            status: "drained",
+            message: "No job is active; the worker is safe to restart".to_owned(),
+            lifecycle: "drained",
+            safe_to_restart: true,
         }
     } else {
         WorkerSummary {
             status: "ready",
             message: "Polling Tropibot for package jobs".to_owned(),
+            lifecycle: "accepting",
+            safe_to_restart: false,
         }
     };
     Json(JobsResponse {
@@ -229,6 +262,49 @@ async fn jobs(State(state): State<ApiState>) -> Response {
         jobs: records.into_iter().map(job_summary).collect(),
     })
     .into_response()
+}
+
+fn drain_state_name(state: WorkerDrainState) -> &'static str {
+    match state {
+        WorkerDrainState::Accepting => "accepting",
+        WorkerDrainState::Draining => "draining",
+        WorkerDrainState::Drained => "drained",
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkerLifecycleResponse {
+    lifecycle: &'static str,
+    safe_to_restart: bool,
+    message: &'static str,
+}
+
+async fn worker_drain(State(state): State<ApiState>) -> Json<WorkerLifecycleResponse> {
+    state.worker_drain_control.request_drain();
+    let lifecycle = drain_state_name(state.worker_drain_control.state());
+    info!(
+        event = "operator_worker_drain_requested",
+        lifecycle, "Operator requested a safe worker drain"
+    );
+    Json(WorkerLifecycleResponse {
+        lifecycle,
+        safe_to_restart: lifecycle == "drained",
+        message: "drain requested; active work will finish before restart is safe",
+    })
+}
+
+async fn worker_resume(State(state): State<ApiState>) -> Json<WorkerLifecycleResponse> {
+    state.worker_drain_control.resume();
+    info!(
+        event = "operator_worker_resume_requested",
+        "Operator resumed worker polling"
+    );
+    Json(WorkerLifecycleResponse {
+        lifecycle: "accepting",
+        safe_to_restart: false,
+        message: "worker resumed accepting package jobs",
+    })
 }
 
 async fn coordinator_lost_job(State(state): State<ApiState>) -> Response {
@@ -808,6 +884,7 @@ mod tests {
             )?,
             worker_readiness: WorkerReadiness::default(),
             worker_recovery_control: WorkerRecoveryControl::default(),
+            worker_drain_control: WorkerDrainControl::default(),
         });
 
         let dashboard = app
@@ -934,6 +1011,58 @@ mod tests {
         assert!(!summary.requires_attention);
         assert!(summary.diagnostics.blocks_worker);
         assert!(summary.has_claim);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn operator_can_drain_and_resume_worker_lifecycle() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let store: Arc<dyn RunStore> =
+            Arc::new(FileRunStore::new(directory.path().to_path_buf()).await?);
+        let drain_control = WorkerDrainControl::default();
+        let app = router(ApiState {
+            config: Arc::new(config()?),
+            package_manager: Arc::new(FakePackageManager::new()),
+            store,
+            coordinator: CoordinatorClient::new(
+                "https://tropibot.example",
+                "worker-01".to_owned(),
+                "worker-token".to_owned(),
+                Duration::from_secs(1),
+            )?,
+            worker_readiness: WorkerReadiness::default(),
+            worker_recovery_control: WorkerRecoveryControl::default(),
+            worker_drain_control: drain_control.clone(),
+        });
+
+        let drained = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/operator/worker/drain")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(drained.status(), StatusCode::OK);
+        assert_eq!(drain_control.state(), WorkerDrainState::Draining);
+
+        let ready = app
+            .clone()
+            .oneshot(Request::builder().uri("/readyz").body(Body::empty())?)
+            .await?;
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let resumed = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/operator/worker/resume")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(resumed.status(), StatusCode::OK);
+        assert_eq!(drain_control.state(), WorkerDrainState::Accepting);
         Ok(())
     }
 }

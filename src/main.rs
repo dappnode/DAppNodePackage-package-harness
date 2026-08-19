@@ -5,7 +5,6 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
 };
 
 use dappnode_package_harness::{
@@ -21,8 +20,8 @@ use dappnode_package_harness::{
     runner::{RunController, RunnerConfig, stabilization::StabilizationConfig},
     storage::{FileRunStore, RunStore},
     worker::{
-        PackageHarnessWorker, WorkerConfig, WorkerDependencies, WorkerReadiness,
-        WorkerRecoveryControl,
+        PackageHarnessWorker, WorkerConfig, WorkerDependencies, WorkerDrainControl,
+        WorkerReadiness, WorkerRecoveryControl,
     },
 };
 use tracing::{debug, error, info};
@@ -134,6 +133,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let accepting = Arc::new(AtomicBool::new(true));
     let worker_readiness = WorkerReadiness::default();
     let worker_recovery_control = WorkerRecoveryControl::default();
+    let worker_drain_control = WorkerDrainControl::default();
     worker_readiness.set_not_ready("worker is reconciling local state");
     let worker = PackageHarnessWorker::new(
         coordinator.clone(),
@@ -152,6 +152,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         },
         worker_readiness.clone(),
         worker_recovery_control.clone(),
+        worker_drain_control.clone(),
         Arc::clone(&accepting),
     );
     let worker = tokio::spawn(worker.run());
@@ -163,6 +164,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         coordinator,
         worker_readiness,
         worker_recovery_control: worker_recovery_control.clone(),
+        worker_drain_control: worker_drain_control.clone(),
     };
     let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
     info!(
@@ -175,28 +177,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with_graceful_shutdown(shutdown_signal(
             Arc::clone(&accepting),
             worker_recovery_control,
+            worker_drain_control,
         ))
         .await?;
     info!(
         event = "supervision_server_stopped",
         "Supervision server stopped"
     );
-    match tokio::time::timeout(Duration::from_secs(300), worker).await {
-        Ok(result) => {
-            info!(
-                event = "worker_shutdown_complete",
-                "Worker shutdown complete"
-            );
-            result?;
-        }
-        Err(_) => {
-            error!(
-                event = "worker_shutdown_timeout",
-                timeout_seconds = 300,
-                "Worker did not stop within the shutdown deadline"
-            );
-        }
-    }
+    worker.await?;
+    info!(
+        event = "worker_shutdown_complete",
+        "Worker shutdown complete"
+    );
     Ok(())
 }
 
@@ -262,6 +254,7 @@ async fn mcp_smoke(package_manager: Arc<dyn PackageManager>) -> Result<(), Box<d
 async fn shutdown_signal(
     accepting: Arc<AtomicBool>,
     worker_recovery_control: WorkerRecoveryControl,
+    worker_drain_control: WorkerDrainControl,
 ) {
     let ctrl_c = async {
         if let Err(signal_error) = tokio::signal::ctrl_c().await {
@@ -283,6 +276,7 @@ async fn shutdown_signal(
         () = ctrl_c => {}
         () = terminate => {}
     }
+    worker_drain_control.request_drain();
     accepting.store(false, Ordering::SeqCst);
     worker_recovery_control.resume();
     info!(

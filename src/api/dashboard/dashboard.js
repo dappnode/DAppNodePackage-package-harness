@@ -7,6 +7,7 @@ const state = {
   jobsFingerprint: "",
   lostJob: null,
   lostJobFingerprint: "",
+  worker: null,
   expandedJobs: loadExpandedJobs(),
 };
 
@@ -39,6 +40,13 @@ const elements = {
   localRecoveryContext: document.querySelector("#local-recovery-context"),
   localRecoveryExplanation: document.querySelector("#local-recovery-explanation"),
   localRecoveryActions: document.querySelector("#local-recovery-actions"),
+  drainLifecycle: document.querySelector("#drain-lifecycle"),
+  drainMessage: document.querySelector("#drain-message"),
+  drainCurrentJob: document.querySelector("#drain-current-job"),
+  drainSafety: document.querySelector("#drain-safety"),
+  drainStatus: document.querySelector("#drain-status"),
+  drainWorker: document.querySelector("#drain-worker"),
+  resumeWorker: document.querySelector("#resume-worker"),
 };
 
 function humanize(value) {
@@ -675,9 +683,56 @@ function renderJobs() {
 }
 
 function renderWorker(worker) {
+  state.worker = worker;
   elements.workerState.dataset.status = worker.status;
   elements.workerLabel.textContent = humanize(worker.status);
   elements.workerMessage.textContent = worker.message;
+  elements.drainLifecycle.textContent = humanize(worker.lifecycle);
+  elements.drainLifecycle.className = `badge ${worker.safeToRestart ? "ready" : worker.lifecycle}`;
+  elements.drainMessage.textContent = worker.message;
+  const active = state.jobs.find(
+    (job) => !job.completionAcknowledged && job.hasClaim,
+  );
+  elements.drainCurrentJob.textContent = active
+    ? `${active.dnpName} · ${humanize(active.phase)}`
+    : "No active job";
+  elements.drainSafety.textContent = worker.safeToRestart
+    ? "Safe to restart"
+    : worker.lifecycle === "draining"
+      ? "Waiting for safe completion"
+      : "Drain required";
+  elements.drainStatus.classList.toggle("is-safe", worker.safeToRestart);
+  elements.drainWorker.disabled = worker.lifecycle !== "accepting";
+  elements.resumeWorker.disabled = worker.lifecycle === "accepting";
+}
+
+async function setWorkerLifecycle(action) {
+  const draining = action === "drain";
+  if (
+    draining &&
+    !window.confirm(
+      "Stop claiming new jobs and finish all current mutation, cleanup, and delivery work before restart?",
+    )
+  ) {
+    return;
+  }
+  elements.drainWorker.disabled = true;
+  elements.resumeWorker.disabled = true;
+  try {
+    const response = await fetch(`/operator/worker/${action}`, {
+      method: "POST",
+      headers: { accept: "application/json" },
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `Request failed (${response.status})`);
+    toast(payload.message, "success");
+    state.jobsFingerprint = "";
+    await loadJobs();
+    window.setTimeout(() => loadJobs({ quiet: true }), 500);
+  } catch (error) {
+    toast(error instanceof Error ? error.message : String(error), "error");
+    if (state.worker) renderWorker(state.worker);
+  }
 }
 
 async function loadJobs({ quiet = false } = {}) {
@@ -849,6 +904,8 @@ elements.readyAndRetry.addEventListener("click", () =>
 elements.readyWithoutRetry.addEventListener("click", () =>
   markCoordinatorReady(false, elements.readyWithoutRetry),
 );
+elements.drainWorker.addEventListener("click", () => setWorkerLifecycle("drain"));
+elements.resumeWorker.addEventListener("click", () => setWorkerLifecycle("resume"));
 elements.search.addEventListener("input", (event) => {
   state.query = event.target.value.trim().toLowerCase();
   renderJobs();

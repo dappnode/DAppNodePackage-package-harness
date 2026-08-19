@@ -152,6 +152,16 @@ button {
   box-shadow: 0 0 0 4px var(--red-soft);
 }
 
+.worker-state[data-status="draining"] .state-dot {
+  background: var(--yellow);
+  box-shadow: 0 0 0 4px var(--yellow-soft);
+}
+
+.worker-state[data-status="drained"] .state-dot {
+  background: var(--green);
+  box-shadow: 0 0 0 4px var(--green-soft);
+}
+
 .hero {
   display: flex;
   gap: 48px;
@@ -295,7 +305,8 @@ summary:focus-visible {
 }
 
 .coordinator-recovery,
-.local-recovery {
+.local-recovery,
+.drain-control {
   margin-top: 22px;
   padding: 26px 28px;
   border: 1px solid rgba(255, 107, 104, 0.42);
@@ -304,6 +315,13 @@ summary:focus-visible {
     linear-gradient(120deg, rgba(255, 107, 104, 0.1), transparent 55%),
     var(--panel);
   box-shadow: var(--shadow);
+}
+
+.drain-control {
+  border-color: rgba(112, 167, 255, 0.3);
+  background:
+    linear-gradient(120deg, rgba(112, 167, 255, 0.08), transparent 55%),
+    var(--panel);
 }
 
 .local-recovery {
@@ -327,12 +345,56 @@ summary:focus-visible {
 
 .coordinator-recovery-copy,
 .local-recovery-copy,
+.drain-copy,
 .recovery-guidance {
   max-width: 850px;
   margin: 16px 0 22px;
   color: var(--muted);
   font-size: 13px;
   line-height: 1.6;
+}
+
+.drain-status {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  overflow: hidden;
+  margin-bottom: 22px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--line);
+}
+
+.drain-status > div {
+  padding: 15px 17px;
+  background: rgba(17, 16, 15, 0.72);
+}
+
+.drain-status span,
+.drain-status strong {
+  display: block;
+}
+
+.drain-status span {
+  margin-bottom: 7px;
+  color: var(--subtle);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.drain-status strong {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.drain-status.is-safe {
+  border-color: rgba(80, 216, 144, 0.32);
+}
+
+.drain-status.is-safe > div:last-child strong {
+  color: var(--green);
 }
 
 .local-recovery-copy {
@@ -556,7 +618,8 @@ h2 {
 .badge.warning,
 .badge.pending,
 .badge.running,
-.badge.queued {
+.badge.queued,
+.badge.draining {
   color: var(--yellow);
   border-color: rgba(245, 196, 81, 0.25);
   background: var(--yellow-soft);
@@ -573,7 +636,8 @@ h2 {
 }
 
 .badge.completed,
-.badge.skipped {
+.badge.skipped,
+.badge.drained {
   color: var(--blue);
   border-color: rgba(112, 167, 255, 0.24);
   background: rgba(112, 167, 255, 0.1);
@@ -1007,7 +1071,8 @@ h2 {
   }
 
   .coordinator-recovery,
-  .local-recovery {
+  .local-recovery,
+  .drain-control {
     padding: 21px 18px;
   }
 
@@ -1022,6 +1087,10 @@ h2 {
   }
 
   .local-recovery .recovery-context {
+    grid-template-columns: 1fr;
+  }
+
+  .drain-status {
     grid-template-columns: 1fr;
   }
 

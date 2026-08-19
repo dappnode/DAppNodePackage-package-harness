@@ -34,8 +34,8 @@ use dappnode_package_harness::{
     },
     storage::{FileRunStore, RunStore},
     worker::{
-        PackageHarnessWorker, WorkerConfig, WorkerDependencies, WorkerReadiness,
-        WorkerRecoveryControl, progress::WorkerProgress,
+        PackageHarnessWorker, WorkerConfig, WorkerDependencies, WorkerDrainControl,
+        WorkerDrainState, WorkerReadiness, WorkerRecoveryControl, progress::WorkerProgress,
     },
 };
 use serde_json::json;
@@ -461,6 +461,24 @@ fn worker_for_with_recovery_control(
     accepting: Arc<AtomicBool>,
     recovery_control: WorkerRecoveryControl,
 ) -> Result<PackageHarnessWorker, Box<dyn Error>> {
+    worker_for_with_controls(
+        server,
+        store,
+        manager,
+        accepting,
+        recovery_control,
+        WorkerDrainControl::default(),
+    )
+}
+
+fn worker_for_with_controls(
+    server: &MockServer,
+    store: Arc<FileRunStore>,
+    manager: Arc<dyn PackageManager>,
+    accepting: Arc<AtomicBool>,
+    recovery_control: WorkerRecoveryControl,
+    drain_control: WorkerDrainControl,
+) -> Result<PackageHarnessWorker, Box<dyn Error>> {
     let clock: Arc<dyn Clock> = Arc::new(ImmediateClock);
     let store_port: Arc<dyn RunStore> = store;
     let controller = Arc::new(RunController::new(
@@ -494,6 +512,7 @@ fn worker_for_with_recovery_control(
         },
         WorkerReadiness::default(),
         recovery_control,
+        drain_control,
         accepting,
     ))
 }
@@ -1475,6 +1494,126 @@ async fn polling_worker_resumes_after_coordinator_recovery_without_restart()
     )?;
     let worker_task = tokio::spawn(worker.run());
     recovery_control.resume();
+    tokio::time::timeout(Duration::from_secs(2), worker_task).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn drained_worker_does_not_claim_until_resumed() -> Result<(), Box<dyn Error>> {
+    let server = MockServer::start().await;
+    let accepting = Arc::new(AtomicBool::new(true));
+    let stop_after_claim = Arc::clone(&accepting);
+    Mock::given(method("POST"))
+        .and(path("/v1/package-harness/jobs/claim"))
+        .respond_with(move |_: &wiremock::Request| {
+            stop_after_claim.store(false, Ordering::SeqCst);
+            ResponseTemplate::new(204)
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let directory = tempfile::tempdir()?;
+    let store = Arc::new(FileRunStore::new(directory.path().to_path_buf()).await?);
+    let request = request("drain-before-claim")?;
+    let manager: Arc<dyn PackageManager> = Arc::new(ScriptedPackageManager::new(
+        request.package.dnp_name.clone(),
+    ));
+    let drain_control = WorkerDrainControl::default();
+    drain_control.request_drain();
+    let worker = worker_for_with_controls(
+        &server,
+        store,
+        manager,
+        Arc::clone(&accepting),
+        WorkerRecoveryControl::default(),
+        drain_control.clone(),
+    )?;
+    let worker_task = tokio::spawn(worker.run());
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while drain_control.state() != WorkerDrainState::Drained {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    assert!(accepting.load(Ordering::SeqCst));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(accepting.load(Ordering::SeqCst));
+
+    drain_control.resume();
+    tokio::time::timeout(Duration::from_secs(2), worker_task).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn drain_finishes_an_in_flight_claim_before_becoming_safe() -> Result<(), Box<dyn Error>> {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/package-harness/jobs/claim"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(include_str!("fixtures/claim-response.json")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1/package-harness/jobs/gh-pr-42-0123456789ab-abcdef1234567890/complete",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "schemaVersion": 1,
+            "disposition": "recorded"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let directory = tempfile::tempdir()?;
+    let store = Arc::new(FileRunStore::new(directory.path().to_path_buf()).await?);
+    let request = request("drain-in-flight")?;
+    let mut scripted_manager = ScriptedPackageManager::new(request.package.dnp_name.clone());
+    scripted_manager.core = true;
+    scripted_manager.list_packages_delay = Duration::from_millis(50);
+    let manager: Arc<dyn PackageManager> = Arc::new(scripted_manager);
+    let accepting = Arc::new(AtomicBool::new(true));
+    let drain_control = WorkerDrainControl::default();
+    let worker = worker_for_with_controls(
+        &server,
+        Arc::clone(&store),
+        manager,
+        Arc::clone(&accepting),
+        WorkerRecoveryControl::default(),
+        drain_control.clone(),
+    )?;
+    let worker_task = tokio::spawn(worker.run());
+    let job_id =
+        dappnode_package_harness::model::RunId::parse("gh-pr-42-0123456789ab-abcdef1234567890")?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if store.get(&job_id).await?.is_some() {
+                return Ok::<_, dappnode_package_harness::storage::StoreError>(());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await??;
+    drain_control.request_drain();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while drain_control.state() != WorkerDrainState::Drained {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    let record = store.get(&job_id).await?.ok_or("missing drained run")?;
+    assert!(record.worker.completion_acknowledged);
+    assert_eq!(record.cleanup.status, CleanupStatus::Skipped);
+    assert!(!record.requires_worker_attention());
+
+    accepting.store(false, Ordering::SeqCst);
+    drain_control.resume();
     tokio::time::timeout(Duration::from_secs(2), worker_task).await??;
     Ok(())
 }

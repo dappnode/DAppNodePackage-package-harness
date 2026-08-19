@@ -66,6 +66,37 @@
         </article>
       </section>
 
+      <section class="drain-control" id="drain-control" aria-live="polite">
+        <div class="recovery-heading">
+          <div>
+            <p class="eyebrow">Planned restart control</p>
+            <h2>Worker lifecycle</h2>
+          </div>
+          <span class="badge ready" id="drain-lifecycle">Accepting</span>
+        </div>
+        <p class="drain-copy" id="drain-message">
+          The worker is accepting package jobs.
+        </p>
+        <div class="drain-status" id="drain-status">
+          <div>
+            <span>Current work</span>
+            <strong id="drain-current-job">Checking…</strong>
+          </div>
+          <div>
+            <span>Restart safety</span>
+            <strong id="drain-safety">Not drained</strong>
+          </div>
+        </div>
+        <div class="recovery-actions">
+          <button class="button button-primary" id="drain-worker" type="button">
+            Drain worker
+          </button>
+          <button class="button button-secondary" id="resume-worker" type="button" disabled>
+            Resume accepting jobs
+          </button>
+        </div>
+      </section>
+
       <section class="local-recovery is-hidden" id="local-recovery" aria-live="polite">
         <div class="recovery-heading">
           <div>

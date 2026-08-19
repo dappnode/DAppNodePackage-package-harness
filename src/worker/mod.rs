@@ -10,7 +10,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 
 use chrono::Utc;
 use tracing::{debug, error, info, warn};
@@ -105,6 +105,67 @@ impl WorkerRecoveryControl {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerDrainState {
+    Accepting,
+    Draining,
+    Drained,
+}
+
+/// Coordinates planned restarts without interrupting package mutation,
+/// cleanup, or persisted completion delivery.
+#[derive(Clone, Debug)]
+pub struct WorkerDrainControl {
+    state: watch::Sender<WorkerDrainState>,
+}
+
+impl Default for WorkerDrainControl {
+    fn default() -> Self {
+        let (state, _) = watch::channel(WorkerDrainState::Accepting);
+        Self { state }
+    }
+}
+
+impl WorkerDrainControl {
+    pub fn state(&self) -> WorkerDrainState {
+        *self.state.borrow()
+    }
+
+    pub fn request_drain(&self) {
+        self.state.send_if_modified(|state| {
+            if *state == WorkerDrainState::Accepting {
+                *state = WorkerDrainState::Draining;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    pub fn resume(&self) {
+        self.state.send_replace(WorkerDrainState::Accepting);
+    }
+
+    fn mark_drained(&self) {
+        self.state.send_if_modified(|state| {
+            if *state == WorkerDrainState::Draining {
+                *state = WorkerDrainState::Drained;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    async fn changed_from(&self, observed: WorkerDrainState) {
+        let mut receiver = self.state.subscribe();
+        if *receiver.borrow() != observed {
+            return;
+        }
+        let _ = receiver.changed().await;
+    }
+}
+
 /// Polls Tropibot, drives exactly one local run at a time, and only claims
 /// again after the previous completion has been acknowledged.
 pub struct PackageHarnessWorker {
@@ -116,6 +177,7 @@ pub struct PackageHarnessWorker {
     config: WorkerConfig,
     readiness: WorkerReadiness,
     recovery_control: WorkerRecoveryControl,
+    drain_control: WorkerDrainControl,
     accepting: Arc<AtomicBool>,
 }
 
@@ -126,6 +188,7 @@ impl PackageHarnessWorker {
         config: WorkerConfig,
         readiness: WorkerReadiness,
         recovery_control: WorkerRecoveryControl,
+        drain_control: WorkerDrainControl,
         accepting: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -137,6 +200,7 @@ impl PackageHarnessWorker {
             config,
             readiness,
             recovery_control,
+            drain_control,
             accepting,
         }
     }
@@ -165,12 +229,18 @@ impl PackageHarnessWorker {
                 return;
             }
             self.readiness.clear();
+            if !self.wait_until_accepting().await {
+                return;
+            }
             info!(
                 event = "worker_polling_started",
                 "Ready; polling Tropibot for package jobs"
             );
             let mut transient_attempt = 0_u32;
             while self.accepting.load(Ordering::SeqCst) {
+                if !self.wait_until_accepting().await {
+                    return;
+                }
                 match self.coordinator.claim().await {
                     Ok(ClaimOutcome::NoWork) => {
                         transient_attempt = 0;
@@ -178,10 +248,21 @@ impl PackageHarnessWorker {
                             event = "claim_no_work",
                             poll_interval_seconds = self.config.poll_interval.as_secs(),
                         );
-                        tokio::time::sleep(self.config.poll_interval).await;
+                        tokio::select! {
+                            () = tokio::time::sleep(self.config.poll_interval) => {}
+                            () = self.drain_control.changed_from(WorkerDrainState::Accepting) => {}
+                        }
                     }
                     Ok(ClaimOutcome::Claimed(job)) => {
                         transient_attempt = 0;
+                        if self.drain_control.state() != WorkerDrainState::Accepting {
+                            warn!(
+                                event = "claim_crossed_drain_boundary",
+                                run_id = %job.request.run_id,
+                                dnp_name = %job.request.package.dnp_name,
+                                "A claim request already in flight completed after draining began; finishing it safely"
+                            );
+                        }
                         info!(
                             event = "claim_succeeded",
                             run_id = %job.request.run_id,
@@ -270,6 +351,35 @@ impl PackageHarnessWorker {
                 }
             }
             return;
+        }
+    }
+
+    async fn wait_until_accepting(&self) -> bool {
+        loop {
+            if !self.accepting.load(Ordering::SeqCst) {
+                return false;
+            }
+            let observed = self.drain_control.state();
+            match observed {
+                WorkerDrainState::Accepting => return true,
+                WorkerDrainState::Draining => {
+                    self.drain_control.mark_drained();
+                    info!(
+                        event = "worker_drained",
+                        worker_id = %self.config.worker_id,
+                        "Worker is quiescent and safe to restart"
+                    );
+                }
+                WorkerDrainState::Drained => {}
+            }
+            self.drain_control.changed_from(observed).await;
+            if self.drain_control.state() == WorkerDrainState::Accepting {
+                info!(
+                    event = "worker_drain_resumed",
+                    worker_id = %self.config.worker_id,
+                    "Worker resumed accepting package jobs"
+                );
+            }
         }
     }
 

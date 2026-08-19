@@ -195,9 +195,10 @@ function diagnosticTable(headers, rows) {
   return wrapper;
 }
 
-function diagnosticSection(title, className = "") {
-  const section = node("section", `diagnostic-card ${className}`.trim());
-  section.append(node("h4", null, title));
+function diagnosticSection(title, className = "", open = true) {
+  const section = node("details", `diagnostic-card ${className}`.trim());
+  section.open = open;
+  section.append(node("summary", null, title));
   return section;
 }
 
@@ -318,7 +319,7 @@ function renderCaptureDiagnostics(label, capture) {
 }
 
 function renderInventory(job) {
-  const section = diagnosticSection("Package inventory", "diagnostic-wide");
+  const section = diagnosticSection("Package inventory", "diagnostic-wide", false);
   const rows = [];
   job.diagnostics.initialPackages.forEach((pkg) =>
     rows.push(["Before", pkg.dnpName, pkg.version, pkg.isCore ? "yes" : "no"]),

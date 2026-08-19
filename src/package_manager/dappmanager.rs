@@ -39,6 +39,11 @@ impl DappmanagerPackageManager {
         mutation_attempts: usize,
         mutation_retry_delay: Duration,
     ) -> Result<Self, PackageManagerError> {
+        if mutation_attempts == 0 {
+            return Err(PackageManagerError::Configuration(
+                "mutation attempts must be greater than zero".to_owned(),
+            ));
+        }
         crate::tls::ensure_crypto_provider();
         let client =
             DappnodeMcpClient::with_timeout(&url, &token, timeout).map_err(package_error)?;
@@ -396,7 +401,7 @@ impl PackageManager for DappmanagerPackageManager {
 
 fn package_error(error: DappnodeMcpError) -> PackageManagerError {
     match error {
-        DappnodeMcpError::Configuration { message } => PackageManagerError::Transport(message),
+        DappnodeMcpError::Configuration { message } => PackageManagerError::Configuration(message),
         DappnodeMcpError::InvalidArgument { field, message } => {
             PackageManagerError::InvalidResponse {
                 tool: field,
@@ -485,15 +490,18 @@ fn retry_delay(initial: Duration, failed_attempt: usize) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use std::error::Error;
+    use std::{error::Error, time::Duration};
 
-    use crate::model::{RunRequest, RunRequestDto};
+    use crate::{
+        model::{RunRequest, RunRequestDto},
+        package_manager::PackageManagerError,
+    };
 
     use dappnode_mcp_client::DappnodeMcpError;
 
     use super::{
-        install_options, operation_in_progress_error, package_absent_error,
-        retryable_mutation_error,
+        DappmanagerPackageManager, install_options, operation_in_progress_error,
+        package_absent_error, retryable_mutation_error,
     };
 
     #[test]
@@ -507,6 +515,20 @@ mod tests {
         assert!(!operation_in_progress_error(
             "Error: failed to download image"
         ));
+    }
+
+    #[test]
+    fn rejects_zero_mutation_attempts_at_construction() {
+        let result = DappmanagerPackageManager::new(
+            "http://dappmanager.example/mcp".to_owned(),
+            "token".to_owned(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            0,
+            Duration::from_millis(100),
+        );
+
+        assert!(matches!(result, Err(PackageManagerError::Configuration(_))));
     }
 
     #[test]
@@ -594,7 +616,7 @@ mod tests {
             "source": {
                 "repository": "dappnode/example",
                 "pullRequest": 1,
-                "headSha": "abcdef"
+                "headSha": "abcdef0"
             },
             "package": {
                 "dnpName": "rotki.dnp.dappnode.eth",

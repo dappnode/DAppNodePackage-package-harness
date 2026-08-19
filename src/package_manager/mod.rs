@@ -75,6 +75,8 @@ impl ToolAvailability {
 /// Error raised while talking to or interpreting the package manager.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum PackageManagerError {
+    #[error("package manager configuration is invalid: {0}")]
+    Configuration(String),
     #[error("MCP transport failure: {0}")]
     Transport(String),
     #[error("MCP tool '{tool}' timed out")]
@@ -96,7 +98,10 @@ impl PackageManagerError {
             Self::Timeout { .. } => true,
             Self::Transport(message) => retryable_transport_message(message),
             Self::Tool { message, .. } => retryable_tool_message(message),
-            Self::InvalidResponse { .. } | Self::RequiredSetup | Self::NotFound => false,
+            Self::Configuration(_)
+            | Self::InvalidResponse { .. }
+            | Self::RequiredSetup
+            | Self::NotFound => false,
         }
     }
 

@@ -38,6 +38,19 @@ pub struct WorkerError {
     pub cleanup_status: CleanupStatus,
 }
 
+/// Operator action required before the worker may accept another claim.
+///
+/// Older records only persisted a human-readable reason. [`WorkerState`] keeps
+/// compatibility with those records by inferring a kind when this field is
+/// absent, while all new writes persist this enum explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManualRecoveryKind {
+    Cleanup,
+    CompletionConflict,
+    Manual,
+}
+
 /// Destructive target state that restart recovery must reconcile.
 ///
 /// This is persisted before each mutation. It replaces the ambiguous
@@ -93,9 +106,39 @@ pub struct WorkerState {
     /// An unresolved cleanup or claim-reconciliation issue that requires an
     /// operator and keeps the worker out of ready state.
     pub manual_recovery_reason: Option<String>,
+    /// Machine-readable recovery classification. Optional for compatibility
+    /// with records written before this field was introduced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_recovery_kind: Option<ManualRecoveryKind>,
 }
 
 impl WorkerState {
+    /// Returns the persisted recovery kind, with a compatibility fallback for
+    /// records that predate the typed field.
+    pub fn manual_recovery_kind(&self) -> Option<ManualRecoveryKind> {
+        self.manual_recovery_kind.or_else(|| {
+            self.manual_recovery_reason.as_deref().map(|reason| {
+                if reason.contains("conflict") {
+                    ManualRecoveryKind::CompletionConflict
+                } else if reason.contains("cleanup") {
+                    ManualRecoveryKind::Cleanup
+                } else {
+                    ManualRecoveryKind::Manual
+                }
+            })
+        })
+    }
+
+    pub fn set_manual_recovery(&mut self, kind: ManualRecoveryKind, reason: String) {
+        self.manual_recovery_kind = Some(kind);
+        self.manual_recovery_reason = Some(reason);
+    }
+
+    pub fn clear_manual_recovery(&mut self) {
+        self.manual_recovery_kind = None;
+        self.manual_recovery_reason = None;
+    }
+
     /// Returns the explicit plan, falling back to the legacy restore field for
     /// records persisted by older harness versions.
     pub fn recovery_plan(&self) -> TargetRecoveryPlan {
@@ -238,5 +281,48 @@ impl RunRecord {
         self.worker.manual_recovery_reason.is_some()
             || self.worker.pending_completion_body.is_some()
             || self.worker.claim_token.is_some() && !self.worker.completion_acknowledged
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ManualRecoveryKind, WorkerState};
+
+    #[test]
+    fn typed_manual_recovery_does_not_depend_on_message_wording() {
+        let mut state = WorkerState::default();
+        state.set_manual_recovery(
+            ManualRecoveryKind::Cleanup,
+            "operator verification is required".to_owned(),
+        );
+
+        assert_eq!(
+            state.manual_recovery_kind(),
+            Some(ManualRecoveryKind::Cleanup)
+        );
+        state.clear_manual_recovery();
+        assert_eq!(state.manual_recovery_kind(), None);
+        assert!(state.manual_recovery_reason.is_none());
+    }
+
+    #[test]
+    fn legacy_manual_recovery_reasons_remain_classified() {
+        let cleanup = WorkerState {
+            manual_recovery_reason: Some("target cleanup failed".to_owned()),
+            ..WorkerState::default()
+        };
+        let conflict = WorkerState {
+            manual_recovery_reason: Some("persisted completion is conflicting".to_owned()),
+            ..WorkerState::default()
+        };
+
+        assert_eq!(
+            cleanup.manual_recovery_kind(),
+            Some(ManualRecoveryKind::Cleanup)
+        );
+        assert_eq!(
+            conflict.manual_recovery_kind(),
+            Some(ManualRecoveryKind::CompletionConflict)
+        );
     }
 }

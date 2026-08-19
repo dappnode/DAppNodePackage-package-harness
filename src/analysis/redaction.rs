@@ -1,31 +1,38 @@
 use regex::Regex;
 use sha2::{Digest, Sha256};
+use std::sync::LazyLock;
 
 const REDACTED: &str = "[REDACTED]";
 const TRUNCATION_SUFFIX: &str = "…[truncated]";
+const REDACTION_PATTERNS: [(&str, &str); 5] = [
+    (
+        r"(?i)(authorization\s*:\s*)(?:bearer\s+)?[^\s]+",
+        "$1[REDACTED]",
+    ),
+    (r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [REDACTED]"),
+    (
+        r"(?im)^([^\r\n:=]*(?:TOKEN|SECRET|PASSWORD|PRIVATE_KEY|API_KEY)[^\r\n:=]*\s*[:=]\s*).*$",
+        "$1[REDACTED]",
+    ),
+    (r"(?i)(https?://)[^/@\s:]+:[^/@\s]+@", "$1[REDACTED]@"),
+    (
+        r"(?s)-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----",
+        "[REDACTED PRIVATE KEY]",
+    ),
+];
+static COMPILED_REDACTION_PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
+    REDACTION_PATTERNS
+        .into_iter()
+        .filter_map(|(pattern, replacement)| {
+            Regex::new(pattern).ok().map(|regex| (regex, replacement))
+        })
+        .collect()
+});
 
 pub fn redact_and_bound(input: &str, maximum_bytes: usize) -> String {
     let mut output = input.to_owned();
-    let patterns = [
-        (
-            r"(?i)(authorization\s*:\s*)(?:bearer\s+)?[^\s]+",
-            "$1[REDACTED]",
-        ),
-        (r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [REDACTED]"),
-        (
-            r"(?im)^([^\r\n:=]*(?:TOKEN|SECRET|PASSWORD|PRIVATE_KEY|API_KEY)[^\r\n:=]*\s*[:=]\s*).*$",
-            "$1[REDACTED]",
-        ),
-        (r"(?i)(https?://)[^/@\s:]+:[^/@\s]+@", "$1[REDACTED]@"),
-        (
-            r"(?s)-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----",
-            "[REDACTED PRIVATE KEY]",
-        ),
-    ];
-    for (pattern, replacement) in patterns {
-        if let Ok(regex) = Regex::new(pattern) {
-            output = regex.replace_all(&output, replacement).into_owned();
-        }
+    for (regex, replacement) in COMPILED_REDACTION_PATTERNS.iter() {
+        output = regex.replace_all(&output, *replacement).into_owned();
     }
     output = redact_long_tokens(&output);
     truncate_utf8(&output, maximum_bytes)
@@ -83,7 +90,15 @@ fn redact_long_tokens(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{TRUNCATION_SUFFIX, redact_and_bound_single_line, truncate_utf8};
+    use super::{
+        COMPILED_REDACTION_PATTERNS, REDACTION_PATTERNS, TRUNCATION_SUFFIX,
+        redact_and_bound_single_line, truncate_utf8,
+    };
+
+    #[test]
+    fn all_redaction_patterns_compile() {
+        assert_eq!(COMPILED_REDACTION_PATTERNS.len(), REDACTION_PATTERNS.len());
+    }
 
     #[test]
     fn log_values_are_redacted_and_kept_on_one_line() {

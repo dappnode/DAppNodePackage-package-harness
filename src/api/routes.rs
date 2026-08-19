@@ -19,8 +19,8 @@ use crate::{
     coordinator::{CoordinatorClient, CoordinatorError},
     model::{
         CaptureEvidence, CleanupStatus, ComparisonEvidence, ContainerSnapshot, ExecutionPhase,
-        ExecutionStatus, LogAnalysisResult, PackageSummary, PhaseTransition, PreviewSummary,
-        ReasonCode, RunError, RunId, RunRecord, StabilizationResult, StepStatus,
+        ExecutionStatus, LogAnalysisResult, ManualRecoveryKind, PackageSummary, PhaseTransition,
+        PreviewSummary, ReasonCode, RunError, RunId, RunRecord, StabilizationResult, StepStatus,
         TargetRecoveryPlan, Verdict, WorkerError,
     },
     package_manager::PackageManager,
@@ -60,7 +60,15 @@ pub fn router(state: ApiState) -> Router {
 
 async fn dashboard() -> impl IntoResponse {
     (
-        [(header::CACHE_CONTROL, "no-store")],
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'self'; base-uri 'none'; connect-src 'self'; frame-ancestors 'none'; form-action 'none'; img-src 'self'; script-src 'self'; style-src 'self'",
+            ),
+            (header::REFERRER_POLICY, "no-referrer"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
         Html(include_str!("dashboard/index.html")),
     )
 }
@@ -280,7 +288,14 @@ struct WorkerLifecycleResponse {
     message: &'static str,
 }
 
-async fn worker_drain(State(state): State<ApiState>) -> Json<WorkerLifecycleResponse> {
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerLifecycleRequest {}
+
+async fn worker_drain(
+    State(state): State<ApiState>,
+    Json(_request): Json<WorkerLifecycleRequest>,
+) -> Json<WorkerLifecycleResponse> {
     state.worker_drain_control.request_drain();
     let lifecycle = drain_state_name(state.worker_drain_control.state());
     info!(
@@ -294,7 +309,10 @@ async fn worker_drain(State(state): State<ApiState>) -> Json<WorkerLifecycleResp
     })
 }
 
-async fn worker_resume(State(state): State<ApiState>) -> Json<WorkerLifecycleResponse> {
+async fn worker_resume(
+    State(state): State<ApiState>,
+    Json(_request): Json<WorkerLifecycleRequest>,
+) -> Json<WorkerLifecycleResponse> {
     state.worker_drain_control.resume();
     info!(
         event = "operator_worker_resume_requested",
@@ -358,19 +376,10 @@ fn job_summary(record: RunRecord) -> JobSummary {
     // claim blocks the worker from claiming a second job, but needs no human
     // intervention and must remain only in the Active classification.
     let requires_attention = manual_recovery_reason.is_some();
-    let can_continue_after_cleanup = record.worker.cleanup_required
-        && manual_recovery_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("cleanup"));
-    let recovery_kind = manual_recovery_reason.as_deref().map(|reason| {
-        if reason.contains("conflict") {
-            "completion_conflict"
-        } else if reason.contains("cleanup") {
-            "cleanup"
-        } else {
-            "manual"
-        }
-    });
+    let manual_recovery_kind = record.worker.manual_recovery_kind();
+    let can_continue_after_cleanup =
+        record.worker.cleanup_required && manual_recovery_kind == Some(ManualRecoveryKind::Cleanup);
+    let recovery_kind = manual_recovery_kind.map(recovery_kind_name);
     // Versions before 0.1.2 could acknowledge an early worker error while
     // leaving the execution fields at their initial queued/pending values.
     // Normalize those persisted records for the dashboard as well as fixing
@@ -445,6 +454,14 @@ fn job_summary(record: RunRecord) -> JobSummary {
         completion_acknowledged: record.worker.completion_acknowledged,
         completion_disposition: record.worker.completion_disposition,
         diagnostics,
+    }
+}
+
+const fn recovery_kind_name(kind: ManualRecoveryKind) -> &'static str {
+    match kind {
+        ManualRecoveryKind::Cleanup => "cleanup",
+        ManualRecoveryKind::CompletionConflict => "completion_conflict",
+        ManualRecoveryKind::Manual => "manual",
     }
 }
 
@@ -633,17 +650,17 @@ pub async fn acknowledge_cleanup_recovery(
         .await
         .map_err(|error| OperatorRecoveryError::Store(error.to_string()))?
         .ok_or(OperatorRecoveryError::NotFound)?;
-    let reason = record
-        .worker
-        .manual_recovery_reason
-        .as_deref()
-        .ok_or(OperatorRecoveryError::NotWaiting)?;
-    if !record.worker.cleanup_required || !reason.contains("cleanup") {
+    if record.worker.manual_recovery_reason.is_none() {
+        return Err(OperatorRecoveryError::NotWaiting);
+    }
+    if !record.worker.cleanup_required
+        || record.worker.manual_recovery_kind() != Some(ManualRecoveryKind::Cleanup)
+    {
         return Err(OperatorRecoveryError::NotCleanup);
     }
 
     record_manual_cleanup(&mut record);
-    record.worker.manual_recovery_reason = None;
+    record.worker.clear_manual_recovery();
     store
         .save(&record)
         .await
@@ -704,12 +721,10 @@ async fn resolve_completion_conflict(
         .await
         .map_err(|error| OperatorRecoveryError::Store(error.to_string()))?
         .ok_or(OperatorRecoveryError::NotFound)?;
-    let reason = record
-        .worker
-        .manual_recovery_reason
-        .as_deref()
-        .ok_or(OperatorRecoveryError::NotWaiting)?;
-    if !reason.contains("conflict") {
+    if record.worker.manual_recovery_reason.is_none() {
+        return Err(OperatorRecoveryError::NotWaiting);
+    }
+    if record.worker.manual_recovery_kind() != Some(ManualRecoveryKind::CompletionConflict) {
         return Err(OperatorRecoveryError::NotCompletionConflict);
     }
     if !matches!(
@@ -722,7 +737,7 @@ async fn resolve_completion_conflict(
         return Err(OperatorRecoveryError::MissingCompletion);
     }
 
-    record.worker.manual_recovery_reason = None;
+    record.worker.clear_manual_recovery();
     if accept_coordinator_result {
         record.worker.pending_completion_body = None;
         record.worker.claim_token = None;
@@ -1035,13 +1050,26 @@ mod tests {
             worker_drain_control: drain_control.clone(),
         });
 
-        let drained = app
+        let bodyless = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/operator/worker/drain")
                     .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(bodyless.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(drain_control.state(), WorkerDrainState::Accepting);
+
+        let drained = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/operator/worker/drain")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))?,
             )
             .await?;
         assert_eq!(drained.status(), StatusCode::OK);
@@ -1058,7 +1086,8 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/operator/worker/resume")
-                    .body(Body::empty())?,
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))?,
             )
             .await?;
         assert_eq!(resumed.status(), StatusCode::OK);

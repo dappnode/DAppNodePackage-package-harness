@@ -13,9 +13,12 @@ pub struct FileRunStore {
 
 impl FileRunStore {
     pub async fn new(root: PathBuf) -> Result<Self, StoreError> {
-        tokio::fs::create_dir_all(&root)
-            .await
-            .map_err(|error| StoreError::Io(error.to_string()))?;
+        tokio::fs::create_dir_all(&root).await.map_err(|error| {
+            StoreError::Io(format!(
+                "cannot create data directory {}: {error}",
+                root.display()
+            ))
+        })?;
         Ok(Self { root })
     }
 
@@ -29,24 +32,32 @@ impl FileRunStore {
         let bytes = serde_json::to_vec_pretty(record)
             .map_err(|error| StoreError::Invalid(error.to_string()))?;
         tokio::task::spawn_blocking(move || {
-            let mut temporary = tempfile::NamedTempFile::new_in(&root)
-                .map_err(|error| StoreError::Io(error.to_string()))?;
+            let mut temporary = tempfile::NamedTempFile::new_in(&root).map_err(|error| {
+                StoreError::Io(format!("cannot create temporary file: {error}"))
+            })?;
             temporary
                 .write_all(&bytes)
                 .and_then(|()| temporary.as_file().sync_all())
-                .map_err(|error| StoreError::Io(error.to_string()))?;
+                .map_err(|error| StoreError::Io(format!("cannot sync run record: {error}")))?;
             let persisted = if create_only {
-                temporary.persist_noclobber(destination)
+                temporary.persist_noclobber(&destination)
             } else {
-                temporary.persist(destination)
+                temporary.persist(&destination)
             };
             persisted.map_err(|error| {
                 if create_only && error.error.kind() == std::io::ErrorKind::AlreadyExists {
                     StoreError::AlreadyExists
                 } else {
-                    StoreError::Io(error.error.to_string())
+                    StoreError::Io(format!(
+                        "cannot persist {}: {}",
+                        destination.display(),
+                        error.error
+                    ))
                 }
             })?;
+            fs::File::open(&root)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| StoreError::Io(format!("cannot sync data directory: {error}")))?;
             Ok(())
         })
         .await
@@ -65,29 +76,38 @@ impl RunStore for FileRunStore {
     }
 
     async fn get(&self, run_id: &RunId) -> Result<Option<RunRecord>, StoreError> {
-        match tokio::fs::read(self.path(run_id)).await {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map(Some)
-                .map_err(|error| StoreError::Invalid(error.to_string())),
+        let path = self.path(run_id);
+        match tokio::fs::read(&path).await {
+            Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|error| {
+                StoreError::Invalid(format!("invalid run record {}: {error}", path.display()))
+            }),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(StoreError::Io(error.to_string())),
+            Err(error) => Err(StoreError::Io(format!(
+                "cannot read {}: {error}",
+                path.display()
+            ))),
         }
     }
 
     async fn load_all(&self) -> Result<Vec<RunRecord>, StoreError> {
         let root = self.root.clone();
         tokio::task::spawn_blocking(move || {
-            let entries = fs::read_dir(root).map_err(|error| StoreError::Io(error.to_string()))?;
+            let entries = fs::read_dir(&root).map_err(|error| {
+                StoreError::Io(format!("cannot read {}: {error}", root.display()))
+            })?;
             let mut records = Vec::new();
             for entry in entries {
                 let entry = entry.map_err(|error| StoreError::Io(error.to_string()))?;
                 if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
                     continue;
                 }
-                let bytes =
-                    fs::read(entry.path()).map_err(|error| StoreError::Io(error.to_string()))?;
-                let record = serde_json::from_slice(&bytes)
-                    .map_err(|error| StoreError::Invalid(error.to_string()))?;
+                let path = entry.path();
+                let bytes = fs::read(&path).map_err(|error| {
+                    StoreError::Io(format!("cannot read {}: {error}", path.display()))
+                })?;
+                let record = serde_json::from_slice(&bytes).map_err(|error| {
+                    StoreError::Invalid(format!("invalid run record {}: {error}", path.display()))
+                })?;
                 records.push(record);
             }
             records.sort_by_key(|record: &RunRecord| record.created_at);

@@ -103,19 +103,25 @@ impl TryFrom<RunRequestDto> for RunRequest {
         let run_id = RunId::parse(&dto.run_id)?;
         let repository = bounded(&dto.source.repository, "source.repository", 3, 200)?;
         let mut repository_parts = repository.split('/');
-        let valid_repository = repository_parts.next().is_some_and(|part| !part.is_empty())
-            && repository_parts.next().is_some_and(|part| !part.is_empty())
+        let valid_repository = repository_parts.next().is_some_and(valid_repository_part)
+            && repository_parts.next().is_some_and(valid_repository_part)
             && repository_parts.next().is_none();
-        if !valid_repository || repository.chars().any(char::is_whitespace) {
+        if !valid_repository {
             return Err(validation(
                 "source.repository",
-                "must resemble owner/repository",
+                "must be an ASCII owner/repository name",
             ));
         }
         if dto.source.pull_request == 0 {
             return Err(validation("source.pullRequest", "must be positive"));
         }
-        let head_sha = bounded(&dto.source.head_sha, "source.headSha", 1, 128)?;
+        let head_sha = bounded(&dto.source.head_sha, "source.headSha", 7, 64)?;
+        if !head_sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(validation(
+                "source.headSha",
+                "must contain only hexadecimal characters",
+            ));
+        }
         let dnp_name = DnpName::parse(&dto.package.dnp_name)
             .map_err(|error| validation("package.dnpName", &error.to_string()))?;
         let candidate_ref = parse_package_ref(&dto.package.candidate_ref, "package.candidateRef")?;
@@ -141,6 +147,14 @@ impl TryFrom<RunRequestDto> for RunRequest {
             },
         })
     }
+}
+
+fn valid_repository_part(part: &str) -> bool {
+    !part.is_empty()
+        && part.len() <= 100
+        && part
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn bounded<'a>(
@@ -191,5 +205,35 @@ impl PackageResolver for ExplicitPackageResolver {
             candidate_ref: request.package.candidate_ref.clone(),
             baseline_ref: request.package.baseline_ref.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PackageRequestDto, RunRequest, RunRequestDto, SourceDto};
+
+    fn request(repository: &str, head_sha: &str) -> RunRequestDto {
+        RunRequestDto {
+            schema_version: 1,
+            run_id: "run-01".to_owned(),
+            source: SourceDto {
+                repository: repository.to_owned(),
+                pull_request: 1,
+                head_sha: head_sha.to_owned(),
+            },
+            package: PackageRequestDto {
+                dnp_name: "example.dnp.dappnode.eth".to_owned(),
+                candidate_ref: "/ipfs/QmCandidate".to_owned(),
+                baseline_ref: None,
+            },
+        }
+    }
+
+    #[test]
+    fn source_identifiers_are_safe_for_github_links() {
+        assert!(RunRequest::try_from(request("dappnode/example-package", "abcdef0")).is_ok());
+        assert!(RunRequest::try_from(request("dappnode/example?tab=bad", "abcdef0")).is_err());
+        assert!(RunRequest::try_from(request("dappnode/example", "../main")).is_err());
+        assert!(RunRequest::try_from(request("dappnode/example", "not-a-sha")).is_err());
     }
 }

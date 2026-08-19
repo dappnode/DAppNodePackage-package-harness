@@ -23,8 +23,8 @@ use crate::{
         CoordinatorError, WorkerErrorCompletion,
     },
     model::{
-        CleanupResult, CleanupStatus, ExecutionPhase, ExecutionStatus, PackageRef, RunRecord,
-        TargetRecoveryPlan, WorkerError, WorkerErrorCode,
+        CleanupResult, CleanupStatus, ExecutionPhase, ExecutionStatus, ManualRecoveryKind,
+        PackageRef, RunRecord, TargetRecoveryPlan, WorkerError, WorkerErrorCode,
     },
     package_manager::PackageManager,
     runner::{
@@ -68,24 +68,31 @@ impl WorkerReadiness {
     pub fn ready(&self) -> bool {
         self.reason
             .read()
-            .map(|reason| reason.is_none())
-            .unwrap_or(false)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
     }
 
     pub fn reason(&self) -> Option<String> {
-        self.reason.read().ok().and_then(|reason| reason.clone())
+        self.reason
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub fn set_not_ready(&self, reason: impl Into<String>) {
-        if let Ok(mut current) = self.reason.write() {
-            *current = Some(redact_and_bound(&reason.into(), 500));
-        }
+        let mut current = self
+            .reason
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *current = Some(redact_and_bound(&reason.into(), 500));
     }
 
     pub fn clear(&self) {
-        if let Ok(mut current) = self.reason.write() {
-            *current = None;
-        }
+        let mut current = self
+            .reason
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *current = None;
     }
 }
 
@@ -223,7 +230,7 @@ impl PackageHarnessWorker {
                     "Worker requires operator recovery and is not claiming work"
                 );
                 self.readiness.set_not_ready(&error);
-                if self.wait_for_operator_recovery(&error).await {
+                if self.wait_for_operator_recovery().await {
                     continue 'resume;
                 }
                 return;
@@ -280,7 +287,7 @@ impl PackageHarnessWorker {
                                 "Claimed job could not be completed safely"
                             );
                             self.readiness.set_not_ready(&error);
-                            if self.wait_for_operator_recovery(&error).await {
+                            if self.wait_for_operator_recovery().await {
                                 continue 'resume;
                             }
                             return;
@@ -383,8 +390,16 @@ impl PackageHarnessWorker {
         }
     }
 
-    async fn wait_for_operator_recovery(&self, error: &str) -> bool {
-        if !operator_recovery_hold(error) || !self.accepting.load(Ordering::SeqCst) {
+    async fn wait_for_operator_recovery(&self) -> bool {
+        if !self.accepting.load(Ordering::SeqCst) {
+            return false;
+        }
+        let has_manual_hold = self.store.load_all().await.is_ok_and(|records| {
+            records.iter().any(|record| {
+                record.requires_worker_attention() && record.worker.manual_recovery_kind().is_some()
+            })
+        });
+        if !has_manual_hold {
             return false;
         }
         info!(
@@ -478,6 +493,7 @@ impl PackageHarnessWorker {
                 let reason = self
                     .mark_manual_recovery(
                         &mut record,
+                        ManualRecoveryKind::Cleanup,
                         format!("execution and cleanup recovery failed: {recovery_error}"),
                     )
                     .await?;
@@ -496,6 +512,7 @@ impl PackageHarnessWorker {
                 let reason = self
                     .mark_manual_recovery(
                         &mut record,
+                        ManualRecoveryKind::Cleanup,
                         format!("claim was lost and cleanup recovery failed: {recovery_error}"),
                     )
                     .await?;
@@ -508,6 +525,7 @@ impl PackageHarnessWorker {
             return Err(self
                 .mark_manual_recovery(
                     &mut record,
+                    ManualRecoveryKind::Cleanup,
                     "target cleanup failed; operator action is required before another job can be claimed",
                 )
                 .await?);
@@ -572,6 +590,7 @@ impl PackageHarnessWorker {
             let reason = self
                 .mark_manual_recovery(
                     &mut record,
+                    ManualRecoveryKind::Cleanup,
                     format!("interrupted job cleanup recovery failed: {recovery_error}"),
                 )
                 .await?;
@@ -581,6 +600,7 @@ impl PackageHarnessWorker {
             return Err(self
                 .mark_manual_recovery(
                     &mut record,
+                    ManualRecoveryKind::Cleanup,
                     "interrupted job cleanup failed; operator action is required",
                 )
                 .await?);
@@ -804,7 +824,7 @@ impl PackageHarnessWorker {
                         CompletionDisposition::Duplicate => "duplicate".to_owned(),
                     });
                     record.worker.pending_completion_body = None;
-                    record.worker.manual_recovery_reason = None;
+                    record.worker.clear_manual_recovery();
                     record.worker.claim_token = None;
                     self.store.save(record).await.map_err(|error| {
                         format!("cannot persist completion acknowledgement: {error}")
@@ -854,6 +874,7 @@ impl PackageHarnessWorker {
                     return Err(self
                         .mark_manual_recovery(
                             record,
+                            ManualRecoveryKind::CompletionConflict,
                             "Tropibot rejected the persisted completion as conflicting; operator recovery is required",
                         )
                         .await?);
@@ -893,7 +914,7 @@ impl PackageHarnessWorker {
     async fn release_reconciled_claim(&self, record: &mut RunRecord) -> Result<(), String> {
         record.worker.claim_token = None;
         record.worker.pending_completion_body = None;
-        record.worker.manual_recovery_reason = None;
+        record.worker.clear_manual_recovery();
         self.store
             .save(record)
             .await
@@ -911,6 +932,7 @@ impl PackageHarnessWorker {
     async fn mark_manual_recovery(
         &self,
         record: &mut RunRecord,
+        kind: ManualRecoveryKind,
         reason: impl AsRef<str>,
     ) -> Result<String, String> {
         let reason = redact_and_bound(reason.as_ref(), 500);
@@ -921,7 +943,7 @@ impl PackageHarnessWorker {
             reason = %reason,
             "Worker paused for operator recovery"
         );
-        record.worker.manual_recovery_reason = Some(reason.clone());
+        record.worker.set_manual_recovery(kind, reason.clone());
         self.store.save(record).await.map_err(|store_error| {
             format!("cannot persist manual recovery requirement: {store_error}")
         })?;
@@ -978,10 +1000,6 @@ fn cleanup_failed(record: &RunRecord) -> bool {
         record.cleanup.status,
         CleanupStatus::Failed | CleanupStatus::TimedOut
     )
-}
-
-fn operator_recovery_hold(error: &str) -> bool {
-    error.contains("cleanup") || error.contains("conflicting")
 }
 
 fn worker_error_cleanup_status(record: &RunRecord) -> CleanupStatus {

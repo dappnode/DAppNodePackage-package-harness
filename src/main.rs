@@ -226,7 +226,7 @@ fn analyzer(config: &Config) -> Result<Arc<dyn LogAnalyzer>, Box<dyn Error>> {
         Some(api_key) => {
             let nexus = NexusLogAnalyzer::new(
                 api_key.clone(),
-                config.nexus_base_url.clone(),
+                &config.nexus_base_url,
                 config.nexus_model.clone(),
                 config.nexus_timeout,
                 config.nexus_max_input_bytes,

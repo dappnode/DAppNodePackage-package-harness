@@ -38,11 +38,7 @@ impl WorkerProgress {
     pub fn snapshot(&self) -> ProgressSnapshot {
         self.snapshot
             .lock()
-            .map(|snapshot| *snapshot)
-            .unwrap_or(ProgressSnapshot {
-                phase: ExecutionPhase::Queued,
-                cleanup_required: true,
-            })
+            .map_or_else(|poisoned| *poisoned.into_inner(), |snapshot| *snapshot)
     }
 
     pub fn request_cancellation(&self) {
@@ -60,12 +56,14 @@ impl WorkerProgress {
 
 impl RunProgress for WorkerProgress {
     fn publish(&self, phase: ExecutionPhase, cleanup_required: bool) {
-        if let Ok(mut snapshot) = self.snapshot.lock() {
-            *snapshot = ProgressSnapshot {
-                phase,
-                cleanup_required,
-            };
-        }
+        let mut snapshot = self
+            .snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *snapshot = ProgressSnapshot {
+            phase,
+            cleanup_required,
+        };
     }
 
     fn control(&self) -> RunControl {

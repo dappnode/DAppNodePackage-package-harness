@@ -137,6 +137,19 @@ function externalLink(label, href) {
   return link;
 }
 
+async function readJson(response, failureLabel = "Request failed") {
+  let payload;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new Error(`${failureLabel}: invalid JSON response (${response.status})`);
+  }
+  if (!response.ok) {
+    throw new Error(payload?.error || `${failureLabel} (${response.status})`);
+  }
+  return payload;
+}
+
 function repositoryLinks(job) {
   const links = node("span", "inline-links");
   const repositoryUrl = `https://github.com/${job.repository}`;
@@ -721,10 +734,13 @@ async function setWorkerLifecycle(action) {
   try {
     const response = await fetch(`/operator/worker/${action}`, {
       method: "POST",
-      headers: { accept: "application/json" },
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+      },
+      body: "{}",
     });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || `Request failed (${response.status})`);
+    const payload = await readJson(response);
     toast(payload.message, "success");
     state.jobsFingerprint = "";
     await loadJobs();
@@ -745,8 +761,7 @@ async function loadJobs({ quiet = false } = {}) {
       headers: { accept: "application/json" },
       cache: "no-store",
     });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || `Request failed (${response.status})`);
+    const payload = await readJson(response, "Loading jobs failed");
     const jobsFingerprint = JSON.stringify(payload.jobs);
     const jobsChanged = jobsFingerprint !== state.jobsFingerprint;
     state.jobs = payload.jobs;
@@ -781,13 +796,7 @@ async function loadCoordinatorRecovery({ quiet = false } = {}) {
     });
     let lostJob = null;
     if (response.status !== 204) {
-      const payload = await response.json();
-      if (!response.ok) {
-        throw new Error(
-          payload.error || `Tropibot recovery check failed (${response.status})`,
-        );
-      }
-      lostJob = payload;
+      lostJob = await readJson(response, "Tropibot recovery check failed");
     }
     const fingerprint = JSON.stringify(lostJob);
     if (fingerprint !== state.lostJobFingerprint) {
@@ -830,8 +839,7 @@ async function markCoordinatorReady(retry, button) {
       },
       body: JSON.stringify({ jobId: job.jobId, retry }),
     });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || `Request failed (${response.status})`);
+    const payload = await readJson(response);
     const retryResult = humanize(payload.retryDisposition);
     const blocked = payload.blockingJobIds?.length
       ? ` Blocking jobs: ${payload.blockingJobIds.join(", ")}.`
@@ -874,8 +882,7 @@ async function runRecoveryAction(job, action, button) {
       },
       body: JSON.stringify({ runId: job.runId, action }),
     });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || `Request failed (${response.status})`);
+    const payload = await readJson(response);
     toast(payload.message || "Worker recovery action accepted", "success");
     state.jobsFingerprint = "";
     await loadJobs();

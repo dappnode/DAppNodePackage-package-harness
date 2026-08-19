@@ -1,21 +1,22 @@
-.PHONY: dev build test lint typecheck start
+.PHONY: dev build test lint typecheck check start
 
 dev:
 	PACKAGE_MANAGER_MODE=fake cargo run
 
 build:
-	cargo build --release
+	cargo build --locked --release
 
 test:
-	cargo test --all-features
+	cargo test --locked --all-targets --all-features
 
 lint:
-	cargo fmt --check
-	cargo clippy --all-targets --all-features -- -D warnings
+	cargo fmt --all -- --check
+	cargo clippy --locked --all-targets --all-features -- -D warnings
 
 typecheck:
-	cargo check --all-targets --all-features
+	cargo check --locked --all-targets --all-features
+
+check: lint test
 
 start:
 	cargo run --release
-

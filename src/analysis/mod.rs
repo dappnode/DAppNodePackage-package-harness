@@ -19,6 +19,8 @@ pub use nexus::{CompositeLogAnalyzer, NexusLogAnalyzer};
 /// Failure returned by an analyzer implementation.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum AnalyzerError {
+    #[error("invalid analyzer configuration: {0}")]
+    Configuration(String),
     #[error("analyzer timed out")]
     Timeout,
     #[error("analyzer transport failed: {0}")]

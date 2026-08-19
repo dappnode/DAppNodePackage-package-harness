@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -24,7 +25,7 @@ const MAX_CONTAINER_BYTES: usize = 255;
 pub struct NexusLogAnalyzer {
     client: reqwest::Client,
     api_key: String,
-    base_url: String,
+    base_url: Url,
     model: String,
     timeout: Duration,
     max_input_bytes: usize,
@@ -33,12 +34,27 @@ pub struct NexusLogAnalyzer {
 impl NexusLogAnalyzer {
     pub fn new(
         api_key: String,
-        base_url: String,
+        base_url: impl AsRef<str>,
         model: String,
         timeout: Duration,
         max_input_bytes: usize,
     ) -> Result<Self, AnalyzerError> {
         crate::tls::ensure_crypto_provider();
+        if !(1_024..=1024 * 1024).contains(&max_input_bytes) {
+            return Err(AnalyzerError::Configuration(
+                "max input bytes must be between 1024 and 1048576".to_owned(),
+            ));
+        }
+        let mut base_url = Url::parse(base_url.as_ref())
+            .map_err(|error| AnalyzerError::Configuration(format!("invalid Nexus URL: {error}")))?;
+        if !matches!(base_url.scheme(), "http" | "https") || base_url.host_str().is_none() {
+            return Err(AnalyzerError::Configuration(
+                "invalid Nexus URL: expected an absolute HTTP(S) URL".to_owned(),
+            ));
+        }
+        if !base_url.path().ends_with('/') {
+            base_url.set_path(&format!("{}/", base_url.path()));
+        }
         let client = reqwest::Client::builder()
             .connect_timeout(timeout.min(Duration::from_secs(10)))
             .build()
@@ -46,7 +62,7 @@ impl NexusLogAnalyzer {
         Ok(Self {
             client,
             api_key,
-            base_url: base_url.trim_end_matches('/').to_owned(),
+            base_url,
             model,
             timeout,
             max_input_bytes,
@@ -130,9 +146,13 @@ impl LogAnalyzer for NexusLogAnalyzer {
         );
         let result: Result<LogAnalysisResult, AnalyzerError> =
             match tokio::time::timeout(self.timeout, async {
+                let endpoint = self
+                    .base_url
+                    .join("chat/completions")
+                    .map_err(|error| AnalyzerError::Transport(error.to_string()))?;
                 let response = self
                     .client
-                    .post(format!("{}/chat/completions", self.base_url))
+                    .post(endpoint)
                     .bearer_auth(&self.api_key)
                     .json(&request)
                     .send()
@@ -308,4 +328,37 @@ fn normalize_result(result: &mut LogAnalysisResult) {
 
 fn bound_text(input: &str, maximum_bytes: usize) -> String {
     truncate_utf8(input, maximum_bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use crate::analysis::AnalyzerError;
+
+    use super::NexusLogAnalyzer;
+
+    #[test]
+    fn rejects_invalid_analyzer_configuration_at_construction() {
+        let invalid_url = NexusLogAnalyzer::new(
+            "key".to_owned(),
+            "not a URL",
+            "model".to_owned(),
+            Duration::from_secs(1),
+            4_096,
+        );
+        assert!(matches!(invalid_url, Err(AnalyzerError::Configuration(_))));
+
+        let invalid_limit = NexusLogAnalyzer::new(
+            "key".to_owned(),
+            "https://nexus.example/v1",
+            "model".to_owned(),
+            Duration::from_secs(1),
+            0,
+        );
+        assert!(matches!(
+            invalid_limit,
+            Err(AnalyzerError::Configuration(_))
+        ));
+    }
 }

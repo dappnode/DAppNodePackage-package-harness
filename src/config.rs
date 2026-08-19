@@ -115,6 +115,25 @@ impl Config {
         }
         let package_harness_poll = required_seconds("PACKAGE_HARNESS_POLL_SECONDS")?;
         let package_harness_heartbeat = required_seconds("PACKAGE_HARNESS_HEARTBEAT_SECONDS")?;
+        let stabilization_timeout = millis("STABILIZATION_TIMEOUT_MS", 180_000)?;
+        let stabilization_poll = millis("STABILIZATION_POLL_MS", 5_000)?;
+        let intervals = u32::try_from(required_samples.saturating_sub(1)).unwrap_or(19);
+        let minimum_stabilization_window = stabilization_poll.saturating_mul(intervals);
+        if stabilization_timeout < minimum_stabilization_window {
+            return Err(ConfigError::Invalid {
+                name: "STABILIZATION_TIMEOUT_MS",
+                message: format!(
+                    "must allow {required_samples} samples at the configured poll interval"
+                ),
+            });
+        }
+        let nexus_max_input_bytes = parse("NEXUS_MAX_INPUT_BYTES", 64 * 1024)?;
+        if !(1_024..=1024 * 1024).contains(&nexus_max_input_bytes) {
+            return Err(ConfigError::Invalid {
+                name: "NEXUS_MAX_INPUT_BYTES",
+                message: "must be between 1024 and 1048576 bytes".to_owned(),
+            });
+        }
 
         Ok(Self {
             listen_addr,
@@ -131,8 +150,8 @@ impl Config {
             mcp_mutation_timeout: long_millis("MCP_MUTATION_TIMEOUT_MS", 1_800_000)?,
             mcp_mutation_attempts: mutation_attempts,
             mcp_mutation_retry_delay: millis("MCP_MUTATION_RETRY_DELAY_MS", 5_000)?,
-            stabilization_timeout: millis("STABILIZATION_TIMEOUT_MS", 180_000)?,
-            stabilization_poll: millis("STABILIZATION_POLL_MS", 5_000)?,
+            stabilization_timeout,
+            stabilization_poll,
             stabilization_required_samples: required_samples,
             log_tail,
             cleanup_enabled: bool_value("CLEANUP_ENABLED", true)?,
@@ -143,7 +162,7 @@ impl Config {
                 .unwrap_or_else(|_| "https://nexus-api.dappnode.com/v1".to_owned()),
             nexus_model: env::var("NEXUS_MODEL").unwrap_or_else(|_| "nexus/auto".to_owned()),
             nexus_timeout: millis("NEXUS_TIMEOUT_MS", 300_000)?,
-            nexus_max_input_bytes: parse("NEXUS_MAX_INPUT_BYTES", 64 * 1024)?,
+            nexus_max_input_bytes,
             tropibot_url,
             package_harness_worker_id,
             package_harness_worker_token,

@@ -8,7 +8,6 @@ services:
     restart: unless-stopped
     # Planned drains normally finish before shutdown. If SIGTERM arrives first,
     # keep Docker from killing an in-flight mutation or mandatory cleanup.
-    stop_grace_period: 2h
     environment:
       PORT: "8080"
       DATA_DIR: /data

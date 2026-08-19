@@ -158,7 +158,7 @@ impl PackageHarnessWorker {
                     "Worker requires operator recovery and is not claiming work"
                 );
                 self.readiness.set_not_ready(&error);
-                if self.wait_for_cleanup_acknowledgement(&error).await {
+                if self.wait_for_operator_recovery(&error).await {
                     continue 'resume;
                 }
                 return;
@@ -198,7 +198,7 @@ impl PackageHarnessWorker {
                                 "Claimed job could not be completed safely"
                             );
                             self.readiness.set_not_ready(&error);
-                            if self.wait_for_cleanup_acknowledgement(&error).await {
+                            if self.wait_for_operator_recovery(&error).await {
                                 continue 'resume;
                             }
                             return;
@@ -272,23 +272,23 @@ impl PackageHarnessWorker {
         }
     }
 
-    async fn wait_for_cleanup_acknowledgement(&self, error: &str) -> bool {
-        if !cleanup_recovery_hold(error) || !self.accepting.load(Ordering::SeqCst) {
+    async fn wait_for_operator_recovery(&self, error: &str) -> bool {
+        if !operator_recovery_hold(error) || !self.accepting.load(Ordering::SeqCst) {
             return false;
         }
         info!(
-            event = "worker_waiting_for_cleanup_acknowledgement",
+            event = "worker_waiting_for_operator_recovery",
             worker_id = %self.config.worker_id,
-            "Worker is paused until an operator acknowledges completed manual cleanup"
+            "Worker is paused until an operator resolves the local recovery hold"
         );
         self.recovery_control.wait().await;
         if !self.accepting.load(Ordering::SeqCst) {
             return false;
         }
         info!(
-            event = "worker_cleanup_acknowledgement_received",
+            event = "worker_operator_recovery_received",
             worker_id = %self.config.worker_id,
-            "Operator acknowledgement received; retrying local recovery"
+            "Operator recovery action received; reconciling local state"
         );
         true
     }
@@ -858,8 +858,8 @@ fn cleanup_failed(record: &RunRecord) -> bool {
     )
 }
 
-fn cleanup_recovery_hold(error: &str) -> bool {
-    error.contains("cleanup")
+fn operator_recovery_hold(error: &str) -> bool {
+    error.contains("cleanup") || error.contains("conflicting")
 }
 
 fn worker_error_cleanup_status(record: &RunRecord) -> CleanupStatus {

@@ -93,7 +93,9 @@ curl --fail-with-body \
   http://HARNESS_HOST:8080/operator/recovery/continue
 ```
 
-The endpoint accepts only cleanup-related manual holds. It preserves the claim token and stored result, clears the persisted hold, and wakes the paused worker without a container restart. It does not override coordinator completion conflicts.
+The endpoint accepts only cleanup-related manual holds. It preserves the claim token and stored result, records the operator-verified cleanup, clears the persisted hold, and wakes the paused worker without a container restart.
+
+The dashboard's local worker control remains visible for completion conflicts. It shows whether cleanup is confirmed, a completion payload is persisted, the local claim is held, and Tropibot acknowledged a result. Once cleanup is confirmed, the operator can either retry the exact persisted completion or explicitly accept Tropibot's existing result and release the local claim. The latter is destructive to the saved delivery obligation and requires typing the exact run ID. The worker remains alive and paused while waiting for either action, so no package restart is needed.
 
 Heartbeats run independently of package execution. A cancellation request is observed at safe phase boundaries and inside stabilization polling. It prevents a new mutating phase but never bypasses required cleanup. If Tropibot no longer recognizes the claim, the worker finishes the current operation, reconciles cleanup, and releases the obsolete local claim when the target is safe.
 

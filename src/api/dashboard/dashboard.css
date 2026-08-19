@@ -243,6 +243,12 @@ summary:focus-visible {
   background: var(--orange);
 }
 
+.button-danger {
+  color: #ffd7d5;
+  border-color: rgba(255, 107, 104, 0.4);
+  background: var(--red-soft);
+}
+
 .updated {
   color: var(--subtle);
   font-size: 11px;
@@ -288,7 +294,8 @@ summary:focus-visible {
   color: var(--orange);
 }
 
-.coordinator-recovery {
+.coordinator-recovery,
+.local-recovery {
   margin-top: 22px;
   padding: 26px 28px;
   border: 1px solid rgba(255, 107, 104, 0.42);
@@ -297,6 +304,13 @@ summary:focus-visible {
     linear-gradient(120deg, rgba(255, 107, 104, 0.1), transparent 55%),
     var(--panel);
   box-shadow: var(--shadow);
+}
+
+.local-recovery {
+  border-color: rgba(255, 122, 26, 0.5);
+  background:
+    linear-gradient(120deg, rgba(255, 122, 26, 0.12), transparent 55%),
+    var(--panel);
 }
 
 .recovery-heading,
@@ -311,12 +325,22 @@ summary:focus-visible {
   margin-bottom: 0;
 }
 
-.coordinator-recovery-copy {
+.coordinator-recovery-copy,
+.local-recovery-copy,
+.recovery-guidance {
   max-width: 850px;
   margin: 16px 0 22px;
   color: var(--muted);
   font-size: 13px;
   line-height: 1.6;
+}
+
+.local-recovery-copy {
+  color: #f0d6c3;
+}
+
+.recovery-explanation {
+  max-width: 960px;
 }
 
 .recovery-context {
@@ -328,6 +352,10 @@ summary:focus-visible {
   border: 1px solid var(--line);
   border-radius: 12px;
   background: var(--line);
+}
+
+.local-recovery .recovery-context {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .recovery-context > div {
@@ -628,6 +656,11 @@ h2 {
   width: 100%;
 }
 
+.stacked-actions {
+  display: grid;
+  gap: 8px;
+}
+
 .notice {
   margin-bottom: 14px;
   padding: 12px 14px;
@@ -752,6 +785,10 @@ h2 {
     grid-template-columns: 1fr 1fr;
   }
 
+  .local-recovery .recovery-context {
+    grid-template-columns: 1fr 1fr;
+  }
+
   .search input {
     width: 100%;
   }
@@ -785,7 +822,8 @@ h2 {
     grid-template-columns: 1fr 1fr;
   }
 
-  .coordinator-recovery {
+  .coordinator-recovery,
+  .local-recovery {
     padding: 21px 18px;
   }
 
@@ -796,6 +834,10 @@ h2 {
   }
 
   .recovery-context {
+    grid-template-columns: 1fr;
+  }
+
+  .local-recovery .recovery-context {
     grid-template-columns: 1fr;
   }
 

@@ -1747,17 +1747,30 @@ async fn polling_worker_requires_manual_recovery_for_a_conflicting_completion()
     let manager: Arc<dyn PackageManager> = Arc::new(ScriptedPackageManager::new(
         request.package.dnp_name.clone(),
     ));
-    let worker = worker_for(
+    let accepting = Arc::new(AtomicBool::new(true));
+    let recovery_control = WorkerRecoveryControl::default();
+    let worker = worker_for_with_recovery_control(
         &server,
         Arc::clone(&store),
         manager,
-        Arc::new(AtomicBool::new(true)),
+        Arc::clone(&accepting),
+        recovery_control.clone(),
     )?;
-    tokio::time::timeout(Duration::from_secs(2), worker.run()).await?;
+    let worker_task = tokio::spawn(worker.run());
 
     let job_id =
         dappnode_package_harness::model::RunId::parse("gh-pr-42-0123456789ab-abcdef1234567890")?;
-    let record = store.get(&job_id).await?.ok_or("missing worker record")?;
+    let record = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(record) = store.get(&job_id).await?
+                && record.worker.manual_recovery_reason.is_some()
+            {
+                return Ok::<_, dappnode_package_harness::storage::StoreError>(record);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
     assert!(!record.worker.completion_acknowledged);
     assert!(record.worker.pending_completion_body.is_some());
     assert!(
@@ -1768,6 +1781,10 @@ async fn polling_worker_requires_manual_recovery_for_a_conflicting_completion()
             .is_some_and(|reason| reason.contains("conflicting"))
     );
     assert!(record.requires_worker_attention());
+    assert!(!worker_task.is_finished());
+    accepting.store(false, Ordering::SeqCst);
+    recovery_control.resume();
+    tokio::time::timeout(Duration::from_secs(2), worker_task).await??;
     Ok(())
 }
 

@@ -46,28 +46,38 @@ pub fn router(state: ApiState) -> Router {
         .route("/healthz", get(health))
         .route("/readyz", get(ready))
         .route("/operator/recovery/continue", post(continue_recovery))
+        .route("/operator/recovery/action", post(recovery_action))
         .route("/operator/coordinator/ready", post(coordinator_ready))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
 
-async fn dashboard() -> Html<&'static str> {
-    Html(include_str!("dashboard/index.html"))
+async fn dashboard() -> impl IntoResponse {
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Html(include_str!("dashboard/index.html")),
+    )
 }
 
 async fn dashboard_css() -> impl IntoResponse {
     (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        [
+            (header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
         include_str!("dashboard/dashboard.css"),
     )
 }
 
 async fn dashboard_js() -> impl IntoResponse {
     (
-        [(
-            header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
-        )],
+        [
+            (
+                header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            ),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
         include_str!("dashboard/dashboard.js"),
     )
 }
@@ -143,7 +153,10 @@ struct JobSummary {
     error_count: usize,
     requires_attention: bool,
     manual_recovery_reason: Option<String>,
+    recovery_kind: Option<&'static str>,
     can_continue_after_cleanup: bool,
+    pending_completion: bool,
+    has_claim: bool,
     completion_acknowledged: bool,
     completion_disposition: Option<String>,
 }
@@ -234,6 +247,15 @@ fn job_summary(record: RunRecord) -> JobSummary {
         && manual_recovery_reason
             .as_deref()
             .is_some_and(|reason| reason.contains("cleanup"));
+    let recovery_kind = manual_recovery_reason.as_deref().map(|reason| {
+        if reason.contains("conflict") {
+            "completion_conflict"
+        } else if reason.contains("cleanup") {
+            "cleanup"
+        } else {
+            "manual"
+        }
+    });
     JobSummary {
         run_id: record.request.run_id.to_string(),
         dnp_name: record.request.package.dnp_name.to_string(),
@@ -263,7 +285,10 @@ fn job_summary(record: RunRecord) -> JobSummary {
         error_count: record.errors.len(),
         requires_attention,
         manual_recovery_reason,
+        recovery_kind,
         can_continue_after_cleanup,
+        pending_completion: record.worker.pending_completion_body.is_some(),
+        has_claim: record.worker.claim_token.is_some(),
         completion_acknowledged: record.worker.completion_acknowledged,
         completion_disposition: record.worker.completion_disposition,
     }
@@ -281,6 +306,71 @@ struct ContinueRecoveryResponse {
     status: &'static str,
     run_id: String,
     message: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum RecoveryAction {
+    ContinueAfterCleanup,
+    ConfirmCleanup,
+    RetryCompletion,
+    AcceptCoordinatorResult,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RecoveryActionRequest {
+    run_id: String,
+    action: RecoveryAction,
+}
+
+async fn recovery_action(
+    State(state): State<ApiState>,
+    Json(request): Json<RecoveryActionRequest>,
+) -> Response {
+    let run_id = match RunId::parse(&request.run_id) {
+        Ok(run_id) => run_id,
+        Err(error) => {
+            return operator_error(StatusCode::BAD_REQUEST, format!("invalid runId: {error}"));
+        }
+    };
+    let result = match request.action {
+        RecoveryAction::ContinueAfterCleanup => acknowledge_cleanup_recovery(
+            state.store.as_ref(),
+            &state.worker_recovery_control,
+            &run_id,
+        )
+        .await
+        .map(|()| "manual cleanup acknowledged; worker recovery resumed"),
+        RecoveryAction::ConfirmCleanup => confirm_manual_cleanup(state.store.as_ref(), &run_id)
+            .await
+            .map(|()| "manual cleanup recorded; choose how to resolve the completion conflict"),
+        RecoveryAction::RetryCompletion => resolve_completion_conflict(
+            state.store.as_ref(),
+            &state.worker_recovery_control,
+            &run_id,
+            false,
+        )
+        .await
+        .map(|()| "persisted completion queued for another delivery attempt"),
+        RecoveryAction::AcceptCoordinatorResult => resolve_completion_conflict(
+            state.store.as_ref(),
+            &state.worker_recovery_control,
+            &run_id,
+            true,
+        )
+        .await
+        .map(|()| "coordinator result accepted; local conflict released"),
+    };
+    match result {
+        Ok(message) => Json(ContinueRecoveryResponse {
+            status: "accepted",
+            run_id: run_id.to_string(),
+            message,
+        })
+        .into_response(),
+        Err(error) => operator_error(error.status(), error.to_string()),
+    }
 }
 
 async fn continue_recovery(
@@ -321,6 +411,12 @@ pub enum OperatorRecoveryError {
     NotWaiting,
     #[error("manual recovery hold is not a cleanup hold")]
     NotCleanup,
+    #[error("manual recovery hold is not a completion conflict")]
+    NotCompletionConflict,
+    #[error("completion conflict cannot be released until cleanup is confirmed")]
+    CleanupNotConfirmed,
+    #[error("persisted completion is missing")]
+    MissingCompletion,
     #[error("cannot access run record: {0}")]
     Store(String),
 }
@@ -329,7 +425,11 @@ impl OperatorRecoveryError {
     fn status(&self) -> StatusCode {
         match self {
             Self::NotFound => StatusCode::NOT_FOUND,
-            Self::NotWaiting | Self::NotCleanup => StatusCode::CONFLICT,
+            Self::NotWaiting
+            | Self::NotCleanup
+            | Self::NotCompletionConflict
+            | Self::CleanupNotConfirmed
+            | Self::MissingCompletion => StatusCode::CONFLICT,
             Self::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -354,6 +454,7 @@ pub async fn acknowledge_cleanup_recovery(
         return Err(OperatorRecoveryError::NotCleanup);
     }
 
+    record_manual_cleanup(&mut record);
     record.worker.manual_recovery_reason = None;
     store
         .save(&record)
@@ -364,6 +465,92 @@ pub async fn acknowledge_cleanup_recovery(
         run_id = %run_id,
         dnp_name = %record.request.package.dnp_name,
         "Operator confirmed manual cleanup; worker recovery will continue"
+    );
+    worker_recovery_control.resume();
+    Ok(())
+}
+
+async fn confirm_manual_cleanup(
+    store: &dyn RunStore,
+    run_id: &RunId,
+) -> Result<(), OperatorRecoveryError> {
+    let mut record = store
+        .get(run_id)
+        .await
+        .map_err(|error| OperatorRecoveryError::Store(error.to_string()))?
+        .ok_or(OperatorRecoveryError::NotFound)?;
+    if record.worker.manual_recovery_reason.is_none() {
+        return Err(OperatorRecoveryError::NotWaiting);
+    }
+    if !record.worker.cleanup_required {
+        return Err(OperatorRecoveryError::NotCleanup);
+    }
+    record_manual_cleanup(&mut record);
+    store
+        .save(&record)
+        .await
+        .map_err(|error| OperatorRecoveryError::Store(error.to_string()))?;
+    info!(
+        event = "operator_cleanup_confirmed",
+        run_id = %run_id,
+        dnp_name = %record.request.package.dnp_name,
+        "Operator recorded verified manual cleanup while preserving the recovery hold"
+    );
+    Ok(())
+}
+
+fn record_manual_cleanup(record: &mut RunRecord) {
+    record.cleanup.status = CleanupStatus::Passed;
+    record.cleanup.error = None;
+    record.cleanup.leftover_packages.clear();
+}
+
+async fn resolve_completion_conflict(
+    store: &dyn RunStore,
+    worker_recovery_control: &WorkerRecoveryControl,
+    run_id: &RunId,
+    accept_coordinator_result: bool,
+) -> Result<(), OperatorRecoveryError> {
+    let mut record = store
+        .get(run_id)
+        .await
+        .map_err(|error| OperatorRecoveryError::Store(error.to_string()))?
+        .ok_or(OperatorRecoveryError::NotFound)?;
+    let reason = record
+        .worker
+        .manual_recovery_reason
+        .as_deref()
+        .ok_or(OperatorRecoveryError::NotWaiting)?;
+    if !reason.contains("conflict") {
+        return Err(OperatorRecoveryError::NotCompletionConflict);
+    }
+    if !matches!(
+        record.cleanup.status,
+        CleanupStatus::Passed | CleanupStatus::Skipped
+    ) {
+        return Err(OperatorRecoveryError::CleanupNotConfirmed);
+    }
+    if record.worker.pending_completion_body.is_none() {
+        return Err(OperatorRecoveryError::MissingCompletion);
+    }
+
+    record.worker.manual_recovery_reason = None;
+    if accept_coordinator_result {
+        record.worker.pending_completion_body = None;
+        record.worker.claim_token = None;
+        record.worker.completion_acknowledged = true;
+        record.worker.completion_disposition = Some("operator_accepted_coordinator".to_owned());
+    }
+    store
+        .save(&record)
+        .await
+        .map_err(|error| OperatorRecoveryError::Store(error.to_string()))?;
+    info!(
+        event = "operator_completion_conflict_resolved",
+        run_id = %run_id,
+        dnp_name = %record.request.package.dnp_name,
+        resolution = if accept_coordinator_result { "accept_coordinator" } else { "retry_local" },
+        "Operator resolved a conflicting completion hold"
     );
     worker_recovery_control.resume();
     Ok(())
@@ -551,6 +738,50 @@ mod tests {
             .await?
             .ok_or("updated record missing")?;
         assert!(updated.worker.manual_recovery_reason.is_none());
+        assert_eq!(updated.cleanup.status, CleanupStatus::Passed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn completion_conflict_can_be_retried_or_explicitly_released()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = Arc::new(FileRunStore::new(directory.path().to_path_buf()).await?);
+        let request = request("dashboard-conflict")?;
+        let mut record = RunRecord::claimed(request.clone(), "claim-token".to_owned());
+        record.cleanup.status = CleanupStatus::Passed;
+        record.worker.cleanup_required = true;
+        record.worker.pending_completion_body = Some("{\"saved\":true}".to_owned());
+        record.worker.manual_recovery_reason = Some(
+            "Tropibot rejected the persisted completion as conflicting; operator recovery is required"
+                .to_owned(),
+        );
+        store.create(&record).await?;
+        let control = WorkerRecoveryControl::default();
+
+        resolve_completion_conflict(store.as_ref(), &control, &request.run_id, false).await?;
+        let retried = store.get(&request.run_id).await?.ok_or("record missing")?;
+        assert!(retried.worker.manual_recovery_reason.is_none());
+        assert_eq!(
+            retried.worker.pending_completion_body.as_deref(),
+            Some("{\"saved\":true}")
+        );
+        assert!(!retried.worker.completion_acknowledged);
+
+        let mut conflicted_again = retried;
+        conflicted_again.worker.manual_recovery_reason =
+            Some("persisted completion is conflicting".to_owned());
+        store.save(&conflicted_again).await?;
+        resolve_completion_conflict(store.as_ref(), &control, &request.run_id, true).await?;
+        let released = store.get(&request.run_id).await?.ok_or("record missing")?;
+        assert!(released.worker.pending_completion_body.is_none());
+        assert!(released.worker.claim_token.is_none());
+        assert!(released.worker.completion_acknowledged);
+        assert_eq!(
+            released.worker.completion_disposition.as_deref(),
+            Some("operator_accepted_coordinator")
+        );
+        assert!(!released.requires_worker_attention());
         Ok(())
     }
 }

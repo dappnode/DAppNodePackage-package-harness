@@ -32,6 +32,13 @@ const elements = {
   lostJobHeartbeat: document.querySelector("#lost-job-heartbeat"),
   readyAndRetry: document.querySelector("#ready-and-retry"),
   readyWithoutRetry: document.querySelector("#ready-without-retry"),
+  localRecovery: document.querySelector("#local-recovery"),
+  localRecoveryTitle: document.querySelector("#local-recovery-title"),
+  localRecoveryKind: document.querySelector("#local-recovery-kind"),
+  localRecoveryReason: document.querySelector("#local-recovery-reason"),
+  localRecoveryContext: document.querySelector("#local-recovery-context"),
+  localRecoveryExplanation: document.querySelector("#local-recovery-explanation"),
+  localRecoveryActions: document.querySelector("#local-recovery-actions"),
 };
 
 function humanize(value) {
@@ -153,10 +160,106 @@ function renderCoordinatorRecovery() {
     : "Not reported";
 }
 
+function recoveryContextItem(label, value) {
+  const item = node("div");
+  item.append(node("span", null, label), node("strong", null, value));
+  return item;
+}
+
+function recoveryActionButton(job, action, label, className = "button-primary") {
+  const button = node("button", `button ${className}`, label);
+  button.type = "button";
+  button.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    runRecoveryAction(job, action, button);
+  });
+  return button;
+}
+
+function recoveryPanelContent(job, compact = false) {
+  const fragment = document.createDocumentFragment();
+  const copy = node("p", compact ? null : "recovery-guidance");
+  const actions = node("div", compact ? "stacked-actions" : "recovery-actions");
+
+  if (job.recoveryKind === "cleanup") {
+    copy.textContent =
+      "Verify the target package is restored or removed as intended. Confirming records the manual cleanup and asks the live worker to reconcile again.";
+    actions.append(
+      recoveryActionButton(
+        job,
+        "continueAfterCleanup",
+        "Cleanup verified — continue",
+      ),
+    );
+  } else if (job.recoveryKind === "completion_conflict") {
+    const cleanupConfirmed = ["passed", "skipped"].includes(job.cleanupStatus);
+    if (!cleanupConfirmed) {
+      copy.textContent =
+        "Tropibot holds different state, but local cleanup is not recorded as safe. Verify the package state first; completion controls unlock after that confirmation.";
+      actions.append(
+        recoveryActionButton(job, "confirmCleanup", "Cleanup verified — unlock resolution"),
+      );
+    } else {
+      copy.textContent =
+        "Tropibot already holds different state for this claim. Retry is non-destructive and resends the exact saved payload. Accept coordinator result permanently discards the local pending payload and releases the claim.";
+      actions.append(
+        recoveryActionButton(job, "retryCompletion", "Retry exact completion"),
+        recoveryActionButton(
+          job,
+          "acceptCoordinatorResult",
+          "Accept Tropibot result & release",
+          "button-danger",
+        ),
+      );
+    }
+  } else {
+    copy.textContent =
+      "This hold has no safe automated override. Inspect the reason and local record, then refresh after correcting the underlying state.";
+  }
+  fragment.append(copy, actions);
+  return fragment;
+}
+
+function renderLocalRecovery() {
+  const job = state.jobs.find((candidate) => candidate.manualRecoveryReason);
+  elements.localRecovery.classList.toggle("is-hidden", !job);
+  if (!job) return;
+
+  const titles = {
+    cleanup: "Manual cleanup must be verified",
+    completion_conflict: "Completion conflicts with Tropibot",
+    manual: "Manual recovery required",
+  };
+  elements.localRecoveryTitle.textContent = titles[job.recoveryKind] || titles.manual;
+  elements.localRecoveryKind.textContent = humanize(job.recoveryKind || "manual");
+  elements.localRecoveryReason.textContent = job.manualRecoveryReason;
+  elements.localRecoveryContext.replaceChildren(
+    recoveryContextItem("Package", job.dnpName),
+    recoveryContextItem("Run", job.runId),
+    recoveryContextItem("Cleanup", humanize(job.cleanupStatus)),
+    recoveryContextItem(
+      "Saved delivery",
+      job.pendingCompletion ? "Pending" : "None",
+    ),
+    recoveryContextItem("Local claim", job.hasClaim ? "Held" : "Released"),
+    recoveryContextItem(
+      "Tropibot acknowledgement",
+      job.completionAcknowledged ? "Recorded" : "Missing",
+    ),
+  );
+  elements.localRecoveryExplanation.replaceChildren();
+  elements.localRecoveryActions.replaceChildren();
+  const content = recoveryPanelContent(job);
+  const children = [...content.childNodes];
+  elements.localRecoveryExplanation.append(children[0]);
+  if (children[1]) elements.localRecoveryActions.append(...children[1].childNodes);
+}
+
 function renderJob(job) {
   const card = node("details", `job${job.requiresAttention ? " needs-attention" : ""}`);
   card.dataset.runId = job.runId;
-  card.open = state.expandedJobs.has(job.runId);
+  card.open = job.requiresAttention || state.expandedJobs.has(job.runId);
   card.addEventListener("toggle", () => {
     if (card.open) {
       state.expandedJobs.add(job.runId);
@@ -215,25 +318,21 @@ function renderJob(job) {
   }
   body.append(information);
 
-  if (job.canContinueAfterCleanup) {
+  if (job.manualRecoveryReason) {
     const recovery = node("aside", "recovery-panel");
-    recovery.append(node("h3", null, "Manual cleanup required"));
     recovery.append(
       node(
-        "p",
+        "h3",
         null,
-        job.manualRecoveryReason ||
-          "The worker is paused until the target has been cleaned up manually.",
+        job.recoveryKind === "completion_conflict"
+          ? "Completion conflict"
+          : "Manual cleanup required",
       ),
     );
-    const action = node("button", "button button-primary", "Cleanup done — continue");
-    action.type = "button";
-    action.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      continueRecovery(job, action);
-    });
-    recovery.append(action);
+    recovery.append(
+      node("p", null, job.manualRecoveryReason),
+    );
+    recovery.append(recoveryPanelContent(job, true));
     body.append(recovery);
   }
 
@@ -274,6 +373,7 @@ async function loadJobs({ quiet = false } = {}) {
     if (jobsChanged) {
       renderMetrics();
       renderJobs();
+      renderLocalRecovery();
     }
     elements.updated.textContent = `Updated ${new Intl.DateTimeFormat(undefined, {
       hour: "2-digit",
@@ -354,11 +454,10 @@ async function markCoordinatorReady(retry, button) {
     const blocked = payload.blockingJobIds?.length
       ? ` Blocking jobs: ${payload.blockingJobIds.join(", ")}.`
       : "";
-    toast(`Worker released. Retry: ${retryResult}.${blocked}`, "success");
-    state.lostJob = null;
-    state.lostJobFingerprint = "null";
-    renderCoordinatorRecovery();
-    renderMetrics();
+    toast(
+      `Tropibot accepted the command. Retry: ${retryResult}.${blocked} Checking the resulting worker state…`,
+      "success",
+    );
     await Promise.all([loadJobs(), loadCoordinatorRecovery()]);
   } catch (error) {
     toast(error instanceof Error ? error.message : String(error), "error");
@@ -369,30 +468,41 @@ async function markCoordinatorReady(retry, button) {
   }
 }
 
-async function continueRecovery(job, button) {
-  const confirmed = window.confirm(
-    `Confirm that manual cleanup for ${job.dnpName} is complete and allow the worker to continue?`,
-  );
-  if (!confirmed) return;
+async function runRecoveryAction(job, action, button) {
+  const acceptingCoordinator = action === "acceptCoordinatorResult";
+  const confirmation = acceptingCoordinator
+    ? window.prompt(
+        `This discards the saved local completion and trusts Tropibot's existing result.\n\nType the run ID to continue:\n${job.runId}`,
+      ) === job.runId
+    : window.confirm(
+        ["continueAfterCleanup", "confirmCleanup"].includes(action)
+          ? `Confirm manual cleanup for ${job.dnpName} is complete and verified?`
+          : `Retry the exact persisted completion for ${job.runId}?`,
+      );
+  if (!confirmation) return;
+  const originalLabel = button.textContent;
   button.disabled = true;
-  button.textContent = "Continuing…";
+  button.textContent = acceptingCoordinator ? "Releasing…" : "Working…";
   try {
-    const response = await fetch("/operator/recovery/continue", {
+    const response = await fetch("/operator/recovery/action", {
       method: "POST",
       headers: {
         accept: "application/json",
         "content-type": "application/json",
       },
-      body: JSON.stringify({ runId: job.runId }),
+      body: JSON.stringify({ runId: job.runId, action }),
     });
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || `Request failed (${response.status})`);
-    toast(payload.message || "Worker recovery resumed", "success");
+    toast(payload.message || "Worker recovery action accepted", "success");
+    state.jobsFingerprint = "";
     await loadJobs();
+    window.setTimeout(() => loadJobs({ quiet: true }), 750);
   } catch (error) {
     toast(error instanceof Error ? error.message : String(error), "error");
+  } finally {
     button.disabled = false;
-    button.textContent = "Cleanup done — continue";
+    button.textContent = originalLabel;
   }
 }
 

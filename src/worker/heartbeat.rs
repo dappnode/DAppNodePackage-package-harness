@@ -43,7 +43,7 @@ impl HeartbeatTask {
                     .heartbeat(
                         &job_id,
                         &claim_token,
-                        heartbeat_phase(snapshot.phase),
+                        snapshot.phase.protocol_name(),
                         snapshot.cleanup_required,
                     )
                     .await
@@ -54,7 +54,7 @@ impl HeartbeatTask {
                             info!(
                                 event = "heartbeat_acknowledged",
                                 run_id = %job_id,
-                                phase = heartbeat_phase(snapshot.phase),
+                                phase = snapshot.phase.protocol_name(),
                                 cleanup_required = snapshot.cleanup_required,
                                 "Tropibot acknowledged; job is still active"
                             );
@@ -66,7 +66,7 @@ impl HeartbeatTask {
                         warn!(
                             event = "heartbeat_cancellation_requested",
                             run_id = %job_id,
-                            phase = heartbeat_phase(snapshot.phase),
+                            phase = snapshot.phase.protocol_name(),
                             cleanup_required = snapshot.cleanup_required,
                             "Tropibot requested cancellation; stopping at the next safe boundary"
                         );
@@ -76,7 +76,7 @@ impl HeartbeatTask {
                         warn!(
                             event = "heartbeat_claim_lost",
                             run_id = %job_id,
-                            phase = heartbeat_phase(snapshot.phase),
+                            phase = snapshot.phase.protocol_name(),
                             cleanup_required = snapshot.cleanup_required,
                             "Tropibot no longer recognizes this claim; cleanup will be reconciled"
                         );
@@ -86,7 +86,7 @@ impl HeartbeatTask {
                         warn!(
                             run_id = %job_id,
                             event = "heartbeat_authentication_failed",
-                            phase = heartbeat_phase(snapshot.phase),
+                            phase = snapshot.phase.protocol_name(),
                             error = %error,
                             "Tropibot rejected heartbeat authentication"
                         );
@@ -110,25 +110,5 @@ impl HeartbeatTask {
         self.stop.store(true, Ordering::SeqCst);
         self.join.abort();
         let _ = self.join.await;
-    }
-}
-
-fn heartbeat_phase(phase: crate::model::ExecutionPhase) -> &'static str {
-    match phase {
-        crate::model::ExecutionPhase::Queued => "queued",
-        crate::model::ExecutionPhase::Preflight => "preflight",
-        crate::model::ExecutionPhase::InitialCleanup => "initial_cleanup",
-        crate::model::ExecutionPhase::BaselinePreview => "baseline_preview",
-        crate::model::ExecutionPhase::BaselineInstall => "baseline_install",
-        crate::model::ExecutionPhase::BaselineStabilization => "baseline_stabilization",
-        crate::model::ExecutionPhase::BaselineCapture => "baseline_capture",
-        crate::model::ExecutionPhase::CandidatePreview => "candidate_preview",
-        crate::model::ExecutionPhase::CandidateInstall => "candidate_install",
-        crate::model::ExecutionPhase::CandidateStabilization => "candidate_stabilization",
-        crate::model::ExecutionPhase::CandidateCapture => "candidate_capture",
-        crate::model::ExecutionPhase::Analysis => "analysis",
-        crate::model::ExecutionPhase::Cleanup => "cleanup",
-        crate::model::ExecutionPhase::Reporting => "completion",
-        crate::model::ExecutionPhase::Finished => "finished",
     }
 }

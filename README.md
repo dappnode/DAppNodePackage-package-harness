@@ -17,13 +17,13 @@ The harness has no public job-submission or GitHub API. It needs outbound HTTPS 
 For every accepted job, the deterministic controller:
 
 1. verifies Dappmanager MCP tools and target safety;
-2. checks whether the target is already installed and records its exact version for restoration when appropriate;
+2. checks whether the target is already installed and persists whether cleanup must restore or remove it;
 3. previews the requested `baselineRef`, or previews the latest published release when it was omitted, and reuses an installed package only when its version matches that resolved baseline;
 4. waits for a stable, non-empty all-running container set;
 5. captures normalized details and bounded, redacted log tails;
 6. upgrades the baseline in place to the candidate;
 7. repeats stabilization and capture, compares both observations, and performs optional Nexus analysis;
-8. restores a pre-existing target to its recorded version; for allowlisted slow packages, restores and retains the resolved published baseline for reuse; otherwise removes only the target with `deleteVolumes: true`; and fails cleanup when final inventory cannot be verified or contains unexpected dependencies.
+8. restores a pre-existing target by removing it without deleting volumes and freshly installing the latest published release (`*`), or removes a target that was initially absent with `deleteVolumes: true`; cleanup fails when final inventory cannot be verified or contains unexpected dependencies.
 
 Nexus is advisory. With no key, the harness uses the heuristic analyzer only. With a key, it sends one bounded redacted request with no tools; Nexus failures fall back safely, and Nexus can never override a deterministic failure.
 
@@ -41,7 +41,7 @@ PACKAGE_HARNESS_HEARTBEAT_SECONDS=20
 
 The shared bearer token is appropriate for this small trusted v1 deployment. The protocol deliberately leaves room for later per-worker credentials or mTLS, but neither is part of this version. The worker never logs the token.
 
-Use [`.env.example`](.env.example) for all timeout, Dappmanager, cleanup, and optional Nexus settings. `MCP_TIMEOUT_MS` bounds read-only Dappmanager calls at 30 seconds by default, while `MCP_MUTATION_TIMEOUT_MS` gives each install, update, or removal attempt 30 minutes by default (up to one hour). Transient transport and package-download failures are retried three times with bounded exponential backoff; tune this with `MCP_MUTATION_ATTEMPTS` and `MCP_MUTATION_RETRY_DELAY_MS`. `NEXUS_TIMEOUT_MS` gives advisory Nexus analysis five minutes by default. If the target package was installed before a run, cleanup restores the exact baseline resolved for that run; otherwise cleanup removes the target. The pre-run package version never replaces the requested baseline. `TROPIBOT_TIMEOUT_MS` bounds each coordinator request. The Dappmanager MCP token and Nexus key remain local and are never sent to Tropibot or persisted in a job record.
+Use [`.env.example`](.env.example) for all timeout, Dappmanager, cleanup, and optional Nexus settings. `MCP_TIMEOUT_MS` bounds read-only Dappmanager calls at 30 seconds by default, while `MCP_MUTATION_TIMEOUT_MS` gives each install, update, or removal attempt 30 minutes by default (up to one hour). Transient transport and package-download failures are retried three times with bounded exponential backoff; tune this with `MCP_MUTATION_ATTEMPTS` and `MCP_MUTATION_RETRY_DELAY_MS`. `NEXUS_TIMEOUT_MS` gives advisory Nexus analysis five minutes by default. If the target package was installed before a run, cleanup preserves its volumes and freshly installs the latest published release; otherwise cleanup removes the target and its volumes. The pre-run package version never replaces the requested baseline. `TROPIBOT_TIMEOUT_MS` bounds each coordinator request. The Dappmanager MCP token and Nexus key remain local and are never sent to Tropibot or persisted in a job record.
 
 ## Local fake mode
 
@@ -50,6 +50,7 @@ Rust 1.96.1 is pinned by `rust-toolchain.toml`. The process reads a local `.env`
 ```bash
 mkdir -p .data
 PACKAGE_MANAGER_MODE=fake \
+ALLOW_DESTRUCTIVE_PACKAGE_TESTS=true \
 DATA_DIR=./.data \
 TROPIBOT_URL=https://tropibot.example \
 PACKAGE_HARNESS_WORKER_ID=worker-01 \

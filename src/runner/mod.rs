@@ -2,6 +2,7 @@ pub mod cleanup;
 pub mod comparison;
 pub mod controller;
 pub mod progress;
+mod result;
 pub mod stabilization;
 
 pub use controller::{RunController, RunnerConfig};

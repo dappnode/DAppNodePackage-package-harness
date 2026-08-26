@@ -66,6 +66,7 @@ struct ScriptedPackageManager {
     cleanup_failure: bool,
     candidate_removes_target: bool,
     candidate_error: Option<PackageManagerError>,
+    baseline_preview_error: Option<PackageManagerError>,
     leave_extra_package: bool,
     core: bool,
     restore_resolution: Option<(String, String)>,
@@ -74,6 +75,7 @@ struct ScriptedPackageManager {
     package_details_delay: Duration,
     remove_leaves_installed: bool,
     baseline_signature_rejected: bool,
+    resolver_noop_when_installed: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -98,6 +100,7 @@ impl ScriptedPackageManager {
             cleanup_failure: false,
             candidate_removes_target: false,
             candidate_error: None,
+            baseline_preview_error: None,
             leave_extra_package: false,
             core: false,
             restore_resolution: None,
@@ -106,6 +109,7 @@ impl ScriptedPackageManager {
             package_details_delay: Duration::ZERO,
             remove_leaves_installed: false,
             baseline_signature_rejected: false,
+            resolver_noop_when_installed: false,
         }
     }
 
@@ -173,6 +177,9 @@ impl ScriptedPackageManager {
         }
         if bypass_signature {
             state.signature_bypass_calls = state.signature_bypass_calls.saturating_add(1);
+        }
+        if self.resolver_noop_when_installed && state.installed {
+            return Ok(());
         }
         state.installed = true;
         state.candidate = false;
@@ -265,6 +272,11 @@ impl PackageManager for ScriptedPackageManager {
         dnp_name: &DnpName,
         version: Option<&PackageRef>,
     ) -> Result<PreviewSummary, PackageManagerError> {
+        if version.is_none()
+            && let Some(error) = &self.baseline_preview_error
+        {
+            return Err(error.clone());
+        }
         self.state()?
             .preview_requests
             .push(version.map(ToString::to_string));
@@ -325,6 +337,9 @@ impl PackageManager for ScriptedPackageManager {
         }
         let mut state = self.state()?;
         state.update_versions.push(version.to_string());
+        if self.resolver_noop_when_installed && version.as_str() != "/ipfs/QmCandidate" {
+            return Ok(());
+        }
         state.installed =
             !(self.candidate_removes_target && version.as_str() == "/ipfs/QmCandidate");
         state.candidate = version.as_str() == "/ipfs/QmCandidate";
@@ -400,7 +415,6 @@ fn runner_config() -> RunnerConfig {
             required_samples: 2,
         },
         log_tail: 30,
-        cleanup_enabled: true,
         cleanup_timeout: Duration::from_millis(10),
     }
 }
@@ -592,6 +606,24 @@ async fn transient_candidate_install_failure_is_infrastructure_error() -> Result
 }
 
 #[tokio::test]
+async fn baseline_preview_tool_failure_is_not_reported_as_mcp_unavailable()
+-> Result<(), Box<dyn Error>> {
+    let request = request("baseline-preview-tool-failure")?;
+    let mut manager = ScriptedPackageManager::new(request.package.dnp_name.clone());
+    manager.baseline_preview_error = Some(PackageManagerError::Tool {
+        tool: "dappnode_fetch_install_preview".to_owned(),
+        message: "registry version lookup reverted".to_owned(),
+    });
+    let (_directory, _store, record) =
+        execute_with(request, Arc::new(manager), &NoopRunProgress).await?;
+    let result = record.result.ok_or("missing result")?;
+    assert_eq!(result.verdict, Verdict::InfrastructureError);
+    assert_eq!(result.reason_code, ReasonCode::BaselineUnavailable);
+    assert_eq!(result.cleanup.status, CleanupStatus::Skipped);
+    Ok(())
+}
+
+#[tokio::test]
 async fn deterministic_candidate_install_failure_is_failed() -> Result<(), Box<dyn Error>> {
     let request = request("candidate-deterministic-failure")?;
     let mut manager = ScriptedPackageManager::new(request.package.dnp_name.clone());
@@ -618,21 +650,43 @@ async fn installed_target_is_restored_to_latest_published_baseline() -> Result<(
     let observation = manager.clone();
     let (_directory, _store, record) = execute_with(request, manager, &NoopRunProgress).await?;
     assert_eq!(record.cleanup.status, CleanupStatus::Passed);
-    assert!(matches!(
+    assert_eq!(
         record.worker.target_recovery,
-        Some(TargetRecoveryPlan::Restore {
-            baseline_ref,
-            expected_version: Some(expected_version),
-            retained: false,
-        }) if baseline_ref == "/ipfs/QmPublishedBaseline" && expected_version == "0.3.0"
-    ));
-    assert_eq!(observation.cleanup_calls()?, 0);
+        Some(TargetRecoveryPlan::RestoreLatest)
+    );
+    assert_eq!(observation.cleanup_calls()?, 2);
     assert_eq!(observation.installed_version()?.as_deref(), Some("0.3.0"));
     assert_eq!(
         observation.preview_requests()?,
         vec![None, Some("/ipfs/QmCandidate".to_owned())],
         "the pre-run version must never be used as a baseline reference"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn successful_downgrade_noops_are_forced_with_volume_preserving_reinstalls()
+-> Result<(), Box<dyn Error>> {
+    let request = request("baseline-downgrade-noop")?;
+    let mut manager = ScriptedPackageManager::new(request.package.dnp_name.clone())
+        .with_installed_baseline("0.3.1")?
+        .with_latest_release("0.3.0", "0.3.0");
+    manager.resolver_noop_when_installed = true;
+    let observation = Arc::new(manager);
+
+    let (_directory, _store, record) =
+        execute_with(request, observation.clone(), &NoopRunProgress).await?;
+    let baseline_version = record
+        .evidence
+        .baseline
+        .as_ref()
+        .and_then(|capture| capture.details.as_ref())
+        .and_then(|details| details.version.as_deref());
+
+    assert_eq!(baseline_version, Some("0.3.0"));
+    assert_eq!(observation.installed_version()?.as_deref(), Some("0.3.0"));
+    assert_eq!(record.cleanup.status, CleanupStatus::Passed);
+    assert!(observation.cleanup_calls()? >= 2);
     Ok(())
 }
 
@@ -679,7 +733,7 @@ fn legacy_worker_state_recovers_its_saved_baseline() -> Result<(), Box<dyn Error
 }
 
 #[tokio::test]
-async fn explicit_baseline_is_honored_and_restored_after_candidate() -> Result<(), Box<dyn Error>> {
+async fn explicit_baseline_is_tested_then_latest_is_restored() -> Result<(), Box<dyn Error>> {
     let mut request = request("explicit-installed-baseline")?;
     request.package.baseline_ref = Some(PackageRef::parse("/ipfs/QmRequestedBaseline")?);
     let manager = Arc::new(
@@ -693,17 +747,10 @@ async fn explicit_baseline_is_honored_and_restored_after_candidate() -> Result<(
         result.package.baseline_resolved_version.as_deref(),
         Some("/ipfs/QmRequestedBaseline")
     );
-    assert_eq!(
-        observation.update_versions()?,
-        vec![
-            "/ipfs/QmRequestedBaseline",
-            "/ipfs/QmCandidate",
-            "/ipfs/QmRequestedBaseline"
-        ]
-    );
+    assert_eq!(observation.update_versions()?, vec!["/ipfs/QmCandidate"]);
     assert_eq!(
         observation.installed_version()?.as_deref(),
-        Some("/ipfs/QmRequestedBaseline")
+        Some("baseline")
     );
     Ok(())
 }

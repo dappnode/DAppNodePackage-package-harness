@@ -9,7 +9,9 @@ use tracing::{info, warn};
 use crate::{
     analysis::redaction::truncate_utf8,
     clock::Clock,
-    model::{CleanupResult, CleanupStatus, DnpName, PackageRef, PackageSummary},
+    model::{
+        CleanupResult, CleanupStatus, DnpName, PackageRef, PackageSummary, TargetRecoveryPlan,
+    },
     package_manager::PackageManager,
 };
 
@@ -232,7 +234,62 @@ pub async fn restore_target(
             error: Some(truncate_utf8(&error.to_string(), 300)),
         };
     }
-    let poll = Duration::from_millis(500);
+    if installed {
+        match package_manager.get_package_details(dnp_name).await {
+            Ok(details) if details.version.as_deref() == Some(expected_version) => {
+                info!(
+                    event = "cleanup_restore_verified",
+                    dnp_name = %dnp_name,
+                    baseline_ref = %restore_ref,
+                    expected_version,
+                    duration_ms = elapsed_ms(started, clock.now()),
+                    verification_samples = 1,
+                    "Baseline restoration verified"
+                );
+                return CleanupResult {
+                    status: CleanupStatus::Passed,
+                    leftover_packages: Vec::new(),
+                    error: None,
+                };
+            }
+            Ok(details) => {
+                warn!(
+                    event = "cleanup_restore_update_noop",
+                    dnp_name = %dnp_name,
+                    baseline_ref = %restore_ref,
+                    expected_version,
+                    observed_version = details.version.as_deref().unwrap_or("unknown"),
+                    "Dappmanager reported a successful update without applying the baseline; forcing a volume-preserving reinstall"
+                );
+                if let Err(error) = package_manager.remove_package(dnp_name, false).await {
+                    return CleanupResult {
+                        status: CleanupStatus::Failed,
+                        leftover_packages: Vec::new(),
+                        error: Some(truncate_utf8(&error.to_string(), 300)),
+                    };
+                }
+                if let Err(error) = package_manager
+                    .install_package(dnp_name, Some(&restore_ref))
+                    .await
+                {
+                    return CleanupResult {
+                        status: CleanupStatus::Failed,
+                        leftover_packages: Vec::new(),
+                        error: Some(truncate_utf8(&error.to_string(), 300)),
+                    };
+                }
+            }
+            Err(error) => {
+                warn!(
+                    event = "cleanup_restore_immediate_verification_failed",
+                    dnp_name = %dnp_name,
+                    error = %error,
+                    "Could not immediately verify restoration; continuing bounded polling"
+                );
+            }
+        }
+    }
+    let poll = Duration::from_secs(5);
     let verification_started = Instant::now();
     let attempts = ((timeout.as_millis() / poll.as_millis()) as usize)
         .saturating_add(1)
@@ -338,6 +395,132 @@ pub async fn restore_target(
         leftover_packages: Vec::new(),
         error: Some("target package did not return to its baseline version".to_owned()),
     }
+}
+
+/// Reinstalls the latest published release while preserving package volumes.
+pub async fn restore_latest_target(
+    package_manager: &dyn PackageManager,
+    dnp_name: &DnpName,
+) -> CleanupResult {
+    info!(
+        event = "cleanup_restore_latest_started",
+        dnp_name = %dnp_name,
+        delete_volumes = false,
+        baseline_ref = "*",
+        "Reinstalling the latest published release while preserving volumes"
+    );
+    if let Err(error) = package_manager.remove_package(dnp_name, false).await
+        && !matches!(error, crate::package_manager::PackageManagerError::NotFound)
+    {
+        return CleanupResult {
+            status: CleanupStatus::Failed,
+            leftover_packages: Vec::new(),
+            error: Some(truncate_utf8(&error.to_string(), 300)),
+        };
+    }
+    if let Err(error) = package_manager.install_package(dnp_name, None).await {
+        return CleanupResult {
+            status: CleanupStatus::Failed,
+            leftover_packages: Vec::new(),
+            error: Some(truncate_utf8(&error.to_string(), 300)),
+        };
+    }
+    match package_manager.list_packages().await {
+        Ok(packages) if packages.iter().any(|package| package.dnp_name == *dnp_name) => {
+            info!(
+                event = "cleanup_restore_latest_verified",
+                dnp_name = %dnp_name,
+                baseline_ref = "*",
+                "Latest published release reinstall verified"
+            );
+            CleanupResult {
+                status: CleanupStatus::Passed,
+                leftover_packages: Vec::new(),
+                error: None,
+            }
+        }
+        Ok(_) => CleanupResult {
+            status: CleanupStatus::Failed,
+            leftover_packages: Vec::new(),
+            error: Some("latest published release was not present after reinstall".to_owned()),
+        },
+        Err(error) => CleanupResult {
+            status: CleanupStatus::Failed,
+            leftover_packages: Vec::new(),
+            error: Some(truncate_utf8(&error.to_string(), 300)),
+        },
+    }
+}
+
+/// Applies a persisted target recovery plan and verifies the complete package inventory.
+pub async fn reconcile_target(
+    package_manager: &dyn PackageManager,
+    clock: Arc<dyn Clock>,
+    dnp_name: &DnpName,
+    plan: &TargetRecoveryPlan,
+    initial_packages: &[PackageSummary],
+    timeout: Duration,
+) -> (CleanupResult, Vec<PackageSummary>) {
+    let mut cleanup = match plan {
+        TargetRecoveryPlan::RestoreLatest => restore_latest_target(package_manager, dnp_name).await,
+        TargetRecoveryPlan::Restore {
+            baseline_ref,
+            expected_version,
+            ..
+        } => match PackageRef::parse(baseline_ref) {
+            Ok(baseline_ref) => {
+                let expected_version = expected_version.as_deref().unwrap_or(baseline_ref.as_str());
+                restore_target(
+                    package_manager,
+                    Arc::clone(&clock),
+                    dnp_name,
+                    &baseline_ref,
+                    expected_version,
+                    timeout,
+                )
+                .await
+            }
+            Err(error) => CleanupResult {
+                status: CleanupStatus::Failed,
+                leftover_packages: Vec::new(),
+                error: Some(truncate_utf8(
+                    &format!("saved baseline reference is invalid: {error}"),
+                    300,
+                )),
+            },
+        },
+        TargetRecoveryPlan::Remove => {
+            cleanup_target(package_manager, Arc::clone(&clock), dnp_name, timeout).await
+        }
+    };
+
+    let final_packages = match package_manager.list_packages().await {
+        Ok(packages) => packages,
+        Err(error) => {
+            if cleanup.status == CleanupStatus::Passed {
+                cleanup.status = CleanupStatus::Failed;
+            }
+            if cleanup.error.is_none() {
+                cleanup.error = Some(truncate_utf8(&error.to_string(), 300));
+            }
+            return (cleanup, Vec::new());
+        }
+    };
+    let retained_target =
+        matches!(plan, TargetRecoveryPlan::Restore { retained: true, .. }).then_some(dnp_name);
+    cleanup.leftover_packages =
+        leftover_packages(initial_packages, &final_packages, retained_target);
+    if cleanup.status == CleanupStatus::Passed && !cleanup.leftover_packages.is_empty() {
+        cleanup.status = CleanupStatus::Failed;
+        cleanup.error = Some(truncate_utf8(
+            &format!(
+                "cleanup left packages that were not present before the run: {}",
+                cleanup.leftover_packages.join(", ")
+            ),
+            300,
+        ));
+    }
+    (cleanup, final_packages)
 }
 
 fn elapsed_ms(start: chrono::DateTime<chrono::Utc>, end: chrono::DateTime<chrono::Utc>) -> u64 {

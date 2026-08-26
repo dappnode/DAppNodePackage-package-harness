@@ -836,7 +836,6 @@ mod tests {
             stabilization_poll: Duration::from_millis(1),
             stabilization_required_samples: 1,
             log_tail: 1,
-            cleanup_enabled: true,
             cleanup_timeout: Duration::from_secs(1),
             nexus_api_key: None,
             nexus_base_url: "https://nexus.example/v1".to_owned(),

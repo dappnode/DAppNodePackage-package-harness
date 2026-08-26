@@ -39,7 +39,6 @@ pub struct Config {
     pub stabilization_poll: Duration,
     pub stabilization_required_samples: usize,
     pub log_tail: usize,
-    pub cleanup_enabled: bool,
     pub cleanup_timeout: Duration,
     pub nexus_api_key: Option<String>,
     pub nexus_base_url: String,
@@ -156,7 +155,6 @@ impl Config {
             stabilization_poll,
             stabilization_required_samples: required_samples,
             log_tail,
-            cleanup_enabled: bool_value("CLEANUP_ENABLED", true)?,
             cleanup_timeout: millis("CLEANUP_TIMEOUT_MS", 60_000)?,
             nexus_api_key: optional("NEXUS_API_KEY"),
             nexus_base_url: env::var("NEXUS_BASE_URL")

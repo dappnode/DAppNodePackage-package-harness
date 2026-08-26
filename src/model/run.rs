@@ -60,7 +60,11 @@ pub enum ManualRecoveryKind {
 pub enum TargetRecoveryPlan {
     /// The target did not exist before the run and must be removed.
     Remove,
+    /// The target existed before the run and must be freshly installed from
+    /// the latest published registry release while preserving its volumes.
+    RestoreLatest,
     /// Return a preexisting target to the baseline resolved for its run.
+    /// Kept for recovery of records persisted by older harness versions.
     Restore {
         /// Exact release reference when available, otherwise its resolved
         /// semantic version.
@@ -69,7 +73,7 @@ pub enum TargetRecoveryPlan {
         /// records omit this and use `baseline_ref` for both purposes.
         #[serde(default)]
         expected_version: Option<String>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "is_false")]
         /// Backward-compatible marker used only by older persisted records.
         retained: bool,
     },
@@ -94,7 +98,7 @@ pub struct WorkerState {
     /// Version that was installed before this run. When set, cleanup restores
     /// this package instead of removing it. Kept only for backward-compatible
     /// recovery of records written by harness 0.1.1.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline_restore_ref: Option<String>,
     /// A normal result is mutually exclusive with a worker error.
     pub worker_error: Option<WorkerError>,
@@ -156,24 +160,22 @@ impl WorkerState {
     }
 
     pub fn set_recovery_plan(&mut self, plan: TargetRecoveryPlan) {
-        self.baseline_restore_ref = match &plan {
-            TargetRecoveryPlan::Restore {
-                baseline_ref,
-                expected_version,
-                ..
-            } => Some(expected_version.as_ref().unwrap_or(baseline_ref).clone()),
-            TargetRecoveryPlan::Remove => None,
-        };
+        // Clear the pre-0.1.2 compatibility field as soon as a current plan is written.
+        self.baseline_restore_ref = None;
         self.target_recovery = Some(plan);
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionPhase {
     Queued,
+    #[serde(alias = "initial_cleanup")]
     Preflight,
-    InitialCleanup,
     BaselinePreview,
     BaselineInstall,
     BaselineStabilization,
@@ -186,6 +188,46 @@ pub enum ExecutionPhase {
     Cleanup,
     Reporting,
     Finished,
+}
+
+impl ExecutionPhase {
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Queued => "Queued",
+            Self::Preflight => "Preflight safety checks",
+            Self::BaselinePreview => "Baseline preview",
+            Self::BaselineInstall => "Baseline installation",
+            Self::BaselineStabilization => "Baseline stabilization",
+            Self::BaselineCapture => "Baseline evidence capture",
+            Self::CandidatePreview => "Candidate preview",
+            Self::CandidateInstall => "Candidate upgrade",
+            Self::CandidateStabilization => "Candidate stabilization",
+            Self::CandidateCapture => "Candidate evidence capture",
+            Self::Analysis => "Evidence comparison and analysis",
+            Self::Cleanup => "Target cleanup and restoration",
+            Self::Reporting => "Result delivery",
+            Self::Finished => "Run finished",
+        }
+    }
+
+    pub fn protocol_name(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Preflight => "preflight",
+            Self::BaselinePreview => "baseline_preview",
+            Self::BaselineInstall => "baseline_install",
+            Self::BaselineStabilization => "baseline_stabilization",
+            Self::BaselineCapture => "baseline_capture",
+            Self::CandidatePreview => "candidate_preview",
+            Self::CandidateInstall => "candidate_install",
+            Self::CandidateStabilization => "candidate_stabilization",
+            Self::CandidateCapture => "candidate_capture",
+            Self::Analysis => "analysis",
+            Self::Cleanup => "cleanup",
+            Self::Reporting => "completion",
+            Self::Finished => "finished",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -286,7 +328,7 @@ impl RunRecord {
 
 #[cfg(test)]
 mod tests {
-    use super::{ManualRecoveryKind, WorkerState};
+    use super::{ExecutionPhase, ManualRecoveryKind, TargetRecoveryPlan, WorkerState};
 
     #[test]
     fn typed_manual_recovery_does_not_depend_on_message_wording() {
@@ -324,5 +366,26 @@ mod tests {
             conflict.manual_recovery_kind(),
             Some(ManualRecoveryKind::CompletionConflict)
         );
+    }
+
+    #[test]
+    fn current_recovery_plans_do_not_write_legacy_fields() -> Result<(), serde_json::Error> {
+        let mut state = WorkerState {
+            baseline_restore_ref: Some("0.1.0".to_owned()),
+            ..WorkerState::default()
+        };
+        state.set_recovery_plan(TargetRecoveryPlan::RestoreLatest);
+
+        let json = serde_json::to_value(state)?;
+        assert!(json.get("baselineRestoreRef").is_none());
+        assert_eq!(json["targetRecovery"]["action"], "restore_latest");
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_initial_cleanup_phase_maps_to_preflight() -> Result<(), serde_json::Error> {
+        let phase: ExecutionPhase = serde_json::from_str("\"initial_cleanup\"")?;
+        assert_eq!(phase, ExecutionPhase::Preflight);
+        Ok(())
     }
 }

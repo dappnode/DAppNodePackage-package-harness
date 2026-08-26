@@ -11,17 +11,16 @@ use crate::{
     },
     clock::Clock,
     model::{
-        AnalysisSide, AnalyzerKind, AnalyzerStatus, CaptureEvidence, CleanupStatus,
-        ComparisonEvidence, ExecutionPhase, ExecutionStatus, HardCheckResult, HarnessResult,
-        InstallResult, LogAnalysisInput, LogAnalysisResult, LogCollectionResult, PackageRef,
-        PackageResolver, ReasonCode, ResultExecution, ResultPackage, ResultSide, ResultSource,
-        RunError, RunId, RunRecord, StabilizationResult, StepStatus, TargetRecoveryPlan, Verdict,
+        CaptureEvidence, CleanupStatus, ExecutionPhase, ExecutionStatus, LogAnalysisInput,
+        PackageResolver, ReasonCode, RunError, RunId, RunRecord, StabilizationResult, StepStatus,
+        TargetRecoveryPlan, Verdict,
     },
     package_manager::{PackageManager, PackageManagerError},
     runner::{
-        cleanup::{cleanup_target, leftover_packages, restore_target},
+        cleanup::reconcile_target,
         comparison::{compare, deterministic_verdict},
         progress::{RunControl, RunProgress},
+        result::{analysis_failure, build_result, comparison_from_partial, inconclusive_analysis},
         stabilization::{StabilizationConfig, stabilize},
     },
     storage::{RunStore, StoreError},
@@ -36,8 +35,6 @@ pub struct RunnerConfig {
     pub stabilization: StabilizationConfig,
     /// Number of log lines requested from the package manager.
     pub log_tail: usize,
-    /// Whether cleanup removes the target package after a run.
-    pub cleanup_enabled: bool,
     /// Maximum time spent trying to remove the target package.
     pub cleanup_timeout: Duration,
 }
@@ -162,81 +159,17 @@ impl RunController {
                 cleanup_timeout_ms = self.config.cleanup_timeout.as_millis() as u64,
                 "Applying the persisted cleanup plan"
             );
-            record.cleanup = match &recovery_plan {
-                TargetRecoveryPlan::Restore {
-                    baseline_ref,
-                    expected_version,
-                    ..
-                } => match crate::model::PackageRef::parse(baseline_ref) {
-                    Ok(baseline_ref) => {
-                        let expected_version =
-                            expected_version.as_deref().unwrap_or(baseline_ref.as_str());
-                        restore_target(
-                            self.package_manager.as_ref(),
-                            Arc::clone(&self.clock),
-                            &package.dnp_name,
-                            &baseline_ref,
-                            expected_version,
-                            self.config.cleanup_timeout,
-                        )
-                        .await
-                    }
-                    Err(error) => crate::model::CleanupResult {
-                        status: CleanupStatus::Failed,
-                        leftover_packages: Vec::new(),
-                        error: Some(truncate_utf8(
-                            &format!("saved baseline reference is invalid: {error}"),
-                            300,
-                        )),
-                    },
-                },
-                TargetRecoveryPlan::Remove if self.config.cleanup_enabled => {
-                    cleanup_target(
-                        self.package_manager.as_ref(),
-                        Arc::clone(&self.clock),
-                        &package.dnp_name,
-                        self.config.cleanup_timeout,
-                    )
-                    .await
-                }
-                TargetRecoveryPlan::Remove => crate::model::CleanupResult {
-                    status: CleanupStatus::Skipped,
-                    leftover_packages: Vec::new(),
-                    error: None,
-                },
-            };
-            match self.package_manager.list_packages().await {
-                Ok(final_packages) => {
-                    let retained_target = matches!(
-                        recovery_plan,
-                        TargetRecoveryPlan::Restore { retained: true, .. }
-                    )
-                    .then_some(&package.dnp_name);
-                    record.cleanup.leftover_packages = leftover_packages(
-                        &record.evidence.initial_packages,
-                        &final_packages,
-                        retained_target,
-                    );
-                    if record.cleanup.status == CleanupStatus::Passed
-                        && !record.cleanup.leftover_packages.is_empty()
-                    {
-                        record.cleanup.status = CleanupStatus::Failed;
-                        record.cleanup.error = Some(format!(
-                            "cleanup left packages that were not present before the run: {}",
-                            record.cleanup.leftover_packages.join(", ")
-                        ));
-                    }
-                    record.evidence.final_packages = final_packages;
-                }
-                Err(error) => {
-                    if record.cleanup.status == CleanupStatus::Passed {
-                        record.cleanup.status = CleanupStatus::Failed;
-                    }
-                    if record.cleanup.error.is_none() {
-                        record.cleanup.error = Some(truncate_utf8(&error.to_string(), 300));
-                    }
-                }
-            }
+            let (cleanup, final_packages) = reconcile_target(
+                self.package_manager.as_ref(),
+                Arc::clone(&self.clock),
+                &package.dnp_name,
+                &recovery_plan,
+                &record.evidence.initial_packages,
+                self.config.cleanup_timeout,
+            )
+            .await;
+            record.cleanup = cleanup;
+            record.evidence.final_packages = final_packages;
             if matches!(
                 record.cleanup.status,
                 CleanupStatus::Passed | CleanupStatus::Skipped
@@ -371,7 +304,7 @@ impl RunController {
             .package_manager
             .verify_tools()
             .await
-            .map_err(infrastructure)?;
+            .map_err(|error| package_failure(error, ReasonCode::McpUnavailable))?;
         if !tools.ready() {
             return Err(Failure {
                 verdict: Verdict::InfrastructureError,
@@ -397,7 +330,7 @@ impl RunController {
             .package_manager
             .list_packages()
             .await
-            .map_err(infrastructure)?;
+            .map_err(|error| package_failure(error, ReasonCode::McpUnavailable))?;
         if packages
             .iter()
             .any(|installed| installed.dnp_name == package.dnp_name && installed.is_core)
@@ -423,10 +356,13 @@ impl RunController {
             installed_version = installed_baseline.and_then(|package| package.version.as_deref()).unwrap_or("none"),
             "Inventory inspected"
         );
-        let target_was_installed = installed_baseline.is_some();
-        // Until the requested baseline is resolved, removal is the only exact
-        // recovery action we can persist without consulting pre-run versions.
-        record.worker.set_recovery_plan(TargetRecoveryPlan::Remove);
+        record
+            .worker
+            .set_recovery_plan(if installed_baseline.is_some() {
+                TargetRecoveryPlan::RestoreLatest
+            } else {
+                TargetRecoveryPlan::Remove
+            });
         self.save_failure(record).await?;
 
         self.phase_failure(record, ExecutionPhase::BaselinePreview, progress)
@@ -437,40 +373,9 @@ impl RunController {
             .package_manager
             .preview_install(&package.dnp_name, package.baseline_ref.as_ref())
             .await
-            .map_err(infrastructure)?;
+            .map_err(|error| package_failure(error, ReasonCode::BaselineUnavailable))?;
         let baseline_resolved_ref = baseline_preview.resolved_ref.clone();
         let baseline_expected_version = baseline_preview.version.clone();
-        if target_was_installed {
-            let expected_version = baseline_expected_version
-                .as_deref()
-                .ok_or_else(|| Failure {
-                    verdict: Verdict::InfrastructureError,
-                    reason: ReasonCode::BaselineUnavailable,
-                    summary: "baseline preview did not report its resolved version".to_owned(),
-                })?;
-            let restore_ref = baseline_resolved_ref
-                .as_deref()
-                .or_else(|| package.baseline_ref.as_ref().map(PackageRef::as_str))
-                .unwrap_or(expected_version);
-            let restore_ref = PackageRef::parse(restore_ref).map_err(|error| Failure {
-                verdict: Verdict::InfrastructureError,
-                reason: ReasonCode::BaselineUnavailable,
-                summary: truncate_utf8(
-                    &format!("resolved baseline reference is invalid: {error}"),
-                    500,
-                ),
-            })?;
-            // Persist the baseline recovery plan before any package mutation.
-            // The pre-run version is intentionally irrelevant.
-            record
-                .worker
-                .set_recovery_plan(TargetRecoveryPlan::Restore {
-                    baseline_ref: restore_ref.to_string(),
-                    expected_version: Some(expected_version.to_owned()),
-                    retained: false,
-                });
-            self.save_failure(record).await?;
-        }
         let reuse_installed_baseline = installed_baseline.is_some_and(|installed| {
             let Some(installed_version) = installed.version.as_deref() else {
                 return false;
@@ -502,18 +407,23 @@ impl RunController {
         if !reuse_installed_baseline {
             self.authorize_cleanup(record, cleanup_authorized, progress)
                 .await?;
-            let install_result = match (installed_baseline, package.baseline_ref.as_ref()) {
-                (Some(_), Some(baseline_ref)) => {
-                    self.package_manager
-                        .update_package(&package.dnp_name, baseline_ref)
-                        .await
-                }
-                _ => {
-                    self.package_manager
-                        .install_package(&package.dnp_name, package.baseline_ref.as_ref())
-                        .await
-                }
-            };
+            if installed_baseline.is_some()
+                && let Err(error) = self
+                    .package_manager
+                    .remove_package(&package.dnp_name, false)
+                    .await
+                && !matches!(error, PackageManagerError::NotFound)
+            {
+                return Err(Failure {
+                    verdict: Verdict::InfrastructureError,
+                    reason: ReasonCode::BaselineInstallFailed,
+                    summary: truncate_utf8(&error.to_string(), 500),
+                });
+            }
+            let install_result = self
+                .package_manager
+                .install_package(&package.dnp_name, package.baseline_ref.as_ref())
+                .await;
             let install_result = match install_result {
                 Err(error) if error.is_signature_rejection() => {
                     let warning = truncate_utf8(
@@ -527,21 +437,13 @@ impl RunController {
                         error = %warning,
                         "Baseline signature was rejected; retrying with the signed-package restriction bypass"
                     );
-                    let retry = match (installed_baseline, package.baseline_ref.as_ref()) {
-                        (Some(_), Some(baseline_ref)) => {
-                            self.package_manager
-                                .update_package_bypassing_signature(&package.dnp_name, baseline_ref)
-                                .await
-                        }
-                        _ => {
-                            self.package_manager
-                                .install_package_bypassing_signature(
-                                    &package.dnp_name,
-                                    package.baseline_ref.as_ref(),
-                                )
-                                .await
-                        }
-                    };
+                    let retry = self
+                        .package_manager
+                        .install_package_bypassing_signature(
+                            &package.dnp_name,
+                            package.baseline_ref.as_ref(),
+                        )
+                        .await;
                     if retry.is_ok() {
                         record.errors.push(RunError {
                             code: ReasonCode::BaselineSignatureInvalid,
@@ -623,7 +525,7 @@ impl RunController {
             .package_manager
             .preview_install(&package.dnp_name, Some(&package.candidate_ref))
             .await
-            .map_err(infrastructure)?;
+            .map_err(|error| package_failure(error, ReasonCode::CandidateInstallFailed))?;
         info!(
             event = "candidate_preview_ready",
             run_id = %record.request.run_id,
@@ -862,7 +764,7 @@ impl RunController {
         if phase == ExecutionPhase::Finished {
             return Ok(());
         }
-        let label = phase_name(phase);
+        let label = phase.display_name();
         info!(
             event = "phase_started",
             run_id = %record.request.run_id,
@@ -953,10 +855,21 @@ fn logs_for_analysis(capture: &CaptureEvidence) -> Vec<(Option<String>, String)>
         .unwrap_or_default()
 }
 
-fn infrastructure(error: PackageManagerError) -> Failure {
+fn package_failure(error: PackageManagerError, operation_reason: ReasonCode) -> Failure {
+    let reason = match error {
+        PackageManagerError::Transport(_) | PackageManagerError::Timeout { .. } => {
+            ReasonCode::McpUnavailable
+        }
+        PackageManagerError::Configuration(_) | PackageManagerError::InvalidResponse { .. } => {
+            ReasonCode::UnexpectedError
+        }
+        PackageManagerError::Tool { .. }
+        | PackageManagerError::RequiredSetup
+        | PackageManagerError::NotFound => operation_reason,
+    };
     Failure {
         verdict: Verdict::InfrastructureError,
-        reason: ReasonCode::McpUnavailable,
+        reason,
         summary: truncate_utf8(&error.to_string(), 500),
     }
 }
@@ -976,183 +889,4 @@ fn store_error(error: StoreError) -> ControllerError {
 
 fn elapsed_ms(start: chrono::DateTime<Utc>, end: chrono::DateTime<Utc>) -> u64 {
     end.signed_duration_since(start).num_milliseconds().max(0) as u64
-}
-
-fn phase_name(phase: ExecutionPhase) -> &'static str {
-    match phase {
-        ExecutionPhase::Queued => "Queued",
-        ExecutionPhase::Preflight => "Preflight safety checks",
-        ExecutionPhase::InitialCleanup => "Initial cleanup",
-        ExecutionPhase::BaselinePreview => "Baseline preview",
-        ExecutionPhase::BaselineInstall => "Baseline installation",
-        ExecutionPhase::BaselineStabilization => "Baseline stabilization",
-        ExecutionPhase::BaselineCapture => "Baseline evidence capture",
-        ExecutionPhase::CandidatePreview => "Candidate preview",
-        ExecutionPhase::CandidateInstall => "Candidate upgrade",
-        ExecutionPhase::CandidateStabilization => "Candidate stabilization",
-        ExecutionPhase::CandidateCapture => "Candidate evidence capture",
-        ExecutionPhase::Analysis => "Evidence comparison and analysis",
-        ExecutionPhase::Cleanup => "Target cleanup and restoration",
-        ExecutionPhase::Reporting => "Result delivery",
-        ExecutionPhase::Finished => "Run finished",
-    }
-}
-
-fn analysis_failure(message: &str) -> LogAnalysisResult {
-    LogAnalysisResult {
-        analyzer: AnalyzerKind::Heuristic,
-        status: AnalyzerStatus::Inconclusive,
-        summary: "Log analysis was unavailable".to_owned(),
-        baseline: AnalysisSide {
-            status: AnalyzerStatus::Inconclusive,
-            summary: "Analysis unavailable".to_owned(),
-        },
-        candidate: AnalysisSide {
-            status: AnalyzerStatus::Inconclusive,
-            summary: "Analysis unavailable".to_owned(),
-        },
-        new_findings: Vec::new(),
-        analyzer_errors: vec![truncate_utf8(message, 300)],
-        components: Vec::new(),
-    }
-}
-
-fn inconclusive_analysis() -> LogAnalysisResult {
-    analysis_failure("run ended before comparative log analysis")
-}
-
-fn comparison_from_partial(record: &RunRecord) -> ComparisonEvidence {
-    match (&record.evidence.baseline, &record.evidence.candidate) {
-        (Some(baseline), Some(candidate)) => compare(baseline, candidate),
-        _ => ComparisonEvidence {
-            baseline_hard_check: record
-                .evidence
-                .baseline
-                .as_ref()
-                .is_some_and(|capture| capture.stabilization.passed),
-            candidate_hard_check: false,
-            baseline_containers: Vec::new(),
-            candidate_containers: Vec::new(),
-            containers_added: Vec::new(),
-            containers_removed: Vec::new(),
-            baseline_version: record
-                .evidence
-                .baseline
-                .as_ref()
-                .and_then(|capture| capture.details.as_ref())
-                .and_then(|details| details.version.clone()),
-            candidate_version: None,
-            baseline_stabilization_ms: record
-                .evidence
-                .baseline
-                .as_ref()
-                .map_or(0, |capture| capture.stabilization.duration_ms),
-            candidate_stabilization_ms: 0,
-            baseline_last_non_running_states: Vec::new(),
-            candidate_last_non_running_states: Vec::new(),
-            baseline_logs_collected: record
-                .evidence
-                .baseline
-                .as_ref()
-                .is_some_and(|capture| capture.logs.is_some()),
-            candidate_logs_collected: false,
-            deterministic_regressions: Vec::new(),
-        },
-    }
-}
-
-fn build_result(
-    record: &RunRecord,
-    comparison: ComparisonEvidence,
-    analysis: LogAnalysisResult,
-    verdict: Verdict,
-    reason_code: ReasonCode,
-    summary: String,
-) -> HarnessResult {
-    let baseline = result_side(
-        record.evidence.baseline.as_ref(),
-        ReasonCode::BaselineContainersUnstable,
-    );
-    let candidate = result_side(
-        record.evidence.candidate.as_ref(),
-        ReasonCode::CandidateContainersUnstable,
-    );
-    let started = record.started_at.unwrap_or(record.created_at);
-    let finished = record.finished_at.unwrap_or_else(Utc::now);
-    HarnessResult {
-        schema_version: 1,
-        run_id: record.request.run_id.to_string(),
-        source: ResultSource::from_request(&record.request),
-        package: ResultPackage {
-            dnp_name: record.request.package.dnp_name.to_string(),
-            baseline_requested_ref: record
-                .request
-                .package
-                .baseline_ref
-                .as_ref()
-                .map(ToString::to_string),
-            baseline_resolved_version: record
-                .evidence
-                .baseline
-                .as_ref()
-                .and_then(|capture| capture.details.as_ref())
-                .and_then(|details| details.version.clone()),
-            candidate_ref: record.request.package.candidate_ref.to_string(),
-            candidate_reported_version: record
-                .evidence
-                .candidate
-                .as_ref()
-                .and_then(|capture| capture.details.as_ref())
-                .and_then(|details| details.version.clone()),
-        },
-        execution: ResultExecution {
-            status: ExecutionStatus::Completed,
-            started_at: started.to_rfc3339(),
-            finished_at: finished.to_rfc3339(),
-            duration_ms: elapsed_ms(started, finished),
-        },
-        verdict,
-        reason_code,
-        summary,
-        baseline,
-        candidate,
-        comparison,
-        log_analysis: analysis,
-        cleanup: record.cleanup.clone(),
-        errors: record.errors.clone(),
-    }
-}
-
-fn result_side(capture: Option<&CaptureEvidence>, unstable_reason: ReasonCode) -> ResultSide {
-    let containers = capture
-        .and_then(|capture| capture.details.as_ref())
-        .map(|details| details.containers.clone())
-        .unwrap_or_default();
-    ResultSide {
-        install: InstallResult {
-            status: capture.map_or(StepStatus::Failed, |capture| capture.install_status),
-            duration_ms: capture.map_or(0, |capture| capture.install_duration_ms),
-        },
-        hard_check: HardCheckResult {
-            passed: capture.is_some_and(|capture| capture.stabilization.passed),
-            reason_codes: if capture.is_some_and(|capture| capture.stabilization.passed) {
-                Vec::new()
-            } else {
-                vec![unstable_reason]
-            },
-            container_count: containers.len(),
-            stable_samples: capture.map_or(0, |capture| capture.stabilization.stable_samples),
-        },
-        containers,
-        log_collection: LogCollectionResult {
-            status: if capture.is_some_and(|capture| capture.logs.is_some()) {
-                StepStatus::Passed
-            } else {
-                StepStatus::Failed
-            },
-            container_count: capture
-                .and_then(|capture| capture.logs.as_ref())
-                .map_or(0, |logs| logs.entries.len()),
-        },
-    }
 }

@@ -265,13 +265,25 @@ function renderWorkerDiagnostics(job) {
   return section;
 }
 
-function renderCaptureDiagnostics(label, capture) {
-  const section = diagnosticSection(label);
+function renderCapturesSideBySide(job) {
+  const section = diagnosticSection("Baseline vs Candidate");
+  const grid = node("div", "capture-pair");
+  grid.append(
+    renderCapturePanel("Baseline", job.diagnostics.baseline),
+    renderCapturePanel("Candidate", job.diagnostics.candidate),
+  );
+  section.append(grid);
+  return section;
+}
+
+function renderCapturePanel(label, capture) {
+  const panel = node("article", `capture-panel ${capture ? "" : "is-empty"}`.trim());
+  panel.append(node("h4", null, label));
   if (!capture) {
-    section.append(node("p", "diagnostic-empty", "Stage not captured."));
-    return section;
+    panel.append(node("p", "diagnostic-empty", "Stage not captured."));
+    return panel;
   }
-  const grid = node("div", "diagnostic-kv");
+  const kv = node("div", "capture-kv");
   [
     ["Install", humanize(capture.installStatus)],
     ["Install duration", formatDuration(capture.installDurationMs)],
@@ -279,16 +291,19 @@ function renderCaptureDiagnostics(label, capture) {
     ["Stable samples", String(capture.stabilization.stableSamples)],
     ["Stabilization", formatDuration(capture.stabilization.durationMs)],
     ["Log entries", String(capture.logEntryCount)],
-  ].forEach(([key, value]) => grid.append(detail(key, value)));
-  section.append(grid);
-  if (capture.preview?.summary) {
-    section.append(node("p", "diagnostic-copy", `Preview: ${capture.preview.summary}`));
+  ].forEach(([key, value]) => kv.append(detail(key, value)));
+  panel.append(kv);
+
+  if (capture.preview) {
+    panel.append(renderPreview(capture.preview));
   }
+
   if (capture.logError) {
-    section.append(node("p", "diagnostic-alert", `Logs: ${capture.logError}`));
+    panel.append(node("p", "diagnostic-alert", `Logs: ${capture.logError}`));
   }
+
   if (capture.containers.length) {
-    section.append(
+    panel.append(
       diagnosticTable(
         ["Container", "Service", "State", "Running", "Image"],
         capture.containers.map((container) => [
@@ -301,9 +316,10 @@ function renderCaptureDiagnostics(label, capture) {
       ),
     );
   }
+
   if (capture.stabilization.samples.length) {
-    section.append(node("h5", null, "Stabilization samples"));
-    section.append(
+    panel.append(node("h5", null, "Stabilization samples"));
+    panel.append(
       diagnosticTable(
         ["Observed", "Healthy", "Containers", "Non-running / error"],
         capture.stabilization.samples.map((sample) => [
@@ -315,7 +331,7 @@ function renderCaptureDiagnostics(label, capture) {
       ),
     );
   }
-  return section;
+  return panel;
 }
 
 function renderInventory(job) {
@@ -418,6 +434,48 @@ function renderErrors(job) {
   return section;
 }
 
+function renderPreview(preview) {
+  const wrapper = node("div", "preview-block");
+  const heading = node("h5", null, "Install preview");
+  wrapper.append(heading);
+
+  const meta = node("dl", "preview-meta");
+  const fields = [
+    ["Package", preview.packageName],
+    ["Version", preview.version],
+    ["Images", preview.imageCount === null || preview.imageCount === undefined ? null : String(preview.imageCount)],
+    ["Requires input", preview.requiresUserInput ? "yes" : "no"],
+  ];
+  fields
+    .filter(([, value]) => value !== null && value !== "")
+    .forEach(([label, value]) => {
+      const term = node("dt", null, label);
+      const detail = node("dd", null, value);
+      meta.append(term, detail);
+    });
+  if (meta.childElementCount) wrapper.append(meta);
+
+  const formatted = tryFormatJson(preview.summary);
+  if (formatted) {
+    const pre = node("pre", "json-block");
+    const code = node("code", null, formatted);
+    pre.append(code);
+    wrapper.append(pre);
+  } else if (preview.summary) {
+    wrapper.append(node("p", "diagnostic-copy", preview.summary));
+  }
+  return wrapper;
+}
+
+function tryFormatJson(raw) {
+  if (!raw) return null;
+  try {
+    return JSON.stringify(JSON.parse(raw), null, 2);
+  } catch {
+    return null;
+  }
+}
+
 function renderExpertDiagnostics(job) {
   const expert = node("section", "expert-diagnostics");
   const heading = node("div", "expert-heading");
@@ -430,8 +488,7 @@ function renderExpertDiagnostics(job) {
   grid.append(
     renderPhaseTimeline(job),
     renderWorkerDiagnostics(job),
-    renderCaptureDiagnostics("Baseline capture", job.diagnostics.baseline),
-    renderCaptureDiagnostics("Candidate capture", job.diagnostics.candidate),
+    renderCapturesSideBySide(job),
     renderComparison(job),
     renderInventory(job),
     renderErrors(job),

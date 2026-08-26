@@ -908,6 +908,110 @@ h2 {
   background: rgba(255, 122, 26, 0.06);
 }
 
+.capture-pair {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  width: 100%;
+}
+
+.capture-panel {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding: 16px 18px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(8, 8, 7, 0.45);
+}
+
+.capture-panel.is-empty {
+  align-items: center;
+  justify-content: center;
+}
+
+.capture-panel h4 {
+  margin: 0 0 14px;
+  color: var(--orange);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.capture-kv {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 18px;
+  margin-bottom: 4px;
+}
+
+.preview-block {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  margin-top: 6px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.22);
+}
+
+.preview-block h5 {
+  margin: 0 0 2px;
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.preview-meta {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 8px 16px;
+  margin: 0;
+}
+
+.preview-meta dt {
+  margin: 0;
+  color: var(--subtle);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.preview-meta dd {
+  overflow-wrap: anywhere;
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.json-block {
+  max-width: 100%;
+  overflow: auto;
+  margin: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #0a0908;
+  color: #d9d2c5;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: pre;
+  tab-size: 2;
+}
+
+.json-block code {
+  color: inherit;
+  font: inherit;
+}
+
 .diagnostic-table-wrap {
   max-width: 100%;
   overflow-x: auto;
@@ -1182,6 +1286,14 @@ h2 {
   .diagnostics-grid,
   .diagnostic-kv {
     grid-template-columns: 1fr;
+  }
+
+  .capture-pair {
+    grid-template-columns: 1fr;
+  }
+
+  .capture-kv {
+    grid-template-columns: 1fr 1fr;
   }
 
   .event-line {

@@ -60,17 +60,17 @@ pub enum ManualRecoveryKind {
 pub enum TargetRecoveryPlan {
     /// The target did not exist before the run and must be removed.
     Remove,
-    /// Return the target to an exact baseline. `retained` records that the
-    /// harness intentionally keeps a newly installed baseline as a local cache.
+    /// Return a preexisting target to the baseline resolved for its run.
     Restore {
-        /// Immutable reference used for restoration. New records use the
-        /// release's IPFS origin so a semver downgrade cannot be suppressed.
+        /// Exact release reference when available, otherwise its resolved
+        /// semantic version.
         baseline_ref: String,
         /// Version expected in package inventory after restoration. Older
         /// records omit this and use `baseline_ref` for both purposes.
         #[serde(default)]
         expected_version: Option<String>,
         #[serde(default)]
+        /// Backward-compatible marker used only by older persisted records.
         retained: bool,
     },
 }

@@ -402,7 +402,6 @@ fn runner_config() -> RunnerConfig {
         log_tail: 30,
         cleanup_enabled: true,
         cleanup_timeout: Duration::from_millis(10),
-        retain_baseline_packages: Default::default(),
     }
 }
 
@@ -609,138 +608,49 @@ async fn deterministic_candidate_install_failure_is_failed() -> Result<(), Box<d
 }
 
 #[tokio::test]
-async fn installed_target_is_restored_after_latest_baseline_test() -> Result<(), Box<dyn Error>> {
+async fn installed_target_is_restored_to_latest_published_baseline() -> Result<(), Box<dyn Error>> {
     let request = request("installed-baseline")?;
     let manager = Arc::new(
         ScriptedPackageManager::new(request.package.dnp_name.clone())
-            .with_installed_baseline("/ipfs/QmOriginal")?,
+            .with_installed_baseline("0.3.1")?
+            .with_latest_release("0.3.0", "/ipfs/QmPublishedBaseline"),
     );
     let observation = manager.clone();
     let (_directory, _store, record) = execute_with(request, manager, &NoopRunProgress).await?;
     assert_eq!(record.cleanup.status, CleanupStatus::Passed);
-    assert_eq!(
-        record.worker.baseline_restore_ref.as_deref(),
-        Some("/ipfs/QmOriginal")
-    );
-    assert_eq!(observation.cleanup_calls()?, 0);
-    assert_eq!(
-        observation.installed_version()?.as_deref(),
-        Some("/ipfs/QmOriginal")
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn semantic_downgrade_restores_by_immutable_origin() -> Result<(), Box<dyn Error>> {
-    let request = request("semantic-baseline-restore")?;
-    let manager = Arc::new(
-        ScriptedPackageManager::new(request.package.dnp_name.clone())
-            .with_installed_baseline("0.1.3")?
-            .with_restore_resolution("0.1.3", "/ipfs/QmBaselineOrigin"),
-    );
-
-    let (_directory, _store, record) =
-        execute_with(request, manager.clone(), &NoopRunProgress).await?;
-
-    assert_eq!(record.cleanup.status, CleanupStatus::Passed);
-    assert_eq!(
-        manager.update_versions()?,
-        vec!["/ipfs/QmCandidate", "/ipfs/QmBaselineOrigin"]
-    );
-    assert_eq!(manager.installed_version()?.as_deref(), Some("0.1.3"));
     assert!(matches!(
         record.worker.target_recovery,
         Some(TargetRecoveryPlan::Restore {
             baseline_ref,
             expected_version: Some(expected_version),
             retained: false,
-        }) if baseline_ref == "/ipfs/QmBaselineOrigin" && expected_version == "0.1.3"
-    ));
-    Ok(())
-}
-
-#[tokio::test]
-async fn expensive_baseline_is_retained_then_reused() -> Result<(), Box<dyn Error>> {
-    let mut first_request = request("retained-baseline-first")?;
-    first_request.package.baseline_ref = Some(PackageRef::parse("1.0.0")?);
-    let manager = Arc::new(ScriptedPackageManager::new(
-        first_request.package.dnp_name.clone(),
-    ));
-    let mut config = runner_config();
-    config
-        .retain_baseline_packages
-        .insert(first_request.package.dnp_name.to_string());
-
-    let (_directory, _store, first) = execute_with_config(
-        first_request.clone(),
-        manager.clone(),
-        &NoopRunProgress,
-        config.clone(),
-    )
-    .await?;
-    assert_eq!(first.cleanup.status, CleanupStatus::Passed);
-    assert_eq!(manager.cleanup_calls()?, 0);
-    assert_eq!(manager.install_calls()?, 1);
-    assert_eq!(manager.installed_version()?.as_deref(), Some("1.0.0"));
-    assert!(matches!(
-        first.worker.target_recovery,
-        Some(TargetRecoveryPlan::Restore {
-            baseline_ref,
-            expected_version: Some(expected_version),
-            retained: true,
-        }) if baseline_ref == "1.0.0" && expected_version == "1.0.0"
-    ));
-
-    let mut second_request = first_request;
-    second_request.run_id =
-        dappnode_package_harness::model::RunId::parse("retained-baseline-second")?;
-    let (_directory, _store, second) =
-        execute_with_config(second_request, manager.clone(), &NoopRunProgress, config).await?;
-    assert_eq!(second.cleanup.status, CleanupStatus::Passed);
-    assert_eq!(
-        manager.install_calls()?,
-        1,
-        "second run must reuse baseline"
-    );
-    assert_eq!(manager.installed_version()?.as_deref(), Some("1.0.0"));
-    Ok(())
-}
-
-#[tokio::test]
-async fn retained_package_resolves_omitted_baseline_as_latest() -> Result<(), Box<dyn Error>> {
-    let request = request("retained-latest-baseline")?;
-    let manager = Arc::new(
-        ScriptedPackageManager::new(request.package.dnp_name.clone())
-            .with_installed_baseline("0.3.1")?
-            .with_latest_release("0.3.0", "/ipfs/QmPublishedBaseline"),
-    );
-    let mut config = runner_config();
-    config
-        .retain_baseline_packages
-        .insert(request.package.dnp_name.to_string());
-
-    let (_directory, _store, record) =
-        execute_with_config(request, manager.clone(), &NoopRunProgress, config).await?;
-
-    assert_eq!(record.cleanup.status, CleanupStatus::Passed);
-    assert_eq!(
-        manager.preview_requests()?,
-        vec![None, Some("/ipfs/QmCandidate".to_owned())],
-        "the installed manifest version must not be sent as the baseline request"
-    );
-    assert_eq!(
-        manager.update_versions()?,
-        vec!["/ipfs/QmCandidate", "/ipfs/QmPublishedBaseline"]
-    );
-    assert_eq!(manager.installed_version()?.as_deref(), Some("0.3.0"));
-    assert!(matches!(
-        record.worker.target_recovery,
-        Some(TargetRecoveryPlan::Restore {
-            baseline_ref,
-            expected_version: Some(expected_version),
-            retained: true,
         }) if baseline_ref == "/ipfs/QmPublishedBaseline" && expected_version == "0.3.0"
     ));
+    assert_eq!(observation.cleanup_calls()?, 0);
+    assert_eq!(observation.installed_version()?.as_deref(), Some("0.3.0"));
+    assert_eq!(
+        observation.preview_requests()?,
+        vec![None, Some("/ipfs/QmCandidate".to_owned())],
+        "the pre-run version must never be used as a baseline reference"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn target_absent_before_run_is_removed_after_candidate_test() -> Result<(), Box<dyn Error>> {
+    let request = request("absent-target-cleanup")?;
+    let manager = Arc::new(ScriptedPackageManager::new(
+        request.package.dnp_name.clone(),
+    ));
+    let (_directory, _store, record) =
+        execute_with(request, manager.clone(), &NoopRunProgress).await?;
+    assert_eq!(record.cleanup.status, CleanupStatus::Passed);
+    assert_eq!(manager.cleanup_calls()?, 1);
+    assert_eq!(manager.installed_version()?, None);
+    assert_eq!(
+        record.worker.target_recovery,
+        Some(TargetRecoveryPlan::Remove)
+    );
     Ok(())
 }
 
@@ -769,8 +679,7 @@ fn legacy_worker_state_recovers_its_saved_baseline() -> Result<(), Box<dyn Error
 }
 
 #[tokio::test]
-async fn explicit_baseline_is_honored_then_original_installation_is_restored()
--> Result<(), Box<dyn Error>> {
+async fn explicit_baseline_is_honored_and_restored_after_candidate() -> Result<(), Box<dyn Error>> {
     let mut request = request("explicit-installed-baseline")?;
     request.package.baseline_ref = Some(PackageRef::parse("/ipfs/QmRequestedBaseline")?);
     let manager = Arc::new(
@@ -789,12 +698,12 @@ async fn explicit_baseline_is_honored_then_original_installation_is_restored()
         vec![
             "/ipfs/QmRequestedBaseline",
             "/ipfs/QmCandidate",
-            "/ipfs/QmOriginal"
+            "/ipfs/QmRequestedBaseline"
         ]
     );
     assert_eq!(
         observation.installed_version()?.as_deref(),
-        Some("/ipfs/QmOriginal")
+        Some("/ipfs/QmRequestedBaseline")
     );
     Ok(())
 }
@@ -876,8 +785,8 @@ async fn restore_deadline_includes_slow_detail_calls() -> Result<(), Box<dyn Err
 }
 
 #[tokio::test]
-async fn candidate_removing_target_still_restores_preexisting_baseline()
--> Result<(), Box<dyn Error>> {
+async fn candidate_removing_target_still_restores_resolved_baseline() -> Result<(), Box<dyn Error>>
+{
     let request = request("candidate-removes-target")?;
     let mut manager = ScriptedPackageManager::new(request.package.dnp_name.clone())
         .with_installed_baseline("/ipfs/QmOriginal")?;
@@ -888,7 +797,7 @@ async fn candidate_removing_target_still_restores_preexisting_baseline()
     assert_eq!(record.cleanup.status, CleanupStatus::Passed);
     assert_eq!(
         observation.installed_version()?.as_deref(),
-        Some("/ipfs/QmOriginal")
+        Some("baseline")
     );
     Ok(())
 }

@@ -802,9 +802,7 @@ fn not_ready(message: String) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::BTreeSet, error::Error, net::SocketAddr, path::PathBuf, time::Duration,
-    };
+    use std::{error::Error, net::SocketAddr, path::PathBuf, time::Duration};
 
     use axum::{
         body::{Body, to_bytes},
@@ -840,7 +838,6 @@ mod tests {
             log_tail: 1,
             cleanup_enabled: true,
             cleanup_timeout: Duration::from_secs(1),
-            retain_baseline_packages: BTreeSet::new(),
             nexus_api_key: None,
             nexus_base_url: "https://nexus.example/v1".to_owned(),
             nexus_model: "nexus/auto".to_owned(),

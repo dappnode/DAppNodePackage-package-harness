@@ -298,7 +298,7 @@ pub async fn restore_target(
                 return CleanupResult {
                     status: CleanupStatus::TimedOut,
                     leftover_packages: Vec::new(),
-                    error: Some("target package did not return to its original version".to_owned()),
+                    error: Some("target package did not return to its baseline version".to_owned()),
                 };
             }
             Ok(Err(error)) => {
@@ -336,7 +336,7 @@ pub async fn restore_target(
     CleanupResult {
         status: CleanupStatus::TimedOut,
         leftover_packages: Vec::new(),
-        error: Some("target package did not return to its original version".to_owned()),
+        error: Some("target package did not return to its baseline version".to_owned()),
     }
 }
 

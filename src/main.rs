@@ -68,7 +68,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         stabilization_required_samples = config.stabilization_required_samples,
         cleanup_enabled = config.cleanup_enabled,
         cleanup_timeout_ms = config.cleanup_timeout.as_millis() as u64,
-        retained_baseline_packages = ?config.retain_baseline_packages,
         log_tail_lines = config.log_tail,
         "Execution policy loaded"
     );
@@ -113,7 +112,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             log_tail: config.log_tail,
             cleanup_enabled: config.cleanup_enabled,
             cleanup_timeout: config.cleanup_timeout,
-            retain_baseline_packages: config.retain_baseline_packages.clone(),
         },
     ));
     let coordinator = CoordinatorClient::new(

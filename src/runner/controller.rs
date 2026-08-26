@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use chrono::Utc;
 use thiserror::Error;
@@ -40,8 +40,6 @@ pub struct RunnerConfig {
     pub cleanup_enabled: bool,
     /// Maximum time spent trying to remove the target package.
     pub cleanup_timeout: Duration,
-    /// DNP names whose resolved published baseline is restored and retained.
-    pub retain_baseline_packages: BTreeSet<String>,
 }
 
 /// Error returned to API code when a run cannot be driven.
@@ -425,88 +423,14 @@ impl RunController {
             installed_version = installed_baseline.and_then(|package| package.version.as_deref()).unwrap_or("none"),
             "Inventory inspected"
         );
-        let retain_baseline = self
-            .config
-            .retain_baseline_packages
-            .contains(package.dnp_name.as_str());
-        let installed_baseline_ref = if let Some(installed_baseline) =
-            installed_baseline.filter(|_| !retain_baseline)
-        {
-            let version = installed_baseline
-                .version
-                .as_deref()
-                .ok_or_else(|| Failure {
-                    verdict: Verdict::InfrastructureError,
-                    reason: ReasonCode::BaselineUnavailable,
-                    summary: "installed target has no version to restore after testing".to_owned(),
-                })?;
-            let baseline_ref =
-                crate::model::PackageRef::parse(version).map_err(|error| Failure {
-                    verdict: Verdict::InfrastructureError,
-                    reason: ReasonCode::BaselineUnavailable,
-                    summary: truncate_utf8(
-                        &format!("installed target version cannot be restored: {error}"),
-                        500,
-                    ),
-                })?;
-            // Save this before candidate mutation so restart recovery restores
-            // the package that was already running, rather than deleting it.
-            record
-                .worker
-                .set_recovery_plan(TargetRecoveryPlan::Restore {
-                    baseline_ref: baseline_ref.to_string(),
-                    expected_version: Some(version.to_owned()),
-                    retained: false,
-                });
-            self.save_failure(record).await?;
-            Some(baseline_ref)
-        } else {
-            // Persist removal as the safe fallback before the first mutation.
-            // Retained packages are promoted to an exact Restore plan after
-            // the canonical baseline has been resolved.
-            record.worker.set_recovery_plan(TargetRecoveryPlan::Remove);
-            self.save_failure(record).await?;
-            None
-        };
+        let target_was_installed = installed_baseline.is_some();
+        // Until the requested baseline is resolved, removal is the only exact
+        // recovery action we can persist without consulting pre-run versions.
+        record.worker.set_recovery_plan(TargetRecoveryPlan::Remove);
+        self.save_failure(record).await?;
 
         self.phase_failure(record, ExecutionPhase::BaselinePreview, progress)
             .await?;
-        if let Some(installed_ref) = &installed_baseline_ref {
-            let preview = self
-                .package_manager
-                .preview_install(&package.dnp_name, Some(installed_ref))
-                .await
-                .map_err(infrastructure)?;
-            let restore_ref = preview
-                .resolved_ref
-                .as_deref()
-                .unwrap_or(installed_ref.as_str());
-            let restore_ref =
-                crate::model::PackageRef::parse(restore_ref).map_err(|error| Failure {
-                    verdict: Verdict::InfrastructureError,
-                    reason: ReasonCode::BaselineUnavailable,
-                    summary: truncate_utf8(
-                        &format!("resolved baseline reference is invalid: {error}"),
-                        500,
-                    ),
-                })?;
-            let expected_version = installed_baseline
-                .and_then(|installed| installed.version.clone())
-                .ok_or_else(|| Failure {
-                    verdict: Verdict::InfrastructureError,
-                    reason: ReasonCode::BaselineUnavailable,
-                    summary: "installed target has no version to verify after restoration"
-                        .to_owned(),
-                })?;
-            record
-                .worker
-                .set_recovery_plan(TargetRecoveryPlan::Restore {
-                    baseline_ref: restore_ref.to_string(),
-                    expected_version: Some(expected_version),
-                    retained: false,
-                });
-            self.save_failure(record).await?;
-        }
         // An omitted baselineRef always means the latest published release.
         // Installed node state must not silently replace that request.
         let baseline_preview = self
@@ -516,6 +440,37 @@ impl RunController {
             .map_err(infrastructure)?;
         let baseline_resolved_ref = baseline_preview.resolved_ref.clone();
         let baseline_expected_version = baseline_preview.version.clone();
+        if target_was_installed {
+            let expected_version = baseline_expected_version
+                .as_deref()
+                .ok_or_else(|| Failure {
+                    verdict: Verdict::InfrastructureError,
+                    reason: ReasonCode::BaselineUnavailable,
+                    summary: "baseline preview did not report its resolved version".to_owned(),
+                })?;
+            let restore_ref = baseline_resolved_ref
+                .as_deref()
+                .or_else(|| package.baseline_ref.as_ref().map(PackageRef::as_str))
+                .unwrap_or(expected_version);
+            let restore_ref = PackageRef::parse(restore_ref).map_err(|error| Failure {
+                verdict: Verdict::InfrastructureError,
+                reason: ReasonCode::BaselineUnavailable,
+                summary: truncate_utf8(
+                    &format!("resolved baseline reference is invalid: {error}"),
+                    500,
+                ),
+            })?;
+            // Persist the baseline recovery plan before any package mutation.
+            // The pre-run version is intentionally irrelevant.
+            record
+                .worker
+                .set_recovery_plan(TargetRecoveryPlan::Restore {
+                    baseline_ref: restore_ref.to_string(),
+                    expected_version: Some(expected_version.to_owned()),
+                    retained: false,
+                });
+            self.save_failure(record).await?;
+        }
         let reuse_installed_baseline = installed_baseline.is_some_and(|installed| {
             let Some(installed_version) = installed.version.as_deref() else {
                 return false;
@@ -545,37 +500,6 @@ impl RunController {
             .await?;
         let baseline_started = self.clock.now();
         if !reuse_installed_baseline {
-            if retain_baseline && installed_baseline.is_some() {
-                let expected_version =
-                    baseline_expected_version
-                        .as_deref()
-                        .ok_or_else(|| Failure {
-                            verdict: Verdict::InfrastructureError,
-                            reason: ReasonCode::BaselineUnavailable,
-                            summary: "latest baseline preview did not report its resolved version"
-                                .to_owned(),
-                        })?;
-                let restore_ref = baseline_resolved_ref
-                    .as_deref()
-                    .or_else(|| package.baseline_ref.as_ref().map(PackageRef::as_str))
-                    .unwrap_or(expected_version);
-                crate::model::PackageRef::parse(restore_ref).map_err(|error| Failure {
-                    verdict: Verdict::InfrastructureError,
-                    reason: ReasonCode::BaselineUnavailable,
-                    summary: truncate_utf8(
-                        &format!("resolved retained baseline reference is invalid: {error}"),
-                        500,
-                    ),
-                })?;
-                record
-                    .worker
-                    .set_recovery_plan(TargetRecoveryPlan::Restore {
-                        baseline_ref: restore_ref.to_owned(),
-                        expected_version: Some(expected_version.to_owned()),
-                        retained: true,
-                    });
-                self.save_failure(record).await?;
-            }
             self.authorize_cleanup(record, cleanup_authorized, progress)
                 .await?;
             let install_result = match (installed_baseline, package.baseline_ref.as_ref()) {
@@ -690,46 +614,6 @@ impl RunController {
                 reason: ReasonCode::BaselineUnavailable,
                 summary: error,
             })?;
-        if retain_baseline {
-            let baseline_ref = baseline
-                .details
-                .as_ref()
-                .and_then(|details| details.version.as_deref())
-                .ok_or_else(|| Failure {
-                    verdict: Verdict::InfrastructureError,
-                    reason: ReasonCode::BaselineUnavailable,
-                    summary: "retained baseline did not report an exact version to restore"
-                        .to_owned(),
-                })
-                .and_then(|version| {
-                    crate::model::PackageRef::parse(version).map_err(|error| Failure {
-                        verdict: Verdict::InfrastructureError,
-                        reason: ReasonCode::BaselineUnavailable,
-                        summary: truncate_utf8(
-                            &format!("retained baseline version cannot be restored: {error}"),
-                            500,
-                        ),
-                    })
-                })?;
-            record
-                .worker
-                .set_recovery_plan(TargetRecoveryPlan::Restore {
-                    baseline_ref: baseline_resolved_ref
-                        .as_deref()
-                        .unwrap_or(baseline_ref.as_str())
-                        .to_owned(),
-                    expected_version: Some(baseline_ref.to_string()),
-                    retained: true,
-                });
-            info!(
-                event = "baseline_retained",
-                run_id = %record.request.run_id,
-                dnp_name = %package.dnp_name,
-                restore_ref = baseline_resolved_ref.as_deref().unwrap_or(baseline_ref.as_str()),
-                expected_version = %baseline_ref,
-                "Baseline will be retained and restored for future runs"
-            );
-        }
         record.evidence.baseline = Some(baseline);
         self.save_failure(record).await?;
 

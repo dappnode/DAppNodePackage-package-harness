@@ -27,7 +27,6 @@ services:
       LOG_TAIL: "300"
       CLEANUP_ENABLED: "true"
       CLEANUP_TIMEOUT_MS: "60000"
-      RETAIN_BASELINE_PACKAGES: "near.dnp.dappnode.eth"
       TROPIBOT_URL: ""
       PACKAGE_HARNESS_WORKER_ID: ""
       PACKAGE_HARNESS_WORKER_TOKEN: ""

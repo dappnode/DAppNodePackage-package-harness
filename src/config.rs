@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, env, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
 
 use thiserror::Error;
 
@@ -41,9 +41,6 @@ pub struct Config {
     pub log_tail: usize,
     pub cleanup_enabled: bool,
     pub cleanup_timeout: Duration,
-    /// Packages whose resolved published baseline should remain installed and
-    /// be restored after candidate tests.
-    pub retain_baseline_packages: BTreeSet<String>,
     pub nexus_api_key: Option<String>,
     pub nexus_base_url: String,
     pub nexus_model: String,
@@ -161,7 +158,6 @@ impl Config {
             log_tail,
             cleanup_enabled: bool_value("CLEANUP_ENABLED", true)?,
             cleanup_timeout: millis("CLEANUP_TIMEOUT_MS", 60_000)?,
-            retain_baseline_packages: package_list("RETAIN_BASELINE_PACKAGES")?,
             nexus_api_key: optional("NEXUS_API_KEY"),
             nexus_base_url: env::var("NEXUS_BASE_URL")
                 .unwrap_or_else(|_| "https://nexus-api.dappnode.com/v1".to_owned()),
@@ -192,25 +188,6 @@ impl Config {
         }
         None
     }
-}
-
-fn package_list(name: &'static str) -> Result<BTreeSet<String>, ConfigError> {
-    let Some(value) = optional(name) else {
-        return Ok(BTreeSet::new());
-    };
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| {
-            crate::model::DnpName::parse(value)
-                .map(|name| name.to_string())
-                .map_err(|error| ConfigError::Invalid {
-                    name,
-                    message: format!("invalid package '{value}': {error}"),
-                })
-        })
-        .collect()
 }
 
 #[derive(Debug, Error)]

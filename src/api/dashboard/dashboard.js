@@ -266,7 +266,7 @@ function renderWorkerDiagnostics(job) {
 }
 
 function renderCapturesSideBySide(job) {
-  const section = diagnosticSection("Baseline vs Candidate");
+  const section = diagnosticSection("Baseline vs Candidate", "diagnostic-wide");
   const grid = node("div", "capture-pair");
   grid.append(
     renderCapturePanel("Baseline", job.diagnostics.baseline),
@@ -484,11 +484,11 @@ function renderExpertDiagnostics(job) {
     node("span", null, `stage=${job.phase} · status=${job.status}`),
   );
   expert.append(heading);
+  expert.append(renderCapturesSideBySide(job));
   const grid = node("div", "diagnostics-grid");
   grid.append(
     renderPhaseTimeline(job),
     renderWorkerDiagnostics(job),
-    renderCapturesSideBySide(job),
     renderComparison(job),
     renderInventory(job),
     renderErrors(job),

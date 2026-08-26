@@ -787,6 +787,7 @@ h2 {
 
 .diagnostic-card.diagnostic-wide {
   grid-column: 1 / -1;
+  width: 100%;
 }
 
 .diagnostic-card > summary,
@@ -913,6 +914,8 @@ h2 {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 16px;
   width: 100%;
+  margin-right: 0;
+  margin-left: 0;
 }
 
 .capture-panel {
@@ -923,6 +926,17 @@ h2 {
   border: 1px solid var(--line);
   border-radius: 12px;
   background: rgba(8, 8, 7, 0.45);
+}
+
+.capture-panel .preview-block,
+.capture-panel .diagnostic-table-wrap,
+.capture-panel .diagnostic-kv,
+.capture-panel .diagnostic-alert,
+.capture-panel .diagnostic-copy,
+.capture-panel .diagnostic-empty,
+.capture-panel h5 {
+  margin-right: 0;
+  margin-left: 0;
 }
 
 .capture-panel.is-empty {

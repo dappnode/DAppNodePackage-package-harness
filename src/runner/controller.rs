@@ -150,7 +150,7 @@ impl RunController {
         if cleanup_authorized {
             self.phase(&mut record, ExecutionPhase::Cleanup, progress)
                 .await?;
-            let recovery_plan = record.worker.recovery_plan();
+            let recovery_plan = record.worker.target_recovery;
             info!(
                 event = "cleanup_plan_started",
                 run_id = %record.request.run_id,
@@ -163,7 +163,7 @@ impl RunController {
                 self.package_manager.as_ref(),
                 Arc::clone(&self.clock),
                 &package.dnp_name,
-                &recovery_plan,
+                recovery_plan,
                 &record.evidence.initial_packages,
                 self.config.cleanup_timeout,
             )
@@ -356,13 +356,11 @@ impl RunController {
             installed_version = installed_baseline.and_then(|package| package.version.as_deref()).unwrap_or("none"),
             "Inventory inspected"
         );
-        record
-            .worker
-            .set_recovery_plan(if installed_baseline.is_some() {
-                TargetRecoveryPlan::RestoreLatest
-            } else {
-                TargetRecoveryPlan::Remove
-            });
+        record.worker.target_recovery = if installed_baseline.is_some() {
+            TargetRecoveryPlan::RestoreLatest
+        } else {
+            TargetRecoveryPlan::Remove
+        };
         self.save_failure(record).await?;
 
         self.phase_failure(record, ExecutionPhase::BaselinePreview, progress)
@@ -511,13 +509,11 @@ impl RunController {
                 baseline_stabilization,
             )
             .await
-            .map_err(|error| Failure {
-                verdict: Verdict::InfrastructureError,
-                reason: ReasonCode::BaselineUnavailable,
-                summary: error,
-            })?;
+            .map_err(|error| package_failure(error, ReasonCode::BaselineUnavailable))?;
+        let applied = applied_version(&baseline, "baseline", ReasonCode::BaselineInstallFailed);
         record.evidence.baseline = Some(baseline);
         self.save_failure(record).await?;
+        applied?;
 
         self.phase_failure(record, ExecutionPhase::CandidatePreview, progress)
             .await?;
@@ -593,12 +589,11 @@ impl RunController {
                 candidate_stabilization,
             )
             .await
-            .map_err(|error| Failure {
-                verdict: Verdict::Failed,
-                reason: ReasonCode::CandidateContainersUnstable,
-                summary: error,
-            })?;
+            .map_err(|error| package_failure(error, ReasonCode::CandidateInstallFailed))?;
+        let applied = applied_version(&candidate, "candidate", ReasonCode::CandidateInstallFailed);
         record.evidence.candidate = Some(candidate);
+        self.save_failure(record).await?;
+        applied?;
 
         self.phase_failure(record, ExecutionPhase::Analysis, progress)
             .await?;
@@ -683,12 +678,11 @@ impl RunController {
         preview: crate::model::PreviewSummary,
         install_duration_ms: u64,
         stabilization: StabilizationResult,
-    ) -> Result<CaptureEvidence, String> {
+    ) -> Result<CaptureEvidence, PackageManagerError> {
         let details = self
             .package_manager
             .get_package_details(context.dnp_name)
-            .await
-            .map_err(|error| truncate_utf8(&error.to_string(), 500))?;
+            .await?;
         let (logs, log_error) = match self
             .package_manager
             .get_package_logs(context.dnp_name, self.config.log_tail)
@@ -853,6 +847,34 @@ fn logs_for_analysis(capture: &CaptureEvidence) -> Vec<(Option<String>, String)>
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Fails when Dappmanager reported a mutation as applied but the package
+/// still reports another version than the preview resolved. Without this, a
+/// no-op update would compare the baseline with itself and pass.
+fn applied_version(
+    capture: &CaptureEvidence,
+    side: &str,
+    reason: ReasonCode,
+) -> Result<(), Failure> {
+    let expected = capture
+        .preview
+        .as_ref()
+        .and_then(crate::model::PreviewSummary::semantic_version);
+    let reported = capture
+        .details
+        .as_ref()
+        .and_then(|details| details.version.as_deref());
+    match (expected, reported) {
+        (Some(expected), Some(reported)) if expected != reported => Err(Failure {
+            verdict: Verdict::InfrastructureError,
+            reason,
+            summary: format!(
+                "Dappmanager reported the {side} as installed, but the package reports version {reported} instead of {expected}"
+            ),
+        }),
+        _ => Ok(()),
+    }
 }
 
 fn package_failure(error: PackageManagerError, operation_reason: ReasonCode) -> Failure {

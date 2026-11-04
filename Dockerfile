@@ -1,4 +1,4 @@
-FROM rust:1.96.1-bookworm AS builder
+FROM rust:1.99.1-bookworm AS builder
 
 WORKDIR /usr/src/harness
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./

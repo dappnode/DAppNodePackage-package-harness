@@ -21,6 +21,9 @@ use super::{
     retryable_tool_message, retryable_transport_message,
 };
 
+/// How often an operation Dappmanager reports as already running is re-checked.
+const IN_PROGRESS_POLL: Duration = Duration::from_secs(10);
+
 #[derive(Clone)]
 pub struct DappmanagerPackageManager {
     client: DappnodeMcpClient,
@@ -97,6 +100,11 @@ impl DappmanagerPackageManager {
                     );
                     return Ok(());
                 }
+                Err(error) if operation_in_progress_error(&error.to_string()) => {
+                    return self
+                        .await_in_progress(tool, dnp_name, requested_ref, error, &mut reconcile)
+                        .await;
+                }
                 Err(error)
                     if attempt < self.mutation_attempts && retryable_mutation_error(&error) =>
                 {
@@ -150,6 +158,57 @@ impl DappmanagerPackageManager {
         unreachable!("mutation attempts are validated to be non-zero")
     }
 
+    /// An earlier attempt that timed out on our side is still running in
+    /// Dappmanager. Its outcome is unknown until the requested state becomes
+    /// observable, so wait for that instead of reporting success.
+    async fn await_in_progress<Reconcile, ReconcileFuture>(
+        &self,
+        tool: &'static str,
+        dnp_name: &DnpName,
+        requested_ref: Option<&str>,
+        error: DappnodeMcpError,
+        reconcile: &mut Reconcile,
+    ) -> Result<(), DappnodeMcpError>
+    where
+        Reconcile: FnMut() -> ReconcileFuture,
+        ReconcileFuture: Future<Output = bool>,
+    {
+        let started = Instant::now();
+        info!(
+            event = "mcp_mutation_in_progress",
+            tool,
+            dnp_name = %dnp_name,
+            requested_ref = requested_ref.unwrap_or("none"),
+            timeout_ms = self.mutation_timeout.as_millis() as u64,
+            "Dappmanager is still running an earlier attempt; waiting for its result"
+        );
+        loop {
+            if reconcile().await {
+                info!(
+                    event = "mcp_mutation_reconciled",
+                    tool,
+                    dnp_name = %dnp_name,
+                    requested_ref = requested_ref.unwrap_or("none"),
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    "In-progress mutation reached the requested state"
+                );
+                return Ok(());
+            }
+            if started.elapsed() >= self.mutation_timeout {
+                warn!(
+                    event = "mcp_mutation_in_progress_timed_out",
+                    tool,
+                    dnp_name = %dnp_name,
+                    requested_ref = requested_ref.unwrap_or("none"),
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    "In-progress mutation did not reach the requested state"
+                );
+                return Err(error);
+            }
+            tokio::time::sleep(IN_PROGRESS_POLL).await;
+        }
+    }
+
     async fn install_package_with_options(
         &self,
         dnp_name: &DnpName,
@@ -175,7 +234,6 @@ impl DappmanagerPackageManager {
             Err(error) if required_setup_error(&error.to_string()) => {
                 Err(PackageManagerError::RequiredSetup)
             }
-            Err(error) if operation_in_progress_error(&error.to_string()) => Ok(()),
             Err(error) => Err(package_error(error)),
         }
     }
@@ -195,23 +253,27 @@ impl DappmanagerPackageManager {
                 self.mutation_client
                     .update_package(dnp_name, Some(version), options)
             },
+            // Candidate refs are usually IPFS hashes, so compare against the
+            // version the preview resolves rather than the ref itself.
             || async {
-                self.client
+                let Some(installed) = self
+                    .client
                     .get_package_details(dnp_name)
                     .await
                     .ok()
                     .and_then(|details| details.version)
-                    .is_some_and(|installed| installed.to_string() == version.as_str())
+                else {
+                    return false;
+                };
+                self.preview_install(dnp_name, Some(version))
+                    .await
+                    .ok()
+                    .and_then(|preview| preview.semantic_version().map(str::to_owned))
+                    .is_some_and(|expected| installed.to_string() == expected)
             },
         )
         .await
-        .or_else(|error| {
-            if operation_in_progress_error(&error.to_string()) {
-                Ok(())
-            } else {
-                Err(package_error(error))
-            }
-        })
+        .map_err(package_error)
     }
 }
 

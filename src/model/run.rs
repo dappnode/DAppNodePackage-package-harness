@@ -39,44 +39,34 @@ pub struct WorkerError {
 }
 
 /// Operator action required before the worker may accept another claim.
-///
-/// Older records only persisted a human-readable reason. [`WorkerState`] keeps
-/// compatibility with those records by inferring a kind when this field is
-/// absent, while all new writes persist this enum explicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ManualRecoveryKind {
     Cleanup,
     CompletionConflict,
-    Manual,
+}
+
+/// A hold that keeps the worker paused until an operator resolves it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManualRecovery {
+    pub kind: ManualRecoveryKind,
+    pub reason: String,
 }
 
 /// Destructive target state that restart recovery must reconcile.
 ///
-/// This is persisted before each mutation. It replaces the ambiguous
-/// `cleanup_required + optional baseline` convention with an explicit action.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case")]
+/// It is persisted before the first mutation; until then nothing needs
+/// cleanup, so the default only matters for records that never mutated.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TargetRecoveryPlan {
     /// The target did not exist before the run and must be removed.
+    #[default]
     Remove,
     /// The target existed before the run and must be freshly installed from
     /// the latest published registry release while preserving its volumes.
     RestoreLatest,
-    /// Return a preexisting target to the baseline resolved for its run.
-    /// Kept for recovery of records persisted by older harness versions.
-    Restore {
-        /// Exact release reference when available, otherwise its resolved
-        /// semantic version.
-        baseline_ref: String,
-        /// Version expected in package inventory after restoration. Older
-        /// records omit this and use `baseline_ref` for both purposes.
-        #[serde(default)]
-        expected_version: Option<String>,
-        #[serde(default, skip_serializing_if = "is_false")]
-        /// Backward-compatible marker used only by older persisted records.
-        retained: bool,
-    },
 }
 
 /// Delivery state owned by the polling worker.
@@ -92,14 +82,8 @@ pub struct WorkerState {
     pub claim_token: Option<String>,
     /// Becomes true immediately before the worker can mutate the target.
     pub cleanup_required: bool,
-    /// Explicit recovery action persisted before target mutation.
-    #[serde(default)]
-    pub target_recovery: Option<TargetRecoveryPlan>,
-    /// Version that was installed before this run. When set, cleanup restores
-    /// this package instead of removing it. Kept only for backward-compatible
-    /// recovery of records written by harness 0.1.1.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub baseline_restore_ref: Option<String>,
+    /// Recovery action persisted before target mutation.
+    pub target_recovery: TargetRecoveryPlan,
     /// A normal result is mutually exclusive with a worker error.
     pub worker_error: Option<WorkerError>,
     /// Exact UTF-8 completion JSON persisted before its first HTTP attempt.
@@ -107,74 +91,35 @@ pub struct WorkerState {
     pub completion_acknowledged: bool,
     /// `recorded` or `duplicate` once Tropibot has acknowledged delivery.
     pub completion_disposition: Option<String>,
-    /// An unresolved cleanup or claim-reconciliation issue that requires an
-    /// operator and keeps the worker out of ready state.
-    pub manual_recovery_reason: Option<String>,
-    /// Machine-readable recovery classification. Optional for compatibility
-    /// with records written before this field was introduced.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub manual_recovery_kind: Option<ManualRecoveryKind>,
+    /// An unresolved cleanup or completion conflict that requires an operator
+    /// and keeps the worker out of ready state.
+    pub manual_recovery: Option<ManualRecovery>,
 }
 
 impl WorkerState {
-    /// Returns the persisted recovery kind, with a compatibility fallback for
-    /// records that predate the typed field.
     pub fn manual_recovery_kind(&self) -> Option<ManualRecoveryKind> {
-        self.manual_recovery_kind.or_else(|| {
-            self.manual_recovery_reason.as_deref().map(|reason| {
-                if reason.contains("conflict") {
-                    ManualRecoveryKind::CompletionConflict
-                } else if reason.contains("cleanup") {
-                    ManualRecoveryKind::Cleanup
-                } else {
-                    ManualRecoveryKind::Manual
-                }
-            })
-        })
+        self.manual_recovery.as_ref().map(|hold| hold.kind)
+    }
+
+    pub fn manual_recovery_reason(&self) -> Option<&str> {
+        self.manual_recovery
+            .as_ref()
+            .map(|hold| hold.reason.as_str())
     }
 
     pub fn set_manual_recovery(&mut self, kind: ManualRecoveryKind, reason: String) {
-        self.manual_recovery_kind = Some(kind);
-        self.manual_recovery_reason = Some(reason);
+        self.manual_recovery = Some(ManualRecovery { kind, reason });
     }
 
     pub fn clear_manual_recovery(&mut self) {
-        self.manual_recovery_kind = None;
-        self.manual_recovery_reason = None;
+        self.manual_recovery = None;
     }
-
-    /// Returns the explicit plan, falling back to the legacy restore field for
-    /// records persisted by older harness versions.
-    pub fn recovery_plan(&self) -> TargetRecoveryPlan {
-        self.target_recovery.clone().unwrap_or_else(|| {
-            self.baseline_restore_ref
-                .as_ref()
-                .map_or(TargetRecoveryPlan::Remove, |baseline_ref| {
-                    TargetRecoveryPlan::Restore {
-                        baseline_ref: baseline_ref.clone(),
-                        expected_version: None,
-                        retained: false,
-                    }
-                })
-        })
-    }
-
-    pub fn set_recovery_plan(&mut self, plan: TargetRecoveryPlan) {
-        // Clear the pre-0.1.2 compatibility field as soon as a current plan is written.
-        self.baseline_restore_ref = None;
-        self.target_recovery = Some(plan);
-    }
-}
-
-fn is_false(value: &bool) -> bool {
-    !value
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionPhase {
     Queued,
-    #[serde(alias = "initial_cleanup")]
     Preflight,
     BaselinePreview,
     BaselineInstall,
@@ -320,7 +265,7 @@ impl RunRecord {
 
     /// Whether this record prevents the process from claiming another job.
     pub fn requires_worker_attention(&self) -> bool {
-        self.worker.manual_recovery_reason.is_some()
+        self.worker.manual_recovery.is_some()
             || self.worker.pending_completion_body.is_some()
             || self.worker.claim_token.is_some() && !self.worker.completion_acknowledged
     }
@@ -328,10 +273,10 @@ impl RunRecord {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExecutionPhase, ManualRecoveryKind, TargetRecoveryPlan, WorkerState};
+    use super::{ManualRecoveryKind, TargetRecoveryPlan, WorkerState};
 
     #[test]
-    fn typed_manual_recovery_does_not_depend_on_message_wording() {
+    fn manual_recovery_keeps_its_kind_with_its_reason() {
         let mut state = WorkerState::default();
         state.set_manual_recovery(
             ManualRecoveryKind::Cleanup,
@@ -342,50 +287,30 @@ mod tests {
             state.manual_recovery_kind(),
             Some(ManualRecoveryKind::Cleanup)
         );
+        assert_eq!(
+            state.manual_recovery_reason(),
+            Some("operator verification is required")
+        );
         state.clear_manual_recovery();
         assert_eq!(state.manual_recovery_kind(), None);
-        assert!(state.manual_recovery_reason.is_none());
+        assert!(state.manual_recovery_reason().is_none());
     }
 
     #[test]
-    fn legacy_manual_recovery_reasons_remain_classified() {
-        let cleanup = WorkerState {
-            manual_recovery_reason: Some("target cleanup failed".to_owned()),
-            ..WorkerState::default()
-        };
-        let conflict = WorkerState {
-            manual_recovery_reason: Some("persisted completion is conflicting".to_owned()),
-            ..WorkerState::default()
-        };
-
-        assert_eq!(
-            cleanup.manual_recovery_kind(),
-            Some(ManualRecoveryKind::Cleanup)
-        );
-        assert_eq!(
-            conflict.manual_recovery_kind(),
-            Some(ManualRecoveryKind::CompletionConflict)
-        );
-    }
-
-    #[test]
-    fn current_recovery_plans_do_not_write_legacy_fields() -> Result<(), serde_json::Error> {
+    fn worker_state_serializes_recovery_plan_and_hold() -> Result<(), serde_json::Error> {
         let mut state = WorkerState {
-            baseline_restore_ref: Some("0.1.0".to_owned()),
+            target_recovery: TargetRecoveryPlan::RestoreLatest,
             ..WorkerState::default()
         };
-        state.set_recovery_plan(TargetRecoveryPlan::RestoreLatest);
+        state.set_manual_recovery(
+            ManualRecoveryKind::CompletionConflict,
+            "conflict".to_owned(),
+        );
 
-        let json = serde_json::to_value(state)?;
-        assert!(json.get("baselineRestoreRef").is_none());
-        assert_eq!(json["targetRecovery"]["action"], "restore_latest");
-        Ok(())
-    }
-
-    #[test]
-    fn legacy_initial_cleanup_phase_maps_to_preflight() -> Result<(), serde_json::Error> {
-        let phase: ExecutionPhase = serde_json::from_str("\"initial_cleanup\"")?;
-        assert_eq!(phase, ExecutionPhase::Preflight);
+        let json = serde_json::to_value(&state)?;
+        assert_eq!(json["targetRecovery"], "restore_latest");
+        assert_eq!(json["manualRecovery"]["kind"], "completion_conflict");
+        assert_eq!(serde_json::from_value::<WorkerState>(json)?, state);
         Ok(())
     }
 }

@@ -56,6 +56,16 @@ pub struct PreviewSummary {
     pub summary: String,
 }
 
+impl PreviewSummary {
+    /// The semantic version the preview resolves to. `version` falls back to
+    /// the requested reference, which is not a version for IPFS or `*` refs.
+    pub fn semantic_version(&self) -> Option<&str> {
+        self.version
+            .as_deref()
+            .filter(|version| version.starts_with(|c: char| c.is_ascii_digit()))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StabilizationSample {

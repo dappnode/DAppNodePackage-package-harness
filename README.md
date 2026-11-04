@@ -23,7 +23,7 @@ For every accepted job, the deterministic controller:
 5. captures normalized details and bounded, redacted log tails;
 6. upgrades the baseline in place to the candidate;
 7. repeats stabilization and capture, compares both observations, and performs optional Nexus analysis;
-8. restores a pre-existing target by removing it without deleting volumes and freshly installing the latest published release (`*`), or removes a target that was initially absent with `deleteVolumes: true`; cleanup fails when final inventory cannot be verified or contains unexpected dependencies.
+8. restores a pre-existing target by removing it without deleting volumes and freshly installing the latest published release (`*`), or removes a target that was initially absent with `deleteVolumes: true`; cleanup fails when final inventory cannot be verified or contains unexpected dependencies. A cleanup that already passed, automatically or through an operator, is never repeated.
 
 Nexus is advisory. With no key, the harness uses the heuristic analyzer only. With a key, it sends one bounded redacted request with no tools; Nexus failures fall back safely, and Nexus can never override a deterministic failure.
 
@@ -45,7 +45,7 @@ Use [`.env.example`](.env.example) for all timeout, Dappmanager, cleanup, and op
 
 ## Local fake mode
 
-Rust 1.96.1 is pinned by `rust-toolchain.toml`. The process reads a local `.env` if it exists; existing process variables take precedence.
+Rust 1.99.1 is pinned by `rust-toolchain.toml`. The process reads a local `.env` if it exists; existing process variables take precedence.
 
 ```bash
 mkdir -p .data
@@ -80,7 +80,7 @@ Every request carries `Authorization: Bearer <PACKAGE_HARNESS_WORKER_TOKEN>`, `C
 
 Claim input is validated before persistence or execution: `runId` is a bounded safe identifier, `source.repository` is an ASCII `owner/repository` name, `source.headSha` is a 7–64 character hexadecimal commit ID, and package names and references use the shared Dappnode parsers.
 
-Before mutating, the worker atomically persists the full claim and opaque claim token under `DATA_DIR`. It persists every recovery-relevant phase and, before network delivery, the exact serialized completion JSON. Transient failures and coordinator compatibility rejections retry the same bytes with capped backoff and worker-specific jitter, so a coordinator upgrade heals delivery without a worker restart. Successful delivery clears legacy delivery-recovery markers. The worker never claims another job until completion is acknowledged as `recorded` or `duplicate`.
+Before mutating, the worker atomically persists the full claim and opaque claim token under `DATA_DIR`. It persists every recovery-relevant phase and, before network delivery, the exact serialized completion JSON. Transient failures and coordinator compatibility rejections retry the same bytes with capped backoff and worker-specific jitter, so a coordinator upgrade heals delivery without a worker restart. An acknowledged delivery also clears a completion-conflict hold, so a restart that redelivers successfully needs no operator. The worker never claims another job until completion is acknowledged as `recorded` or `duplicate`.
 
 On restart, a pending completion is retried first. An interrupted job is never rerun: if it may have mutated the target, the worker inspects Dappmanager, performs bounded cleanup, then sends an `interrupted` worker-error completion. A lost claim is released locally after cleanup succeeds; if Tropibot still holds unresolved coordinator state, the next claim receives a conflict and polling stops without inventing new local recovery work. Manual recovery is reserved for failed cleanup, ambiguous local records, or a conflicting completion that proves Tropibot already holds different state for the claim.
 
@@ -92,15 +92,15 @@ After manually completing a failed target cleanup, acknowledge that exact run th
 curl --fail-with-body \
   --request POST \
   --header 'content-type: application/json' \
-  --data '{"runId":"gh-pr-177-f33e0a37375d-f0181f51d12f8734"}' \
-  http://HARNESS_HOST:8080/operator/recovery/continue
+  --data '{"runId":"gh-pr-177-f33e0a37375d-f0181f51d12f8734","action":"continueAfterCleanup"}' \
+  http://HARNESS_HOST:8080/operator/recovery/action
 ```
 
-The endpoint accepts only cleanup-related manual holds. It preserves the claim token and stored result, records the operator-verified cleanup, clears the persisted hold, and wakes the paused worker without a container restart.
+This action accepts only cleanup holds; the same endpoint takes `confirmCleanup`, `retryCompletion` and `acceptCoordinatorResult` for completion conflicts, as the dashboard does. It preserves the claim token and stored result, records the operator-verified cleanup, clears the persisted hold, and wakes the paused worker without a container restart.
 
 The dashboard's local worker control remains visible for completion conflicts. It shows whether cleanup is confirmed, a completion payload is persisted, the local claim is held, and Tropibot acknowledged a result. Once cleanup is confirmed, the operator can either retry the exact persisted completion or explicitly accept Tropibot's existing result and release the local claim. The latter is destructive to the saved delivery obligation and requires typing the exact run ID. The worker remains alive and paused while waiting for either action, so no package restart is needed.
 
-For planned package updates or host maintenance, choose **Drain worker** in the dashboard first. The lifecycle moves from `accepting` to `draining`; no new claim request is started, while an already claimed job is allowed to finish mutation, mandatory cleanup, and persisted completion delivery. Restart only after the dashboard reports `drained` and **Safe to restart**. **Resume accepting jobs** cancels or exits a drain. A claim response that crosses the drain boundary is completed safely because the v1 coordinator protocol has no claim-release operation. `POST /operator/worker/drain` and `POST /operator/worker/resume` expose the same controls and require an `application/json` body (`{}`). `/readyz` returns unavailable while draining or drained, but `/healthz` remains a process liveness check. SIGTERM also requests a drain, and the Compose service grants up to two hours for active safe work to finish.
+For planned package updates or host maintenance, choose **Drain worker** in the dashboard first. The lifecycle moves from `accepting` to `draining`; no new claim request is started, while an already claimed job is allowed to finish mutation, mandatory cleanup, and persisted completion delivery. Restart only after the dashboard reports `drained` and **Safe to restart**. **Resume accepting jobs** cancels or exits a drain. A claim response that crosses the drain boundary is completed safely because the v1 coordinator protocol has no claim-release operation. `POST /operator/worker/drain` and `POST /operator/worker/resume` expose the same controls and require an `application/json` body (`{}`). `/readyz` returns unavailable while draining or drained, but `/healthz` remains a process liveness check. SIGTERM also requests a drain, but Docker's default stop timeout of 10 seconds is far shorter than a package mutation, so drain first. A stop that interrupts a job is reconciled on the next start: the worker cleans up the target and reports the job as `interrupted` without rerunning it.
 
 Heartbeats run independently of package execution. A cancellation request is observed at safe phase boundaries and inside stabilization polling. It prevents a new mutating phase but never bypasses required cleanup. If Tropibot no longer recognizes the claim, the worker finishes the current operation, reconciles cleanup, and releases the obsolete local claim when the target is safe.
 

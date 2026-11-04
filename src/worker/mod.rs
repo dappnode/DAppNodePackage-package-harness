@@ -27,7 +27,7 @@ use crate::{
         WorkerError, WorkerErrorCode,
     },
     package_manager::PackageManager,
-    runner::{RunController, cleanup::reconcile_target},
+    runner::{RunController, RunProgress, cleanup::reconcile_target},
     storage::RunStore,
 };
 
@@ -428,51 +428,47 @@ impl PackageHarnessWorker {
             dnp_name = %record.request.package.dnp_name,
             "Claim persisted; destructive execution may now begin"
         );
-
-        let unsupported_job = match self.unsupported_job_reason(&record).await {
-            Ok(reason) => reason,
-            Err(error) => {
-                self.set_worker_error(&mut record, WorkerErrorCode::UnexpectedError, error)
-                    .await?;
-                return self.deliver_or_pause(&mut record).await;
-            }
-        };
-        if let Some(summary) = unsupported_job {
-            self.set_worker_error(&mut record, WorkerErrorCode::UnsupportedJob, summary)
-                .await?;
-            return self.deliver_or_pause(&mut record).await;
-        }
-
+        // Heartbeats cover recovery cleanup and delivery too, which can take
+        // far longer than Tropibot's worker-lost timeout.
         let progress = WorkerProgress::new();
-        debug!(
-            event = "heartbeat_started",
-            run_id = %record.request.run_id,
-            interval_seconds = self.config.heartbeat_interval.as_secs(),
-            "Supervision started"
-        );
-        let heartbeat = HeartbeatTask::start(
-            self.coordinator.clone(),
-            record.request.run_id.to_string(),
-            record
-                .worker
-                .claim_token
-                .clone()
-                .ok_or("claimed record unexpectedly lacks claim token")?,
-            Arc::clone(&progress),
-            self.config.heartbeat_interval,
-        );
-        let execution = self
-            .controller
-            .execute(&record.request.run_id, progress.as_ref())
-            .await;
-        heartbeat.stop().await;
+        let heartbeat = self.start_heartbeat(&record, &progress);
+        let outcome = self.settle_claim(&mut record, &progress).await;
+        if let Some(heartbeat) = heartbeat {
+            heartbeat.stop().await;
+        }
         debug!(
             event = "heartbeat_stopped",
             run_id = %record.request.run_id,
             "Supervision stopped"
         );
+        outcome
+    }
 
-        record = self
+    async fn settle_claim(
+        &self,
+        record: &mut RunRecord,
+        progress: &Arc<WorkerProgress>,
+    ) -> Result<(), String> {
+        let unsupported_job = match self.unsupported_job_reason(record).await {
+            Ok(reason) => reason,
+            Err(error) => {
+                self.set_worker_error(record, WorkerErrorCode::UnexpectedError, error)
+                    .await?;
+                return self.deliver_or_pause(record).await;
+            }
+        };
+        if let Some(summary) = unsupported_job {
+            self.set_worker_error(record, WorkerErrorCode::UnsupportedJob, summary)
+                .await?;
+            return self.deliver_or_pause(record).await;
+        }
+
+        let execution = self
+            .controller
+            .execute(&record.request.run_id, progress.as_ref())
+            .await;
+
+        *record = self
             .store
             .get(&record.request.run_id)
             .await
@@ -486,10 +482,10 @@ impl PackageHarnessWorker {
                 error = %error,
                 "Controller execution failed; attempting target recovery"
             );
-            if let Err(recovery_error) = self.recover_target_if_required(&mut record).await {
+            if let Err(recovery_error) = self.recover_target_if_required(record, progress).await {
                 let reason = self
                     .mark_manual_recovery(
-                        &mut record,
+                        record,
                         ManualRecoveryKind::Cleanup,
                         format!("execution and cleanup recovery failed: {recovery_error}"),
                     )
@@ -497,7 +493,7 @@ impl PackageHarnessWorker {
                 return Err(reason);
             }
             self.set_worker_error(
-                &mut record,
+                record,
                 WorkerErrorCode::LocalPersistenceFailed,
                 format!("execution stopped before a persisted result: {error}"),
             )
@@ -505,30 +501,30 @@ impl PackageHarnessWorker {
         }
 
         if progress.claim_lost() {
-            if let Err(recovery_error) = self.recover_target_if_required(&mut record).await {
+            if let Err(recovery_error) = self.recover_target_if_required(record, progress).await {
                 let reason = self
                     .mark_manual_recovery(
-                        &mut record,
+                        record,
                         ManualRecoveryKind::Cleanup,
                         format!("claim was lost and cleanup recovery failed: {recovery_error}"),
                     )
                     .await?;
                 return Err(reason);
             }
-            return self.release_reconciled_claim(&mut record).await;
+            return self.release_reconciled_claim(record).await;
         }
 
-        if cleanup_failed(&record) {
+        if cleanup_failed(record) {
             return Err(self
                 .mark_manual_recovery(
-                    &mut record,
+                    record,
                     ManualRecoveryKind::Cleanup,
                     "target cleanup failed; operator action is required before another job can be claimed",
                 )
                 .await?);
         }
 
-        self.deliver_or_pause(&mut record).await
+        self.deliver_or_pause(record).await
     }
 
     async fn recover(&self) -> Result<(), String> {
@@ -568,47 +564,85 @@ impl PackageHarnessWorker {
             pending_completion = record.worker.pending_completion_body.is_some(),
             "Found an unresolved local job; reconciling before polling"
         );
-        if record.worker.pending_completion_body.is_some() {
-            return self.deliver_or_pause(&mut record).await;
+        if record.worker.pending_completion_body.is_none()
+            && let Some(reason) = record.worker.manual_recovery_reason().map(str::to_owned)
+        {
+            // No heartbeat while paused: the job should show as lost in
+            // Tropibot until the operator resolves the local hold.
+            return Err(reason);
         }
-        if record.worker.manual_recovery_reason.is_some() {
-            return Err(record
-                .worker
-                .manual_recovery_reason
-                .clone()
-                .unwrap_or_else(|| "manual recovery is required".to_owned()));
+        let progress = WorkerProgress::new();
+        progress.publish(record.phase, record.worker.cleanup_required);
+        let heartbeat = self.start_heartbeat(&record, &progress);
+        let outcome = self.settle_recovered(&mut record, &progress).await;
+        if let Some(heartbeat) = heartbeat {
+            heartbeat.stop().await;
         }
-        if record.status == ExecutionStatus::Completed && record.result.is_some() {
-            return self.deliver_or_pause(&mut record).await;
+        outcome
+    }
+
+    async fn settle_recovered(
+        &self,
+        record: &mut RunRecord,
+        progress: &Arc<WorkerProgress>,
+    ) -> Result<(), String> {
+        if record.worker.pending_completion_body.is_some()
+            || record.status == ExecutionStatus::Completed && record.result.is_some()
+        {
+            return self.deliver_or_pause(record).await;
         }
 
         record.interrupt();
-        if let Err(recovery_error) = self.recover_target_if_required(&mut record).await {
+        if let Err(recovery_error) = self.recover_target_if_required(record, progress).await {
             let reason = self
                 .mark_manual_recovery(
-                    &mut record,
+                    record,
                     ManualRecoveryKind::Cleanup,
                     format!("interrupted job cleanup recovery failed: {recovery_error}"),
                 )
                 .await?;
             return Err(reason);
         }
-        if cleanup_failed(&record) {
+        if cleanup_failed(record) {
             return Err(self
                 .mark_manual_recovery(
-                    &mut record,
+                    record,
                     ManualRecoveryKind::Cleanup,
                     "interrupted job cleanup failed; operator action is required",
                 )
                 .await?);
         }
+        if progress.claim_lost() {
+            return self.release_reconciled_claim(record).await;
+        }
         self.set_worker_error(
-            &mut record,
+            record,
             WorkerErrorCode::Interrupted,
             "worker restarted before this job completed; the job was not rerun".to_owned(),
         )
         .await?;
-        self.deliver_or_pause(&mut record).await
+        self.deliver_or_pause(record).await
+    }
+
+    fn start_heartbeat(
+        &self,
+        record: &RunRecord,
+        progress: &Arc<WorkerProgress>,
+    ) -> Option<HeartbeatTask> {
+        let claim_token = record.worker.claim_token.clone()?;
+        debug!(
+            event = "heartbeat_started",
+            run_id = %record.request.run_id,
+            interval_seconds = self.config.heartbeat_interval.as_secs(),
+            "Supervision started"
+        );
+        Some(HeartbeatTask::start(
+            self.coordinator.clone(),
+            record.request.run_id.to_string(),
+            claim_token,
+            Arc::clone(progress),
+            self.config.heartbeat_interval,
+        ))
     }
 
     async fn unsupported_job_reason(&self, record: &RunRecord) -> Result<Option<String>, String> {
@@ -631,8 +665,15 @@ impl PackageHarnessWorker {
         Ok(None)
     }
 
-    async fn recover_target_if_required(&self, record: &mut RunRecord) -> Result<(), String> {
-        if !record.worker.cleanup_required {
+    /// Reconciles the target unless it never changed or its cleanup already
+    /// passed, either in the controller or by an operator. Repeating a passed
+    /// cleanup would reinstall the package again or undo manual repairs.
+    async fn recover_target_if_required(
+        &self,
+        record: &mut RunRecord,
+        progress: &WorkerProgress,
+    ) -> Result<(), String> {
+        if !record.worker.cleanup_required || record.cleanup.status == CleanupStatus::Passed {
             self.store
                 .save(record)
                 .await
@@ -654,7 +695,8 @@ impl PackageHarnessWorker {
         {
             return Err("refusing restart cleanup of a core package".to_owned());
         }
-        let recovery_plan = record.worker.recovery_plan();
+        let recovery_plan = record.worker.target_recovery;
+        progress.publish(ExecutionPhase::Cleanup, true);
         info!(
             event = "restart_cleanup_started",
             run_id = %record.request.run_id,
@@ -666,7 +708,7 @@ impl PackageHarnessWorker {
             self.package_manager.as_ref(),
             Arc::clone(&self.clock),
             target,
-            &recovery_plan,
+            recovery_plan,
             &record.evidence.initial_packages,
             self.config.cleanup_timeout,
         )

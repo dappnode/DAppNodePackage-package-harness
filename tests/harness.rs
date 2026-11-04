@@ -22,14 +22,14 @@ use dappnode_package_harness::{
     },
     model::{
         CleanupStatus, ContainerLog, ContainerSnapshot, DnpName, ExecutionPhase, ExecutionStatus,
-        ExplicitPackageResolver, LogAnalysisInput, PackageDetails, PackageLogs, PackageRef,
-        PackageSummary, PreviewSummary, ReasonCode, RunRecord, RunRequest, RunRequestDto,
-        TargetRecoveryPlan, Verdict, WorkerErrorCode, WorkerState,
+        ExplicitPackageResolver, LogAnalysisInput, ManualRecoveryKind, PackageDetails, PackageLogs,
+        PackageRef, PackageSummary, PreviewSummary, ReasonCode, RunRecord, RunRequest,
+        RunRequestDto, TargetRecoveryPlan, Verdict, WorkerErrorCode,
     },
     package_manager::{PackageManager, PackageManagerError, REQUIRED_MCP_TOOLS, ToolAvailability},
     runner::{
         NoopRunProgress, RunControl, RunController, RunProgress, RunnerConfig,
-        cleanup::{cleanup_target, restore_target},
+        cleanup::cleanup_target,
         stabilization::{StabilizationConfig, stabilize},
     },
     storage::{FileRunStore, RunStore},
@@ -69,13 +69,17 @@ struct ScriptedPackageManager {
     baseline_preview_error: Option<PackageManagerError>,
     leave_extra_package: bool,
     core: bool,
-    restore_resolution: Option<(String, String)>,
     latest_release: (String, String),
     list_packages_delay: Duration,
     package_details_delay: Duration,
     remove_leaves_installed: bool,
     baseline_signature_rejected: bool,
     resolver_noop_when_installed: bool,
+    /// Semantic version the candidate preview resolves to and an applied
+    /// candidate update reports.
+    candidate_version: Option<String>,
+    candidate_update_noop: bool,
+    remove_delay: Duration,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -103,13 +107,15 @@ impl ScriptedPackageManager {
             baseline_preview_error: None,
             leave_extra_package: false,
             core: false,
-            restore_resolution: None,
             latest_release: ("baseline".to_owned(), "/ipfs/QmLatestBaseline".to_owned()),
             list_packages_delay: Duration::ZERO,
             package_details_delay: Duration::ZERO,
             remove_leaves_installed: false,
             baseline_signature_rejected: false,
             resolver_noop_when_installed: false,
+            candidate_version: None,
+            candidate_update_noop: false,
+            remove_delay: Duration::ZERO,
         }
     }
 
@@ -129,11 +135,6 @@ impl ScriptedPackageManager {
         state.version = version.to_owned();
         drop(state);
         Ok(self)
-    }
-
-    fn with_restore_resolution(mut self, version: &str, resolved_ref: &str) -> Self {
-        self.restore_resolution = Some((version.to_owned(), resolved_ref.to_owned()));
-        self
     }
 
     fn with_latest_release(mut self, version: &str, resolved_ref: &str) -> Self {
@@ -289,13 +290,13 @@ impl PackageManager for ScriptedPackageManager {
             },
             |version| {
                 (
-                    Some(version.to_string()),
                     Some(
-                        self.restore_resolution
-                            .as_ref()
-                            .filter(|(expected, _)| expected == version.as_str())
-                            .map_or_else(|| version.to_string(), |(_, resolved)| resolved.clone()),
+                        self.candidate_version
+                            .clone()
+                            .filter(|_| version.as_str() == "/ipfs/QmCandidate")
+                            .unwrap_or_else(|| version.to_string()),
                     ),
+                    Some(version.to_string()),
                 )
             },
         );
@@ -340,16 +341,22 @@ impl PackageManager for ScriptedPackageManager {
         if self.resolver_noop_when_installed && version.as_str() != "/ipfs/QmCandidate" {
             return Ok(());
         }
+        if self.candidate_update_noop && version.as_str() == "/ipfs/QmCandidate" {
+            return Ok(());
+        }
         state.installed =
             !(self.candidate_removes_target && version.as_str() == "/ipfs/QmCandidate");
         state.candidate = version.as_str() == "/ipfs/QmCandidate";
         state.version = if version.as_str() == self.latest_release.1 {
             self.latest_release.0.clone()
+        } else if let Some(candidate_version) = self
+            .candidate_version
+            .clone()
+            .filter(|_| version.as_str() == "/ipfs/QmCandidate")
+        {
+            candidate_version
         } else {
-            self.restore_resolution
-                .as_ref()
-                .filter(|(_, resolved)| resolved == version.as_str())
-                .map_or_else(|| version.to_string(), |(expected, _)| expected.clone())
+            version.to_string()
         };
         Ok(())
     }
@@ -359,6 +366,9 @@ impl PackageManager for ScriptedPackageManager {
         _dnp_name: &DnpName,
         _delete_volumes: bool,
     ) -> Result<(), PackageManagerError> {
+        if !self.remove_delay.is_zero() {
+            tokio::time::sleep(self.remove_delay).await;
+        }
         let mut state = self.state()?;
         state.cleanup_calls = state.cleanup_calls.saturating_add(1);
         if self.cleanup_failure {
@@ -624,6 +634,37 @@ async fn baseline_preview_tool_failure_is_not_reported_as_mcp_unavailable()
 }
 
 #[tokio::test]
+async fn candidate_update_that_does_not_apply_is_an_infrastructure_error()
+-> Result<(), Box<dyn Error>> {
+    // An applied candidate that reports its previewed version still passes.
+    let applied = request("candidate-update-applied")?;
+    let mut manager = ScriptedPackageManager::new(applied.package.dnp_name.clone());
+    manager.candidate_version = Some("2.0.0".to_owned());
+    let (_directory, _store, record) =
+        execute_with(applied, Arc::new(manager), &NoopRunProgress).await?;
+    assert_eq!(
+        record.result.ok_or("missing result")?.verdict,
+        Verdict::Passed
+    );
+
+    // A reported success that leaves the baseline running must not compare
+    // the baseline with itself and pass.
+    let request = request("candidate-update-noop")?;
+    let mut manager = ScriptedPackageManager::new(request.package.dnp_name.clone());
+    manager.candidate_version = Some("2.0.0".to_owned());
+    manager.candidate_update_noop = true;
+    let (_directory, _store, record) =
+        execute_with(request, Arc::new(manager), &NoopRunProgress).await?;
+    let result = record.result.ok_or("missing result")?;
+    assert_eq!(result.verdict, Verdict::InfrastructureError);
+    assert_eq!(result.reason_code, ReasonCode::CandidateInstallFailed);
+    assert!(result.summary.contains("instead of 2.0.0"));
+    assert!(record.evidence.candidate.is_some());
+    assert_eq!(record.cleanup.status, CleanupStatus::Passed);
+    Ok(())
+}
+
+#[tokio::test]
 async fn deterministic_candidate_install_failure_is_failed() -> Result<(), Box<dyn Error>> {
     let request = request("candidate-deterministic-failure")?;
     let mut manager = ScriptedPackageManager::new(request.package.dnp_name.clone());
@@ -652,7 +693,7 @@ async fn installed_target_is_restored_to_latest_published_baseline() -> Result<(
     assert_eq!(record.cleanup.status, CleanupStatus::Passed);
     assert_eq!(
         record.worker.target_recovery,
-        Some(TargetRecoveryPlan::RestoreLatest)
+        TargetRecoveryPlan::RestoreLatest
     );
     assert_eq!(observation.cleanup_calls()?, 2);
     assert_eq!(observation.installed_version()?.as_deref(), Some("0.3.0"));
@@ -701,34 +742,7 @@ async fn target_absent_before_run_is_removed_after_candidate_test() -> Result<()
     assert_eq!(record.cleanup.status, CleanupStatus::Passed);
     assert_eq!(manager.cleanup_calls()?, 1);
     assert_eq!(manager.installed_version()?, None);
-    assert_eq!(
-        record.worker.target_recovery,
-        Some(TargetRecoveryPlan::Remove)
-    );
-    Ok(())
-}
-
-#[test]
-fn legacy_worker_state_recovers_its_saved_baseline() -> Result<(), Box<dyn Error>> {
-    let mut legacy = WorkerState {
-        baseline_restore_ref: Some("1.2.3".to_owned()),
-        ..WorkerState::default()
-    };
-    legacy.target_recovery = None;
-    let mut value = serde_json::to_value(legacy)?;
-    value
-        .as_object_mut()
-        .ok_or("worker state did not serialize as an object")?
-        .remove("targetRecovery");
-    let restored: WorkerState = serde_json::from_value(value)?;
-    assert_eq!(
-        restored.recovery_plan(),
-        TargetRecoveryPlan::Restore {
-            baseline_ref: "1.2.3".to_owned(),
-            expected_version: None,
-            retained: false,
-        }
-    );
+    assert_eq!(record.worker.target_recovery, TargetRecoveryPlan::Remove);
     Ok(())
 }
 
@@ -756,29 +770,6 @@ async fn explicit_baseline_is_tested_then_latest_is_restored() -> Result<(), Box
 }
 
 #[tokio::test]
-async fn restoration_reinstalls_a_missing_preexisting_target() -> Result<(), Box<dyn Error>> {
-    let request = request("restore-missing-target")?;
-    let manager = ScriptedPackageManager::new(request.package.dnp_name.clone());
-    let baseline_ref = PackageRef::parse("/ipfs/QmOriginal")?;
-    let cleanup = restore_target(
-        &manager,
-        Arc::new(ImmediateClock),
-        &request.package.dnp_name,
-        &baseline_ref,
-        baseline_ref.as_str(),
-        Duration::from_millis(10),
-    )
-    .await;
-    assert_eq!(cleanup.status, CleanupStatus::Passed);
-    assert_eq!(manager.install_calls()?, 1);
-    assert_eq!(
-        manager.installed_version()?.as_deref(),
-        Some("/ipfs/QmOriginal")
-    );
-    Ok(())
-}
-
-#[tokio::test]
 async fn cleanup_deadline_includes_slow_inventory_calls() -> Result<(), Box<dyn Error>> {
     let request = request("bounded-cleanup-verification")?;
     let mut manager = ScriptedPackageManager::new(request.package.dnp_name.clone())
@@ -799,34 +790,6 @@ async fn cleanup_deadline_includes_slow_inventory_calls() -> Result<(), Box<dyn 
     assert!(
         started.elapsed() < Duration::from_millis(1_100),
         "cleanup verification exceeded its wall-clock deadline"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn restore_deadline_includes_slow_detail_calls() -> Result<(), Box<dyn Error>> {
-    let request = request("bounded-restore-verification")?;
-    let mut manager = ScriptedPackageManager::new(request.package.dnp_name.clone())
-        .with_installed_baseline("0.1.4")?
-        .with_restore_resolution("0.1.4", "/ipfs/QmBaselineOrigin");
-    manager.package_details_delay = Duration::from_millis(400);
-    let baseline_ref = PackageRef::parse("/ipfs/QmBaselineOrigin")?;
-    let started = Instant::now();
-
-    let cleanup = restore_target(
-        &manager,
-        Arc::new(TokioClock),
-        &request.package.dnp_name,
-        &baseline_ref,
-        "0.1.3",
-        Duration::from_millis(600),
-    )
-    .await;
-
-    assert_eq!(cleanup.status, CleanupStatus::TimedOut);
-    assert!(
-        started.elapsed() < Duration::from_millis(1_100),
-        "restore verification exceeded its wall-clock deadline"
     );
     Ok(())
 }
@@ -1702,8 +1665,10 @@ async fn operator_cleanup_acknowledgement_resumes_worker_without_restart()
     assert_eq!(record.cleanup.status, CleanupStatus::Failed);
     record.worker.claim_token =
         Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned());
-    record.worker.manual_recovery_reason =
-        Some("target cleanup failed; operator action is required".to_owned());
+    record.worker.set_manual_recovery(
+        ManualRecoveryKind::Cleanup,
+        "target cleanup failed; operator action is required".to_owned(),
+    );
     store.save(&record).await?;
 
     let server = MockServer::start().await;
@@ -1745,12 +1710,172 @@ async fn operator_cleanup_acknowledgement_resumes_worker_without_restart()
         .get(&request.run_id)
         .await?
         .ok_or("missing recovered worker record")?;
-    assert!(recovered.worker.manual_recovery_reason.is_none());
+    assert!(recovered.worker.manual_recovery.is_none());
     assert!(recovered.worker.completion_acknowledged);
     assert_eq!(
         recovered.worker.completion_disposition.as_deref(),
         Some("recorded")
     );
+    Ok(())
+}
+
+const CLAIM_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+/// A job that was mid-run when the worker restarted, with the target mutated.
+async fn interrupted_record(
+    run_id: &str,
+    plan: TargetRecoveryPlan,
+) -> Result<(TempDir, Arc<FileRunStore>, RunRequest), Box<dyn Error>> {
+    let request = request(run_id)?;
+    let directory = tempfile::tempdir()?;
+    let store = Arc::new(FileRunStore::new(directory.path().to_path_buf()).await?);
+    let mut record = RunRecord::claimed(request.clone(), CLAIM_TOKEN.to_owned());
+    record.start();
+    record.worker.cleanup_required = true;
+    record.worker.target_recovery = plan;
+    store.create(&record).await?;
+    Ok((directory, store, request))
+}
+
+async fn mount_heartbeat(server: &MockServer, run_id: &str, response: ResponseTemplate) {
+    Mock::given(method("POST"))
+        .and(path(format!("/v1/package-harness/jobs/{run_id}/heartbeat")))
+        .respond_with(response)
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn operator_cleanup_acknowledgement_is_not_redone_by_restart_recovery()
+-> Result<(), Box<dyn Error>> {
+    let (_directory, store, request) = interrupted_record(
+        "operator-cleanup-interrupted",
+        TargetRecoveryPlan::RestoreLatest,
+    )
+    .await?;
+    let mut record = store.get(&request.run_id).await?.ok_or("missing record")?;
+    record.worker.set_manual_recovery(
+        ManualRecoveryKind::Cleanup,
+        "interrupted job cleanup failed; operator action is required".to_owned(),
+    );
+    record.cleanup.status = CleanupStatus::Failed;
+    store.save(&record).await?;
+
+    let server = MockServer::start().await;
+    mount_heartbeat(
+        &server,
+        "operator-cleanup-interrupted",
+        ResponseTemplate::new(200)
+            .set_body_json(json!({ "schemaVersion": 1, "cancelRequested": false })),
+    )
+    .await;
+    let accepting = Arc::new(AtomicBool::new(true));
+    let stop_after_completion = Arc::clone(&accepting);
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1/package-harness/jobs/operator-cleanup-interrupted/complete",
+        ))
+        .respond_with(move |_: &wiremock::Request| {
+            stop_after_completion.store(false, Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(json!({
+                "schemaVersion": 1,
+                "disposition": "recorded"
+            }))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let recovery_control = WorkerRecoveryControl::default();
+    let manager = Arc::new(
+        ScriptedPackageManager::new(request.package.dnp_name.clone())
+            .with_installed_baseline("baseline")?,
+    );
+    let observation = Arc::clone(&manager);
+    let worker = worker_for_with_recovery_control(
+        &server,
+        Arc::clone(&store),
+        manager,
+        Arc::clone(&accepting),
+        recovery_control.clone(),
+    )?;
+    let worker_task = tokio::spawn(worker.run());
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    acknowledge_cleanup_recovery(store.as_ref(), &recovery_control, &request.run_id).await?;
+    tokio::time::timeout(Duration::from_secs(2), worker_task).await??;
+
+    // The operator's repair stands: the target is not removed or reinstalled again.
+    assert_eq!(observation.cleanup_calls()?, 0);
+    assert_eq!(observation.install_calls()?, 0);
+    let recovered = store
+        .get(&request.run_id)
+        .await?
+        .ok_or("missing recovered record")?;
+    assert!(recovered.worker.completion_acknowledged);
+    assert_eq!(
+        recovered
+            .worker
+            .worker_error
+            .as_ref()
+            .map(|error| error.code),
+        Some(WorkerErrorCode::Interrupted)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn restart_recovery_heartbeats_and_releases_a_claim_tropibot_dropped()
+-> Result<(), Box<dyn Error>> {
+    let (_directory, store, request) =
+        interrupted_record("restart-claim-dropped", TargetRecoveryPlan::Remove).await?;
+    let server = MockServer::start().await;
+    mount_heartbeat(&server, "restart-claim-dropped", ResponseTemplate::new(409)).await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1/package-harness/jobs/restart-claim-dropped/complete",
+        ))
+        .respond_with(ResponseTemplate::new(409))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let accepting = Arc::new(AtomicBool::new(true));
+    let stop_polling = Arc::clone(&accepting);
+    Mock::given(method("POST"))
+        .and(path("/v1/package-harness/jobs/claim"))
+        .respond_with(move |_: &wiremock::Request| {
+            stop_polling.store(false, Ordering::SeqCst);
+            ResponseTemplate::new(204)
+        })
+        .mount(&server)
+        .await;
+
+    // A slow removal keeps cleanup running until the heartbeat has answered.
+    let mut manager = ScriptedPackageManager::new(request.package.dnp_name.clone())
+        .with_installed_baseline("candidate")?;
+    manager.remove_delay = Duration::from_millis(200);
+    let manager = Arc::new(manager);
+    let observation = Arc::clone(&manager);
+    let worker = worker_for(&server, Arc::clone(&store), manager, Arc::clone(&accepting))?;
+    tokio::time::timeout(Duration::from_secs(5), worker.run()).await?;
+
+    let heartbeats = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|request| request.url.path().ends_with("/heartbeat"))
+        .count();
+    assert!(heartbeats > 0, "restart cleanup ran without heartbeats");
+    assert_eq!(observation.cleanup_calls()?, 1);
+    let recovered = store
+        .get(&request.run_id)
+        .await?
+        .ok_or("missing recovered record")?;
+    assert_eq!(recovered.cleanup.status, CleanupStatus::Passed);
+    assert!(recovered.worker.claim_token.is_none());
+    assert!(recovered.worker.pending_completion_body.is_none());
+    assert!(!recovered.requires_worker_attention());
     Ok(())
 }
 
@@ -1762,8 +1887,10 @@ async fn operator_cleanup_acknowledgement_rejects_non_cleanup_holds() -> Result<
     let request = request("operator-conflict-recovery")?;
     let mut record = RunRecord::claimed(request.clone(), "claim-token".to_owned());
     record.worker.cleanup_required = true;
-    record.worker.manual_recovery_reason =
-        Some("Tropibot completion conflict requires operator recovery".to_owned());
+    record.worker.set_manual_recovery(
+        ManualRecoveryKind::CompletionConflict,
+        "Tropibot completion conflict requires operator recovery".to_owned(),
+    );
     store.create(&record).await?;
 
     let error = acknowledge_cleanup_recovery(
@@ -1779,7 +1906,7 @@ async fn operator_cleanup_acknowledgement_rejects_non_cleanup_holds() -> Result<
         .get(&request.run_id)
         .await?
         .ok_or("missing preserved worker record")?;
-    assert!(preserved.worker.manual_recovery_reason.is_some());
+    assert!(preserved.worker.manual_recovery.is_some());
     Ok(())
 }
 
@@ -1851,7 +1978,7 @@ async fn polling_worker_retries_a_rejected_completion_without_manual_recovery()
     let record = store.get(&job_id).await?.ok_or("missing worker record")?;
     assert!(record.worker.completion_acknowledged);
     assert!(record.worker.pending_completion_body.is_none());
-    assert!(record.worker.manual_recovery_reason.is_none());
+    assert!(record.worker.manual_recovery.is_none());
     assert!(!record.requires_worker_attention());
     Ok(())
 }
@@ -1913,7 +2040,7 @@ async fn polling_worker_requires_manual_recovery_for_a_conflicting_completion()
     let record = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if let Some(record) = store.get(&job_id).await?
-                && record.worker.manual_recovery_reason.is_some()
+                && record.worker.manual_recovery.is_some()
             {
                 return Ok::<_, dappnode_package_harness::storage::StoreError>(record);
             }
@@ -1923,13 +2050,7 @@ async fn polling_worker_requires_manual_recovery_for_a_conflicting_completion()
     .await??;
     assert!(!record.worker.completion_acknowledged);
     assert!(record.worker.pending_completion_body.is_some());
-    assert!(
-        record
-            .worker
-            .manual_recovery_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("conflicting"))
-    );
+    assert!(record.worker.manual_recovery_kind() == Some(ManualRecoveryKind::CompletionConflict));
     assert!(record.requires_worker_attention());
     assert!(!worker_task.is_finished());
     accepting.store(false, Ordering::SeqCst);
@@ -1979,14 +2100,13 @@ async fn polling_worker_releases_a_lost_claim_after_safe_reconciliation()
     let record = store.get(&job_id).await?.ok_or("missing worker record")?;
     assert!(record.worker.claim_token.is_none());
     assert!(record.worker.pending_completion_body.is_none());
-    assert!(record.worker.manual_recovery_reason.is_none());
+    assert!(record.worker.manual_recovery.is_none());
     assert!(!record.requires_worker_attention());
     Ok(())
 }
 
 #[tokio::test]
-async fn polling_worker_retries_a_persisted_completion_after_legacy_delivery_recovery()
--> Result<(), Box<dyn Error>> {
+async fn restart_redelivers_a_completion_held_after_a_conflict() -> Result<(), Box<dyn Error>> {
     let server = MockServer::start().await;
     let accepting = Arc::new(AtomicBool::new(true));
     let stop_after_completion = Arc::clone(&accepting);
@@ -2012,8 +2132,10 @@ async fn polling_worker_retries_a_persisted_completion_after_legacy_delivery_rec
     );
     record.worker.pending_completion_body =
         Some(include_str!("fixtures/complete-worker-error.json").to_owned());
-    record.worker.manual_recovery_reason =
-        Some("coordinator previously rejected completion".to_owned());
+    record.worker.set_manual_recovery(
+        ManualRecoveryKind::CompletionConflict,
+        "coordinator previously rejected completion".to_owned(),
+    );
     store.create(&record).await?;
 
     let manager: Arc<dyn PackageManager> = Arc::new(ScriptedPackageManager::new(
@@ -2032,7 +2154,7 @@ async fn polling_worker_retries_a_persisted_completion_after_legacy_delivery_rec
         Some("recorded")
     );
     assert!(recovered.worker.pending_completion_body.is_none());
-    assert!(recovered.worker.manual_recovery_reason.is_none());
+    assert!(recovered.worker.manual_recovery.is_none());
     Ok(())
 }
 

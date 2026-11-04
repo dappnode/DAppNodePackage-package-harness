@@ -49,7 +49,6 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/coordinator/lost-job", get(coordinator_lost_job))
         .route("/healthz", get(health))
         .route("/readyz", get(ready))
-        .route("/operator/recovery/continue", post(continue_recovery))
         .route("/operator/recovery/action", post(recovery_action))
         .route("/operator/coordinator/ready", post(coordinator_ready))
         .route("/operator/worker/drain", post(worker_drain))
@@ -194,7 +193,7 @@ struct ExpertDiagnostics {
     worker_error: Option<WorkerError>,
     cleanup_required: bool,
     blocks_worker: bool,
-    target_recovery: Option<TargetRecoveryPlan>,
+    target_recovery: TargetRecoveryPlan,
     initial_packages: Vec<PackageSummary>,
     final_packages: Vec<PackageSummary>,
     baseline: Option<CaptureDiagnostics>,
@@ -344,8 +343,29 @@ async fn coordinator_ready(
     State(state): State<ApiState>,
     Json(request): Json<CoordinatorReadyRequest>,
 ) -> Response {
-    if let Err(error) = RunId::parse(&request.job_id) {
-        return operator_error(StatusCode::BAD_REQUEST, format!("invalid jobId: {error}"));
+    let run_id = match RunId::parse(&request.job_id) {
+        Ok(run_id) => run_id,
+        Err(error) => {
+            return operator_error(StatusCode::BAD_REQUEST, format!("invalid jobId: {error}"));
+        }
+    };
+    // Releasing in Tropibot asserts the old process is gone. If this worker
+    // still holds the job locally it is not lost: it is recovering or waiting
+    // on a local hold, and its completion would later conflict.
+    match state.store.get(&run_id).await {
+        Ok(Some(record)) if record.requires_worker_attention() => {
+            return operator_error(
+                StatusCode::CONFLICT,
+                "this worker still holds the job locally; resolve its local recovery instead",
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            return operator_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("cannot load job record: {error}"),
+            );
+        }
     }
     match state
         .coordinator
@@ -371,7 +391,7 @@ async fn coordinator_ready(
 }
 
 fn job_summary(record: RunRecord) -> JobSummary {
-    let manual_recovery_reason = record.worker.manual_recovery_reason.clone();
+    let manual_recovery_reason = record.worker.manual_recovery_reason().map(str::to_owned);
     // "Needs action" is an operator-facing classification. A normal running
     // claim blocks the worker from claiming a second job, but needs no human
     // intervention and must remain only in the Active classification.
@@ -380,32 +400,7 @@ fn job_summary(record: RunRecord) -> JobSummary {
     let can_continue_after_cleanup =
         record.worker.cleanup_required && manual_recovery_kind == Some(ManualRecoveryKind::Cleanup);
     let recovery_kind = manual_recovery_kind.map(recovery_kind_name);
-    // Versions before 0.1.2 could acknowledge an early worker error while
-    // leaving the execution fields at their initial queued/pending values.
-    // Normalize those persisted records for the dashboard as well as fixing
-    // the write path for all new records.
-    let terminal_worker_error =
-        record.worker.completion_acknowledged && record.worker.worker_error.is_some();
-    let status = if terminal_worker_error {
-        ExecutionStatus::Completed
-    } else {
-        record.status
-    };
-    let phase = if terminal_worker_error {
-        ExecutionPhase::Finished
-    } else {
-        record.phase
-    };
-    let cleanup_status = if terminal_worker_error && record.cleanup.status == CleanupStatus::Pending
-    {
-        record
-            .worker
-            .worker_error
-            .as_ref()
-            .map_or(record.cleanup.status, |error| error.cleanup_status)
-    } else {
-        record.cleanup.status
-    };
+    let (status, phase, cleanup_status) = (record.status, record.phase, record.cleanup.status);
     let summary = record.result.as_ref().map_or_else(
         || {
             record
@@ -461,7 +456,6 @@ const fn recovery_kind_name(kind: ManualRecoveryKind) -> &'static str {
     match kind {
         ManualRecoveryKind::Cleanup => "cleanup",
         ManualRecoveryKind::CompletionConflict => "completion_conflict",
-        ManualRecoveryKind::Manual => "manual",
     }
 }
 
@@ -472,7 +466,7 @@ fn expert_diagnostics(record: &RunRecord) -> ExpertDiagnostics {
         worker_error: record.worker.worker_error.clone(),
         cleanup_required: record.worker.cleanup_required,
         blocks_worker: record.requires_worker_attention(),
-        target_recovery: record.worker.target_recovery.clone(),
+        target_recovery: record.worker.target_recovery,
         initial_packages: record.evidence.initial_packages.clone(),
         final_packages: record.evidence.final_packages.clone(),
         baseline: record.evidence.baseline.as_ref().map(capture_diagnostics),
@@ -499,15 +493,9 @@ fn capture_diagnostics(capture: &CaptureEvidence) -> CaptureDiagnostics {
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ContinueRecoveryRequest {
-    run_id: String,
-}
-
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ContinueRecoveryResponse {
+struct RecoveryActionResponse {
     status: &'static str,
     run_id: String,
     message: &'static str,
@@ -568,7 +556,7 @@ async fn recovery_action(
         .map(|()| "coordinator result accepted; local conflict released"),
     };
     match result {
-        Ok(message) => Json(ContinueRecoveryResponse {
+        Ok(message) => Json(RecoveryActionResponse {
             status: "accepted",
             run_id: run_id.to_string(),
             message,
@@ -576,36 +564,6 @@ async fn recovery_action(
         .into_response(),
         Err(error) => operator_error(error.status(), error.to_string()),
     }
-}
-
-async fn continue_recovery(
-    State(state): State<ApiState>,
-    Json(request): Json<ContinueRecoveryRequest>,
-) -> Response {
-    let run_id = match RunId::parse(&request.run_id) {
-        Ok(run_id) => run_id,
-        Err(error) => {
-            return operator_error(StatusCode::BAD_REQUEST, format!("invalid runId: {error}"));
-        }
-    };
-    if let Err(error) = acknowledge_cleanup_recovery(
-        state.store.as_ref(),
-        &state.worker_recovery_control,
-        &run_id,
-    )
-    .await
-    {
-        return operator_error(error.status(), error.to_string());
-    }
-    (
-        StatusCode::OK,
-        Json(ContinueRecoveryResponse {
-            status: "accepted",
-            run_id: run_id.to_string(),
-            message: "manual cleanup acknowledged; worker recovery resumed",
-        }),
-    )
-        .into_response()
 }
 
 #[derive(Debug, Error)]
@@ -650,7 +608,7 @@ pub async fn acknowledge_cleanup_recovery(
         .await
         .map_err(|error| OperatorRecoveryError::Store(error.to_string()))?
         .ok_or(OperatorRecoveryError::NotFound)?;
-    if record.worker.manual_recovery_reason.is_none() {
+    if record.worker.manual_recovery.is_none() {
         return Err(OperatorRecoveryError::NotWaiting);
     }
     if !record.worker.cleanup_required
@@ -684,7 +642,7 @@ async fn confirm_manual_cleanup(
         .await
         .map_err(|error| OperatorRecoveryError::Store(error.to_string()))?
         .ok_or(OperatorRecoveryError::NotFound)?;
-    if record.worker.manual_recovery_reason.is_none() {
+    if record.worker.manual_recovery.is_none() {
         return Err(OperatorRecoveryError::NotWaiting);
     }
     if !record.worker.cleanup_required {
@@ -721,7 +679,7 @@ async fn resolve_completion_conflict(
         .await
         .map_err(|error| OperatorRecoveryError::Store(error.to_string()))?
         .ok_or(OperatorRecoveryError::NotFound)?;
-    if record.worker.manual_recovery_reason.is_none() {
+    if record.worker.manual_recovery.is_none() {
         return Err(OperatorRecoveryError::NotWaiting);
     }
     if record.worker.manual_recovery_kind() != Some(ManualRecoveryKind::CompletionConflict) {
@@ -875,7 +833,7 @@ mod tests {
         let request = request("dashboard-recovery")?;
         let mut record = RunRecord::claimed(request.clone(), "secret-claim-token".to_owned());
         record.worker.cleanup_required = true;
-        record.worker.set_recovery_plan(TargetRecoveryPlan::Remove);
+        record.worker.target_recovery = TargetRecoveryPlan::Remove;
         record.worker.set_manual_recovery(
             ManualRecoveryKind::Cleanup,
             "operator verification is required".to_owned(),
@@ -933,10 +891,11 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/operator/recovery/continue")
+                    .uri("/operator/recovery/action")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
-                        json!({ "runId": "dashboard-recovery" }).to_string(),
+                        json!({ "runId": "dashboard-recovery", "action": "continueAfterCleanup" })
+                            .to_string(),
                     ))?,
             )
             .await?;
@@ -945,8 +904,55 @@ mod tests {
             .get(&request.run_id)
             .await?
             .ok_or("updated record missing")?;
-        assert!(updated.worker.manual_recovery_reason.is_none());
+        assert!(updated.worker.manual_recovery.is_none());
         assert_eq!(updated.cleanup.status, CleanupStatus::Passed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn coordinator_ready_is_refused_for_a_job_this_worker_still_holds()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let file_store = Arc::new(FileRunStore::new(directory.path().to_path_buf()).await?);
+        let request = request("dashboard-held-job")?;
+        let mut record = RunRecord::claimed(request, "claim-token".to_owned());
+        record.worker.cleanup_required = true;
+        file_store.create(&record).await?;
+        let store: Arc<dyn RunStore> = file_store;
+        let package_manager: Arc<dyn PackageManager> = Arc::new(FakePackageManager::new());
+        let app = router(ApiState {
+            config: Arc::new(config()?),
+            package_manager,
+            store,
+            coordinator: CoordinatorClient::new(
+                "https://tropibot.example",
+                "worker-01".to_owned(),
+                "worker-token".to_owned(),
+                Duration::from_secs(1),
+            )?,
+            worker_readiness: WorkerReadiness::default(),
+            worker_recovery_control: WorkerRecoveryControl::default(),
+            worker_drain_control: WorkerDrainControl::default(),
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/operator/coordinator/ready")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "jobId": "dashboard-held-job", "retry": true }).to_string(),
+                    ))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), 4096).await?)?;
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("still holds the job locally"))
+        );
         Ok(())
     }
 
@@ -960,7 +966,8 @@ mod tests {
         record.cleanup.status = CleanupStatus::Passed;
         record.worker.cleanup_required = true;
         record.worker.pending_completion_body = Some("{\"saved\":true}".to_owned());
-        record.worker.manual_recovery_reason = Some(
+        record.worker.set_manual_recovery(
+            ManualRecoveryKind::CompletionConflict,
             "Tropibot rejected the persisted completion as conflicting; operator recovery is required"
                 .to_owned(),
         );
@@ -969,7 +976,7 @@ mod tests {
 
         resolve_completion_conflict(store.as_ref(), &control, &request.run_id, false).await?;
         let retried = store.get(&request.run_id).await?.ok_or("record missing")?;
-        assert!(retried.worker.manual_recovery_reason.is_none());
+        assert!(retried.worker.manual_recovery.is_none());
         assert_eq!(
             retried.worker.pending_completion_body.as_deref(),
             Some("{\"saved\":true}")
@@ -977,8 +984,10 @@ mod tests {
         assert!(!retried.worker.completion_acknowledged);
 
         let mut conflicted_again = retried;
-        conflicted_again.worker.manual_recovery_reason =
-            Some("persisted completion is conflicting".to_owned());
+        conflicted_again.worker.set_manual_recovery(
+            ManualRecoveryKind::CompletionConflict,
+            "persisted completion is conflicting".to_owned(),
+        );
         store.save(&conflicted_again).await?;
         resolve_completion_conflict(store.as_ref(), &control, &request.run_id, true).await?;
         let released = store.get(&request.run_id).await?.ok_or("record missing")?;
@@ -990,31 +999,6 @@ mod tests {
             Some("operator_accepted_coordinator")
         );
         assert!(!released.requires_worker_attention());
-        Ok(())
-    }
-
-    #[test]
-    fn legacy_acknowledged_worker_error_is_reported_as_terminal() -> Result<(), Box<dyn Error>> {
-        let request = request("legacy-worker-error")?;
-        let mut record = RunRecord::claimed(request, "old-claim-token".to_owned());
-        record.worker.worker_error = Some(WorkerError {
-            code: crate::model::WorkerErrorCode::UnsupportedJob,
-            summary: "refused to test a core Dappnode package".to_owned(),
-            cleanup_status: CleanupStatus::Skipped,
-        });
-        record.worker.completion_acknowledged = true;
-        record.worker.completion_disposition = Some("recorded".to_owned());
-
-        let summary = job_summary(record);
-        assert_eq!(summary.status, ExecutionStatus::Completed);
-        assert_eq!(summary.phase, ExecutionPhase::Finished);
-        assert_eq!(summary.cleanup_status, CleanupStatus::Skipped);
-        assert_eq!(
-            summary.summary.as_deref(),
-            Some("refused to test a core Dappnode package")
-        );
-        assert_eq!(summary.error_count, 1);
-        assert!(!summary.has_claim);
         Ok(())
     }
 

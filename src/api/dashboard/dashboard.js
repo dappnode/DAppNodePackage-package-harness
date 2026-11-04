@@ -217,15 +217,6 @@ function renderPhaseTimeline(job) {
     );
     stream.append(line);
   });
-  if (job.phase === "finished" && history.at(-1)?.phase !== "finished") {
-    const line = node("div", "event-line is-current");
-    line.append(
-      node("time", null, "timestamp unavailable"),
-      node("code", null, "phase=finished · normalized legacy record"),
-      node("span", null, "acknowledged"),
-    );
-    stream.append(line);
-  }
   if (!history.length) stream.append(node("p", "diagnostic-empty", "No phase events recorded."));
   section.append(stream);
   return section;
@@ -235,12 +226,7 @@ function renderWorkerDiagnostics(job) {
   const diagnostics = job.diagnostics;
   const section = diagnosticSection("Worker & delivery");
   const grid = node("div", "diagnostic-kv");
-  const recovery = diagnostics.targetRecovery;
-  const recoveryValue = recovery
-    ? recovery.action === "restore"
-      ? `restore · ${compactRef(recovery.baseline_ref || recovery.baselineRef)}`
-      : humanize(recovery.action)
-    : "None";
+  const recoveryValue = diagnostics.cleanupRequired ? humanize(diagnostics.targetRecovery) : "None";
   [
     ["Execution", humanize(job.status)],
     ["Current stage", humanize(job.phase)],
@@ -617,10 +603,9 @@ function renderLocalRecovery() {
   const titles = {
     cleanup: "Manual cleanup must be verified",
     completion_conflict: "Completion conflicts with Tropibot",
-    manual: "Manual recovery required",
   };
-  elements.localRecoveryTitle.textContent = titles[job.recoveryKind] || titles.manual;
-  elements.localRecoveryKind.textContent = humanize(job.recoveryKind || "manual");
+  elements.localRecoveryTitle.textContent = titles[job.recoveryKind];
+  elements.localRecoveryKind.textContent = humanize(job.recoveryKind);
   elements.localRecoveryReason.textContent = job.manualRecoveryReason;
   elements.localRecoveryContext.replaceChildren(
     recoveryContextItem("Package", job.dnpName),

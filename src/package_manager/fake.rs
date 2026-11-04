@@ -4,7 +4,7 @@ use async_trait::async_trait;
 
 use crate::model::{
     ContainerLog, ContainerSnapshot, DnpName, PackageDetails, PackageLogs, PackageRef,
-    PackageSummary, PreviewSummary,
+    PackageSummary, PreviewSummary, ipfs_cid,
 };
 
 use super::{PackageManager, PackageManagerError, REQUIRED_MCP_TOOLS, ToolAvailability};
@@ -84,6 +84,8 @@ impl PackageManager for FakePackageManager {
         Ok(PackageDetails {
             dnp_name: installed_name,
             version: Some(version.clone()),
+            // Like Dappmanager, only IPFS installs record an origin.
+            origin: ipfs_cid(&version).map(|_| version.clone()),
             containers: vec![ContainerSnapshot {
                 name: format!("{}-service", dnp_name.as_str()),
                 service_name: Some("service".to_owned()),
@@ -129,7 +131,10 @@ impl PackageManager for FakePackageManager {
                     .map(ToString::to_string)
                     .unwrap_or_else(|| "1.0.0-fake-baseline".to_owned()),
             ),
-            resolved_ref: version.map(ToString::to_string),
+            // Dappmanager resolves an origin only for IPFS references.
+            resolved_ref: version
+                .filter(|version| ipfs_cid(version.as_str()).is_some())
+                .map(ToString::to_string),
             image_count: Some(1),
             requires_user_input: false,
             summary: "fake install preview".to_owned(),

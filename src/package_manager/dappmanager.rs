@@ -1,18 +1,16 @@
-use std::{
-    future::Future,
-    time::{Duration, Instant},
-};
+use std::{future::Future, time::Duration};
 
 use async_trait::async_trait;
 use dappnode_mcp_client::{DappnodeMcpClient, DappnodeMcpError};
 use dappnode_types::{ContainerState, InstallOptions};
+use tokio::time::Instant;
 use tracing::{info, warn};
 
 use crate::{
     analysis::redaction::{redact_and_bound_single_line, truncate_utf8},
     model::{
         ContainerLog, ContainerSnapshot, DnpName, PackageDetails, PackageLogs, PackageRef,
-        PackageSummary, PreviewSummary,
+        PackageSummary, PreviewSummary, ipfs_cid,
     },
 };
 
@@ -101,6 +99,24 @@ impl DappmanagerPackageManager {
                     return Ok(());
                 }
                 Err(error) if operation_in_progress_error(&error.to_string()) => {
+                    return self
+                        .await_in_progress(tool, dnp_name, requested_ref, error, &mut reconcile)
+                        .await;
+                }
+                // Dappmanager does not cancel a mutation when its caller stops
+                // waiting, so a timed-out request is most likely still running.
+                // Sending it again would start a second, concurrent install of
+                // the same package, which races the first one in Docker.
+                Err(error @ DappnodeMcpError::Timeout { .. }) => {
+                    warn!(
+                        event = "mcp_mutation_unconfirmed",
+                        tool,
+                        dnp_name = %dnp_name,
+                        requested_ref = requested_ref.unwrap_or("none"),
+                        attempt,
+                        duration_ms = started.elapsed().as_millis() as u64,
+                        "Dappmanager did not answer in time; waiting for the requested state instead of resending"
+                    );
                     return self
                         .await_in_progress(tool, dnp_name, requested_ref, error, &mut reconcile)
                         .await;
@@ -226,7 +242,7 @@ impl DappmanagerPackageManager {
                     self.mutation_client
                         .install_package(dnp_name, version, &user_settings, options)
                 },
-                || async { self.client.get_package_details(dnp_name).await.is_ok() },
+                || self.installed_as_requested(dnp_name, version),
             )
             .await
         {
@@ -253,27 +269,71 @@ impl DappmanagerPackageManager {
                 self.mutation_client
                     .update_package(dnp_name, Some(version), options)
             },
-            // Candidate refs are usually IPFS hashes, so compare against the
-            // version the preview resolves rather than the ref itself.
-            || async {
-                let Some(installed) = self
-                    .client
-                    .get_package_details(dnp_name)
-                    .await
-                    .ok()
-                    .and_then(|details| details.version)
-                else {
-                    return false;
-                };
-                self.preview_install(dnp_name, Some(version))
-                    .await
-                    .ok()
-                    .and_then(|preview| preview.semantic_version().map(str::to_owned))
-                    .is_some_and(|expected| installed.to_string() == expected)
-            },
+            || self.installed_as_requested(dnp_name, Some(version)),
         )
         .await
         .map_err(package_error)
+    }
+
+    /// Whether the package is installed exactly as `version` requests, so an
+    /// unanswered install or update can be confirmed without resending it.
+    ///
+    /// An IPFS reference must match the install origin Dappmanager records:
+    /// the version alone cannot tell a candidate build from a baseline with
+    /// the same version. A registry reference must resolve to the installed
+    /// version, and the package must not still be an IPFS install.
+    async fn installed_as_requested(
+        &self,
+        dnp_name: &DnpName,
+        version: Option<&PackageRef>,
+    ) -> bool {
+        let Ok(details) = self.client.get_package_details(dnp_name).await else {
+            return false;
+        };
+        let installed_version = details.version.map(|version| version.to_string());
+        match installed_check(
+            details.origin.as_deref(),
+            installed_version.as_deref(),
+            version,
+        ) {
+            InstalledCheck::Matches => true,
+            InstalledCheck::Differs => false,
+            InstalledCheck::CompareResolvedVersion(installed) => self
+                .preview_install(dnp_name, version)
+                .await
+                .ok()
+                .is_some_and(|preview| preview.semantic_version() == Some(installed)),
+        }
+    }
+}
+
+/// What the installed package says about a requested install reference.
+#[derive(Debug, PartialEq, Eq)]
+enum InstalledCheck<'a> {
+    Matches,
+    Differs,
+    /// A registry reference; it matches when it resolves to this version.
+    CompareResolvedVersion(&'a str),
+}
+
+fn installed_check<'a>(
+    installed_origin: Option<&str>,
+    installed_version: Option<&'a str>,
+    requested: Option<&PackageRef>,
+) -> InstalledCheck<'a> {
+    let installed_cid = installed_origin.and_then(ipfs_cid);
+    if let Some(requested_cid) = requested.and_then(|requested| ipfs_cid(requested.as_str())) {
+        return if installed_cid == Some(requested_cid) {
+            InstalledCheck::Matches
+        } else {
+            InstalledCheck::Differs
+        };
+    }
+    // Registry installs record no origin, so an IPFS origin means the
+    // requested release has not replaced an IPFS build yet.
+    match (installed_cid, installed_version) {
+        (None, Some(installed)) => InstalledCheck::CompareResolvedVersion(installed),
+        _ => InstalledCheck::Differs,
     }
 }
 
@@ -327,6 +387,7 @@ impl PackageManager for DappmanagerPackageManager {
         Ok(PackageDetails {
             dnp_name: details.dnp_name,
             version: details.version.map(|version| version.to_string()),
+            origin: details.origin,
             containers: details
                 .containers
                 .into_iter()
@@ -533,7 +594,8 @@ fn package_absent_error(message: &str) -> bool {
 
 fn retryable_mutation_error(error: &DappnodeMcpError) -> bool {
     match error {
-        DappnodeMcpError::Timeout { .. } => true,
+        // A timed-out mutation may still be running, so it is awaited, never resent.
+        DappnodeMcpError::Timeout { .. } => false,
         DappnodeMcpError::Transport { message, .. } => retryable_transport_message(message),
         DappnodeMcpError::Tool { message, .. } => retryable_tool_message(message),
         DappnodeMcpError::Configuration { .. }
@@ -552,18 +614,23 @@ fn retry_delay(initial: Duration, failed_attempt: usize) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use std::{error::Error, time::Duration};
+    use std::{
+        error::Error,
+        future::ready,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
 
     use crate::{
-        model::{RunRequest, RunRequestDto},
+        model::{DnpName, PackageRef, RunRequest, RunRequestDto},
         package_manager::PackageManagerError,
     };
 
     use dappnode_mcp_client::DappnodeMcpError;
 
     use super::{
-        DappmanagerPackageManager, install_options, operation_in_progress_error,
-        package_absent_error, retryable_mutation_error,
+        DappmanagerPackageManager, InstalledCheck, install_options, installed_check,
+        operation_in_progress_error, package_absent_error, retryable_mutation_error,
     };
 
     #[test]
@@ -616,6 +683,165 @@ mod tests {
             operation: "connect".to_owned(),
             message: "connection reset".to_owned(),
         }));
+    }
+
+    fn manager_for_retry_tests() -> Result<DappmanagerPackageManager, PackageManagerError> {
+        DappmanagerPackageManager::new(
+            "http://dappmanager.example/mcp".to_owned(),
+            "token".to_owned(),
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+            3,
+            Duration::from_millis(100),
+        )
+    }
+
+    fn timeout_error() -> DappnodeMcpError {
+        DappnodeMcpError::Timeout {
+            operation: "dappnode_update_package".to_owned(),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_mutation_is_awaited_not_resent() -> Result<(), Box<dyn Error>> {
+        let manager = manager_for_retry_tests()?;
+        let dnp_name = DnpName::parse("dms.dnp.dappnode.eth")?;
+        let sends = AtomicUsize::new(0);
+        let checks = AtomicUsize::new(0);
+
+        let result = manager
+            .retry_mutation(
+                "dappnode_update_package",
+                &dnp_name,
+                Some("/ipfs/QmCandidate"),
+                || {
+                    sends.fetch_add(1, Ordering::SeqCst);
+                    ready(Err(timeout_error()))
+                },
+                // The original request finishes on Dappmanager's side a few polls later.
+                || ready(checks.fetch_add(1, Ordering::SeqCst) >= 2),
+            )
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+        assert_eq!(checks.load(Ordering::SeqCst), 3);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_mutation_that_never_completes_fails_without_resending()
+    -> Result<(), Box<dyn Error>> {
+        let manager = manager_for_retry_tests()?;
+        let dnp_name = DnpName::parse("dms.dnp.dappnode.eth")?;
+        let sends = AtomicUsize::new(0);
+
+        let result = manager
+            .retry_mutation(
+                "dappnode_update_package",
+                &dnp_name,
+                Some("/ipfs/QmCandidate"),
+                || {
+                    sends.fetch_add(1, Ordering::SeqCst);
+                    ready(Err(timeout_error()))
+                },
+                || ready(false),
+            )
+            .await;
+
+        assert!(matches!(result, Err(DappnodeMcpError::Timeout { .. })));
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_download_is_still_retried() -> Result<(), Box<dyn Error>> {
+        let manager = manager_for_retry_tests()?;
+        let dnp_name = DnpName::parse("dms.dnp.dappnode.eth")?;
+        let sends = AtomicUsize::new(0);
+
+        let result = manager
+            .retry_mutation(
+                "dappnode_update_package",
+                &dnp_name,
+                Some("/ipfs/QmCandidate"),
+                || {
+                    // Dappmanager reported the failure itself, so the first attempt is over.
+                    if sends.fetch_add(1, Ordering::SeqCst) == 0 {
+                        ready(Err(DappnodeMcpError::Tool {
+                            tool: "dappnode_update_package".to_owned(),
+                            message: "Can't download dms.dnp.dappnode.eth image: terminated"
+                                .to_owned(),
+                        }))
+                    } else {
+                        ready(Ok(()))
+                    }
+                },
+                || ready(false),
+            )
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(sends.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn ipfs_requests_match_only_their_install_origin() -> Result<(), Box<dyn Error>> {
+        let candidate = PackageRef::parse("/ipfs/QmVQ2ei1wmizEAQvoZj1gaNDhh2rrm9mWdjxuEYFhZFiNS")?;
+        // The same build, reported in another reference form.
+        assert_eq!(
+            installed_check(
+                Some("ipfs://QmVQ2ei1wmizEAQvoZj1gaNDhh2rrm9mWdjxuEYFhZFiNS"),
+                Some("0.1.10"),
+                Some(&candidate)
+            ),
+            InstalledCheck::Matches
+        );
+        // The baseline still runs with the same version: not yet updated.
+        assert_eq!(
+            installed_check(None, Some("0.1.10"), Some(&candidate)),
+            InstalledCheck::Differs
+        );
+        assert_eq!(
+            installed_check(
+                Some("/ipfs/QmSBi96gxQ8UDvT96xSVfbBoEpVWDm4MPkNxNzHJ8sRWPJ"),
+                Some("0.1.10"),
+                Some(&candidate)
+            ),
+            InstalledCheck::Differs
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn registry_requests_compare_resolved_versions_of_registry_installs()
+    -> Result<(), Box<dyn Error>> {
+        let release = PackageRef::parse("0.1.9")?;
+        assert_eq!(
+            installed_check(None, Some("0.1.9"), Some(&release)),
+            InstalledCheck::CompareResolvedVersion("0.1.9")
+        );
+        assert_eq!(
+            installed_check(None, Some("0.1.9"), None),
+            InstalledCheck::CompareResolvedVersion("0.1.9")
+        );
+        // An IPFS build has not been replaced by the requested release yet.
+        assert_eq!(
+            installed_check(
+                Some("/ipfs/QmVQ2ei1wmizEAQvoZj1gaNDhh2rrm9mWdjxuEYFhZFiNS"),
+                Some("0.1.9"),
+                None
+            ),
+            InstalledCheck::Differs
+        );
+        assert_eq!(installed_check(None, None, None), InstalledCheck::Differs);
+        Ok(())
+    }
+
+    #[test]
+    fn timeouts_are_not_classified_as_resendable() {
+        assert!(!retryable_mutation_error(&timeout_error()));
     }
 
     #[test]

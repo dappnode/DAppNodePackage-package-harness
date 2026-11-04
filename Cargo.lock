@@ -287,9 +287,9 @@ dependencies = [
 
 [[package]]
 name = "dappnode-mcp-client"
-version = "0.1.1"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc79e6e97e3c60fb28f7215681e70759c685b186cb50e236abe8476c0790185d"
+checksum = "7dafb14d082ba2371899db716327c88e1537b9b17b747140c058b7aa72757409"
 dependencies = [
  "dappnode-types",
  "reqwest",
@@ -331,9 +331,9 @@ dependencies = [
 
 [[package]]
 name = "dappnode-types"
-version = "0.1.1"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d8ed44fdd7c8b1a3e5c0d5fe9727a16123ff54b08e6a9f63f1bf64df9926ff6"
+checksum = "f25374b32db393584161bc1708eab5fa9af29d3e2e274a2553c37c88166b0862"
 dependencies = [
  "semver",
  "serde",

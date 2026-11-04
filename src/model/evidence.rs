@@ -26,7 +26,39 @@ pub struct ContainerSnapshot {
 pub struct PackageDetails {
     pub dnp_name: DnpName,
     pub version: Option<String>,
+    /// Exact reference the package was installed from. Dappmanager reports it
+    /// only for IPFS installs, so it tells apart two builds with one version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
     pub containers: Vec<ContainerSnapshot>,
+}
+
+/// Content identifier of an IPFS package reference or install origin.
+///
+/// Accepts the forms Dappmanager uses (`/ipfs/<cid>`, `ipfs://<cid>`, or a
+/// bare CID). Registry references such as `1.2.3` or `*` have none.
+pub fn ipfs_cid(reference: &str) -> Option<&str> {
+    let reference = reference.trim();
+    let (cid, prefixed) = match reference
+        .strip_prefix("/ipfs/")
+        .or_else(|| reference.strip_prefix("ipfs://"))
+    {
+        Some(cid) => (cid, true),
+        None => (reference, false),
+    };
+    let cid = cid.trim_end_matches('/');
+    let bare_cid =
+        (cid.len() == 46 && cid.starts_with("Qm")) || (cid.len() > 50 && cid.starts_with("baf"));
+    let well_formed = !cid.is_empty() && cid.chars().all(|c| c.is_ascii_alphanumeric());
+    (well_formed && (prefixed || bare_cid)).then_some(cid)
+}
+
+/// Whether an installed package's origin is the one a request resolved to.
+///
+/// Registry installs have no origin, so two registry references are equal
+/// here; the caller compares versions for those.
+pub fn same_install_origin(expected: Option<&str>, installed: Option<&str>) -> bool {
+    expected.and_then(ipfs_cid) == installed.and_then(ipfs_cid)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,4 +158,44 @@ pub struct ComparisonEvidence {
     pub baseline_logs_collected: bool,
     pub candidate_logs_collected: bool,
     pub deterministic_regressions: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ipfs_cid, same_install_origin};
+
+    const CID: &str = "QmVQ2ei1wmizEAQvoZj1gaNDhh2rrm9mWdjxuEYFhZFiNS";
+
+    #[test]
+    fn extracts_cid_from_every_ipfs_reference_form() {
+        assert_eq!(ipfs_cid(&format!("/ipfs/{CID}")), Some(CID));
+        assert_eq!(ipfs_cid(&format!("ipfs://{CID}")), Some(CID));
+        assert_eq!(ipfs_cid(&format!(" /ipfs/{CID}/ ")), Some(CID));
+        assert_eq!(ipfs_cid(CID), Some(CID));
+        assert_eq!(ipfs_cid("/ipfs/QmCandidate"), Some("QmCandidate"));
+    }
+
+    #[test]
+    fn registry_references_have_no_cid() {
+        assert_eq!(ipfs_cid("0.1.10"), None);
+        assert_eq!(ipfs_cid("*"), None);
+        assert_eq!(ipfs_cid("QmShort"), None);
+        assert_eq!(ipfs_cid("/ipfs/"), None);
+        assert_eq!(ipfs_cid("/ipfs/Qm bad"), None);
+    }
+
+    #[test]
+    fn compares_install_origins_by_cid() {
+        let path = format!("/ipfs/{CID}");
+        let uri = format!("ipfs://{CID}");
+        assert!(same_install_origin(Some(&path), Some(&uri)));
+        assert!(same_install_origin(None, None));
+        // A registry release and an IPFS build of the same version differ.
+        assert!(!same_install_origin(None, Some(&path)));
+        assert!(!same_install_origin(Some(&path), None));
+        assert!(!same_install_origin(
+            Some(&path),
+            Some("/ipfs/QmSBi96gxQ8UDvT96xSVfbBoEpVWDm4MPkNxNzHJ8sRWPJ")
+        ));
+    }
 }

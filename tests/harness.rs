@@ -24,7 +24,7 @@ use dappnode_package_harness::{
         CleanupStatus, ContainerLog, ContainerSnapshot, DnpName, ExecutionPhase, ExecutionStatus,
         ExplicitPackageResolver, LogAnalysisInput, ManualRecoveryKind, PackageDetails, PackageLogs,
         PackageRef, PackageSummary, PreviewSummary, ReasonCode, RunRecord, RunRequest,
-        RunRequestDto, TargetRecoveryPlan, Verdict, WorkerErrorCode,
+        RunRequestDto, TargetRecoveryPlan, Verdict, WorkerErrorCode, ipfs_cid,
     },
     package_manager::{PackageManager, PackageManagerError, REQUIRED_MCP_TOOLS, ToolAvailability},
     runner::{
@@ -87,6 +87,8 @@ struct ScriptedState {
     installed: bool,
     candidate: bool,
     version: String,
+    /// Install origin, recorded like Dappmanager does: only for IPFS refs.
+    origin: Option<String>,
     install_calls: usize,
     update_versions: Vec<String>,
     cleanup_calls: usize,
@@ -133,6 +135,22 @@ impl ScriptedPackageManager {
         let mut state = self.state()?;
         state.installed = true;
         state.version = version.to_owned();
+        state.origin = ipfs_origin(version);
+        drop(state);
+        Ok(self)
+    }
+
+    /// Installs a build that reports `version` but came from `origin`, as an
+    /// IPFS candidate build that kept the released version would.
+    fn with_installed_build(
+        self,
+        version: &str,
+        origin: &str,
+    ) -> Result<Self, PackageManagerError> {
+        let mut state = self.state()?;
+        state.installed = true;
+        state.version = version.to_owned();
+        state.origin = Some(origin.to_owned());
         drop(state);
         Ok(self)
     }
@@ -184,6 +202,8 @@ impl ScriptedPackageManager {
         }
         state.installed = true;
         state.candidate = false;
+        state.origin =
+            ipfs_origin(version.map_or(self.latest_release.1.as_str(), PackageRef::as_str));
         state.version = version.map_or_else(
             || self.latest_release.0.clone(),
             |version| {
@@ -252,7 +272,9 @@ impl PackageManager for ScriptedPackageManager {
         } else {
             self.baseline_running
         };
-        Ok(details(dnp_name, &state.version, running, "service"))
+        let mut details = details(dnp_name, &state.version, running, "service");
+        details.origin = state.origin;
+        Ok(details)
     }
 
     async fn get_package_logs(
@@ -285,7 +307,7 @@ impl PackageManager for ScriptedPackageManager {
             || {
                 (
                     Some(self.latest_release.0.clone()),
-                    Some(self.latest_release.1.clone()),
+                    ipfs_origin(&self.latest_release.1),
                 )
             },
             |version| {
@@ -296,7 +318,7 @@ impl PackageManager for ScriptedPackageManager {
                             .filter(|_| version.as_str() == "/ipfs/QmCandidate")
                             .unwrap_or_else(|| version.to_string()),
                     ),
-                    Some(version.to_string()),
+                    ipfs_origin(version.as_str()),
                 )
             },
         );
@@ -347,6 +369,7 @@ impl PackageManager for ScriptedPackageManager {
         state.installed =
             !(self.candidate_removes_target && version.as_str() == "/ipfs/QmCandidate");
         state.candidate = version.as_str() == "/ipfs/QmCandidate";
+        state.origin = ipfs_origin(version.as_str());
         state.version = if version.as_str() == self.latest_release.1 {
             self.latest_release.0.clone()
         } else if let Some(candidate_version) = self
@@ -384,10 +407,17 @@ impl PackageManager for ScriptedPackageManager {
     }
 }
 
+/// Dappmanager records an install origin and resolves a preview origin only
+/// for IPFS references.
+fn ipfs_origin(reference: &str) -> Option<String> {
+    ipfs_cid(reference).map(|_| reference.to_owned())
+}
+
 fn details(dnp_name: &DnpName, version: &str, running: bool, name: &str) -> PackageDetails {
     PackageDetails {
         dnp_name: dnp_name.clone(),
         version: Some(version.to_owned()),
+        origin: None,
         containers: vec![ContainerSnapshot {
             name: name.to_owned(),
             service_name: Some(name.to_owned()),
@@ -661,6 +691,76 @@ async fn candidate_update_that_does_not_apply_is_an_infrastructure_error()
     assert!(result.summary.contains("instead of 2.0.0"));
     assert!(record.evidence.candidate.is_some());
     assert_eq!(record.cleanup.status, CleanupStatus::Passed);
+    Ok(())
+}
+
+#[tokio::test]
+async fn same_version_candidate_is_verified_by_install_origin() -> Result<(), Box<dyn Error>> {
+    // The candidate build keeps the baseline's version, so only the install
+    // origin shows whether the update was applied.
+    let applied = request("same-version-candidate-applied")?;
+    let mut manager = ScriptedPackageManager::new(applied.package.dnp_name.clone());
+    manager.candidate_version = Some("baseline".to_owned());
+    let (_directory, _store, record) =
+        execute_with(applied, Arc::new(manager), &NoopRunProgress).await?;
+    assert_eq!(
+        record.result.ok_or("missing result")?.verdict,
+        Verdict::Passed
+    );
+
+    let noop = request("same-version-candidate-noop")?;
+    let mut manager = ScriptedPackageManager::new(noop.package.dnp_name.clone());
+    manager.candidate_version = Some("baseline".to_owned());
+    manager.candidate_update_noop = true;
+    let (_directory, _store, record) =
+        execute_with(noop, Arc::new(manager), &NoopRunProgress).await?;
+    let result = record.result.ok_or("missing result")?;
+    assert_eq!(result.verdict, Verdict::InfrastructureError);
+    assert_eq!(result.reason_code, ReasonCode::CandidateInstallFailed);
+    assert!(
+        result
+            .summary
+            .contains("installed from /ipfs/QmLatestBaseline instead of /ipfs/QmCandidate"),
+        "unexpected summary: {}",
+        result.summary
+    );
+    assert_eq!(record.cleanup.status, CleanupStatus::Passed);
+    Ok(())
+}
+
+#[tokio::test]
+async fn installed_baseline_is_reused_only_from_the_resolved_origin() -> Result<(), Box<dyn Error>>
+{
+    let matching = request("installed-baseline-same-origin")?;
+    let manager = Arc::new(
+        ScriptedPackageManager::new(matching.package.dnp_name.clone())
+            .with_installed_build("baseline", "/ipfs/QmLatestBaseline")?,
+    );
+    let observation = Arc::clone(&manager);
+    let (_directory, _store, record) = execute_with(matching, manager, &NoopRunProgress).await?;
+    assert_eq!(
+        record.result.ok_or("missing result")?.verdict,
+        Verdict::Passed
+    );
+    assert_eq!(observation.install_calls()?, 1, "only cleanup reinstalls");
+
+    // An earlier IPFS build with the released version is not the baseline.
+    let other_build = request("installed-baseline-other-origin")?;
+    let manager = Arc::new(
+        ScriptedPackageManager::new(other_build.package.dnp_name.clone())
+            .with_installed_build("baseline", "/ipfs/QmEarlierCandidateBuild")?,
+    );
+    let observation = Arc::clone(&manager);
+    let (_directory, _store, record) = execute_with(other_build, manager, &NoopRunProgress).await?;
+    assert_eq!(
+        record.result.ok_or("missing result")?.verdict,
+        Verdict::Passed
+    );
+    assert_eq!(
+        observation.install_calls()?,
+        2,
+        "the baseline and the cleanup restore are both fresh installs"
+    );
     Ok(())
 }
 

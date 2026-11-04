@@ -11,9 +11,9 @@ use crate::{
     },
     clock::Clock,
     model::{
-        CaptureEvidence, CleanupStatus, ExecutionPhase, ExecutionStatus, LogAnalysisInput,
+        CaptureEvidence, CleanupStatus, DnpName, ExecutionPhase, ExecutionStatus, LogAnalysisInput,
         PackageResolver, ReasonCode, RunError, RunId, RunRecord, StabilizationResult, StepStatus,
-        TargetRecoveryPlan, Verdict,
+        TargetRecoveryPlan, Verdict, same_install_origin,
     },
     package_manager::{PackageManager, PackageManagerError},
     runner::{
@@ -374,7 +374,7 @@ impl RunController {
             .map_err(|error| package_failure(error, ReasonCode::BaselineUnavailable))?;
         let baseline_resolved_ref = baseline_preview.resolved_ref.clone();
         let baseline_expected_version = baseline_preview.version.clone();
-        let reuse_installed_baseline = installed_baseline.is_some_and(|installed| {
+        let installed_version_matches = installed_baseline.is_some_and(|installed| {
             let Some(installed_version) = installed.version.as_deref() else {
                 return false;
             };
@@ -388,6 +388,20 @@ impl RunController {
                 |resolved_version| resolved_version == installed_version,
             )
         });
+        // An earlier IPFS build can share its version with the requested
+        // release, so the install origin has to match as well.
+        let reuse_installed_baseline = installed_version_matches
+            && self
+                .installed_origin_matches(&package.dnp_name, baseline_resolved_ref.as_deref())
+                .await;
+        if installed_version_matches && !reuse_installed_baseline {
+            info!(
+                event = "installed_baseline_origin_mismatch",
+                run_id = %record.request.run_id,
+                dnp_name = %package.dnp_name,
+                "Installed target has the baseline version but another install origin; reinstalling the baseline"
+            );
+        }
         info!(
             event = "baseline_preview_ready",
             run_id = %record.request.run_id,
@@ -788,6 +802,16 @@ impl RunController {
         self.save(record).await.map_err(persistence_failure)
     }
 
+    /// Whether the installed target came from `expected` (an IPFS origin, or
+    /// `None` for a registry release). Unreadable details count as no match,
+    /// which reinstalls the baseline instead of reusing an unknown build.
+    async fn installed_origin_matches(&self, dnp_name: &DnpName, expected: Option<&str>) -> bool {
+        self.package_manager
+            .get_package_details(dnp_name)
+            .await
+            .is_ok_and(|details| same_install_origin(expected, details.origin.as_deref()))
+    }
+
     async fn authorize_cleanup(
         &self,
         record: &mut RunRecord,
@@ -850,8 +874,10 @@ fn logs_for_analysis(capture: &CaptureEvidence) -> Vec<(Option<String>, String)>
 }
 
 /// Fails when Dappmanager reported a mutation as applied but the package
-/// still reports another version than the preview resolved. Without this, a
-/// no-op update would compare the baseline with itself and pass.
+/// still reports another version or install origin than the preview
+/// resolved. Without this, a no-op update would compare the baseline with
+/// itself and pass. The origin check matters when a candidate build keeps
+/// the baseline's version.
 fn applied_version(
     capture: &CaptureEvidence,
     side: &str,
@@ -865,16 +891,36 @@ fn applied_version(
         .details
         .as_ref()
         .and_then(|details| details.version.as_deref());
-    match (expected, reported) {
-        (Some(expected), Some(reported)) if expected != reported => Err(Failure {
+    if let (Some(expected), Some(reported)) = (expected, reported)
+        && expected != reported
+    {
+        return Err(Failure {
             verdict: Verdict::InfrastructureError,
             reason,
             summary: format!(
                 "Dappmanager reported the {side} as installed, but the package reports version {reported} instead of {expected}"
             ),
-        }),
-        _ => Ok(()),
+        });
     }
+    if let Some(details) = capture.details.as_ref() {
+        let expected_origin = capture
+            .preview
+            .as_ref()
+            .and_then(|preview| preview.resolved_ref.as_deref());
+        let reported_origin = details.origin.as_deref();
+        if !same_install_origin(expected_origin, reported_origin) {
+            return Err(Failure {
+                verdict: Verdict::InfrastructureError,
+                reason,
+                summary: format!(
+                    "Dappmanager reported the {side} as installed, but the package was installed from {} instead of {}",
+                    reported_origin.unwrap_or("the registry"),
+                    expected_origin.unwrap_or("the registry")
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn package_failure(error: PackageManagerError, operation_reason: ReasonCode) -> Failure {

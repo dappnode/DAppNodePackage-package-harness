@@ -18,7 +18,7 @@ For every accepted job, the deterministic controller:
 
 1. verifies Dappmanager MCP tools and target safety;
 2. checks whether the target is already installed and persists whether cleanup must restore or remove it;
-3. previews the requested `baselineRef`, or previews the latest published release when it was omitted, and reuses an installed package only when its version matches that resolved baseline;
+3. previews the requested `baselineRef`, or previews the latest published release when it was omitted, and reuses an installed package only when both its version and its install origin match that resolved baseline (an IPFS build can share a released version);
 4. waits for a stable, non-empty all-running container set;
 5. captures normalized details and bounded, redacted log tails;
 6. upgrades the baseline in place to the candidate;
@@ -41,7 +41,7 @@ PACKAGE_HARNESS_HEARTBEAT_SECONDS=20
 
 The shared bearer token is appropriate for this small trusted v1 deployment. The protocol deliberately leaves room for later per-worker credentials or mTLS, but neither is part of this version. The worker never logs the token.
 
-Use [`.env.example`](.env.example) for all timeout, Dappmanager, cleanup, and optional Nexus settings. `MCP_TIMEOUT_MS` bounds read-only Dappmanager calls at 30 seconds by default, while `MCP_MUTATION_TIMEOUT_MS` gives each install, update, or removal attempt 30 minutes by default (up to one hour). Transient transport and package-download failures are retried three times with bounded exponential backoff; tune this with `MCP_MUTATION_ATTEMPTS` and `MCP_MUTATION_RETRY_DELAY_MS`. `NEXUS_TIMEOUT_MS` gives advisory Nexus analysis five minutes by default. If the target package was installed before a run, cleanup preserves its volumes and freshly installs the latest published release; otherwise cleanup removes the target and its volumes. The pre-run package version never replaces the requested baseline. `TROPIBOT_TIMEOUT_MS` bounds each coordinator request. The Dappmanager MCP token and Nexus key remain local and are never sent to Tropibot or persisted in a job record.
+Use [`.env.example`](.env.example) for all timeout, Dappmanager, cleanup, and optional Nexus settings. `MCP_TIMEOUT_MS` bounds read-only Dappmanager calls at 30 seconds by default, while `MCP_MUTATION_TIMEOUT_MS` gives each install, update, or removal attempt 30 minutes by default (up to one hour). Transient transport and package-download failures are retried three times with bounded exponential backoff; tune this with `MCP_MUTATION_ATTEMPTS` and `MCP_MUTATION_RETRY_DELAY_MS`. A mutation that exceeds its deadline is never resent, because Dappmanager keeps running it: the harness instead polls for the requested state for up to another `MCP_MUTATION_TIMEOUT_MS` and fails the step if it is not reached. `NEXUS_TIMEOUT_MS` gives advisory Nexus analysis five minutes by default. If the target package was installed before a run, cleanup preserves its volumes and freshly installs the latest published release; otherwise cleanup removes the target and its volumes. The pre-run package version never replaces the requested baseline. `TROPIBOT_TIMEOUT_MS` bounds each coordinator request. The Dappmanager MCP token and Nexus key remain local and are never sent to Tropibot or persisted in a job record.
 
 ## Local fake mode
 

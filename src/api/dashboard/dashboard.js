@@ -9,10 +9,13 @@ const state = {
   lostJobFingerprint: "",
   worker: null,
   expandedJobs: loadExpandedJobs(),
+  // Selected detail tab per run, kept across the periodic re-render.
+  jobTabs: new Map(),
 };
 
 const elements = {
   jobs: document.querySelector("#jobs"),
+  jobTable: document.querySelector("#job-table"),
   empty: document.querySelector("#empty-state"),
   error: document.querySelector("#error-notice"),
   workerState: document.querySelector("#worker-state"),
@@ -41,13 +44,16 @@ const elements = {
   localRecoveryExplanation: document.querySelector("#local-recovery-explanation"),
   localRecoveryActions: document.querySelector("#local-recovery-actions"),
   drainLifecycle: document.querySelector("#drain-lifecycle"),
-  drainMessage: document.querySelector("#drain-message"),
   drainCurrentJob: document.querySelector("#drain-current-job"),
   drainSafety: document.querySelector("#drain-safety"),
   drainStatus: document.querySelector("#drain-status"),
   drainWorker: document.querySelector("#drain-worker"),
   resumeWorker: document.querySelector("#resume-worker"),
 };
+
+/* -------------------------------------------------------------------------
+   Formatting
+   ------------------------------------------------------------------------- */
 
 function humanize(value) {
   if (!value) return "Unknown";
@@ -74,6 +80,17 @@ function formatDate(value) {
   }).format(date);
 }
 
+function formatTime(value) {
+  if (!value) return "—";
+  const date = new Date(value);
+  if (Number.isNaN(date.valueOf())) return value;
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).format(date);
+}
+
 function relativeTime(value) {
   if (!value) return "Not started";
   const date = new Date(value);
@@ -84,81 +101,6 @@ function relativeTime(value) {
   if (absolute < 3600) return formatter.format(Math.round(seconds / 60), "minute");
   if (absolute < 86400) return formatter.format(Math.round(seconds / 3600), "hour");
   return formatter.format(Math.round(seconds / 86400), "day");
-}
-
-function node(tag, className, text) {
-  const element = document.createElement(tag);
-  if (className) element.className = className;
-  if (text !== undefined) element.textContent = text;
-  return element;
-}
-
-function loadExpandedJobs() {
-  try {
-    return new Set(JSON.parse(sessionStorage.getItem("expandedHarnessJobs") || "[]"));
-  } catch {
-    return new Set();
-  }
-}
-
-function persistExpandedJobs() {
-  try {
-    sessionStorage.setItem(
-      "expandedHarnessJobs",
-      JSON.stringify([...state.expandedJobs]),
-    );
-  } catch {
-    // The dashboard still works when browser storage is unavailable.
-  }
-}
-
-function badge(value) {
-  return node("span", `badge ${value || "pending"}`, humanize(value || "pending"));
-}
-
-function detail(label, value) {
-  const wrapper = node("div");
-  wrapper.append(node("span", "detail-label", label));
-  const content = node("span", "detail-value");
-  if (value && typeof value === "object" && "nodeType" in value) {
-    content.append(value);
-  } else {
-    content.textContent = value || "—";
-  }
-  wrapper.append(content);
-  return wrapper;
-}
-
-function externalLink(label, href) {
-  const link = node("a", "external-link", label);
-  link.href = href;
-  link.target = "_blank";
-  link.rel = "noopener noreferrer";
-  return link;
-}
-
-async function readJson(response, failureLabel = "Request failed") {
-  let payload;
-  try {
-    payload = await response.json();
-  } catch {
-    throw new Error(`${failureLabel}: invalid JSON response (${response.status})`);
-  }
-  if (!response.ok) {
-    throw new Error(payload?.error || `${failureLabel} (${response.status})`);
-  }
-  return payload;
-}
-
-function repositoryLinks(job) {
-  const links = node("span", "inline-links");
-  const repositoryUrl = `https://github.com/${job.repository}`;
-  links.append(
-    externalLink(job.repository, repositoryUrl),
-    node("span", null, " · "),
-    externalLink(`PR #${job.pullRequest}`, `${repositoryUrl}/pull/${job.pullRequest}`),
-  );
-  return links;
 }
 
 function formatDuration(milliseconds) {
@@ -177,280 +119,8 @@ function elapsedBetween(start, end) {
   return Number.isFinite(duration) ? duration : null;
 }
 
-function diagnosticTable(headers, rows) {
-  const wrapper = node("div", "diagnostic-table-wrap");
-  const table = node("table", "diagnostic-table");
-  const head = node("thead");
-  const headRow = node("tr");
-  headers.forEach((header) => headRow.append(node("th", null, header)));
-  head.append(headRow);
-  const body = node("tbody");
-  rows.forEach((row) => {
-    const tr = node("tr");
-    row.forEach((value) => tr.append(node("td", null, value ?? "—")));
-    body.append(tr);
-  });
-  table.append(head, body);
-  wrapper.append(table);
-  return wrapper;
-}
-
-function diagnosticSection(title, className = "", open = true) {
-  const section = node("details", `diagnostic-card ${className}`.trim());
-  section.open = open;
-  section.append(node("summary", null, title));
-  return section;
-}
-
-function renderPhaseTimeline(job) {
-  const section = diagnosticSection("Phase event stream", "diagnostic-wide");
-  const stream = node("div", "event-stream");
-  const history = job.diagnostics.phaseHistory || [];
-  history.forEach((entry, index) => {
-    const line = node("div", `event-line${entry.phase === job.phase ? " is-current" : ""}`);
-    const previous = history[index - 1];
-    const elapsed = previous ? elapsedBetween(previous.at, entry.at) : null;
-    line.append(
-      node("time", null, formatDate(entry.at)),
-      node("code", null, `phase=${entry.phase}`),
-      node("span", null, elapsed === null ? "claimed" : `+${formatDuration(elapsed)}`),
-    );
-    stream.append(line);
-  });
-  if (!history.length) stream.append(node("p", "diagnostic-empty", "No phase events recorded."));
-  section.append(stream);
-  return section;
-}
-
-function renderWorkerDiagnostics(job) {
-  const diagnostics = job.diagnostics;
-  const section = diagnosticSection("Worker & delivery");
-  const grid = node("div", "diagnostic-kv");
-  const recoveryValue = diagnostics.cleanupRequired ? humanize(diagnostics.targetRecovery) : "None";
-  [
-    ["Execution", humanize(job.status)],
-    ["Current stage", humanize(job.phase)],
-    ["Blocks next claim", diagnostics.blocksWorker ? "Yes" : "No"],
-    ["Cleanup required", diagnostics.cleanupRequired ? "Yes" : "No"],
-    ["Recovery plan", recoveryValue],
-    ["Claim", job.hasClaim ? "Persisted" : "Released"],
-    ["Saved completion", job.pendingCompletion ? "Pending" : "None"],
-    ["Acknowledged", job.completionAcknowledged ? "Yes" : "No"],
-    ["Disposition", humanize(job.completionDisposition)],
-  ].forEach(([label, value]) => grid.append(detail(label, value)));
-  section.append(grid);
-  if (diagnostics.workerError) {
-    section.append(
-      node(
-        "p",
-        "diagnostic-alert",
-        `${humanize(diagnostics.workerError.code)} · ${diagnostics.workerError.summary}`,
-      ),
-    );
-  }
-  return section;
-}
-
-function renderCapturesSideBySide(job) {
-  const section = diagnosticSection("Baseline vs Candidate", "diagnostic-wide");
-  const grid = node("div", "capture-pair");
-  grid.append(
-    renderCapturePanel("Baseline", job.diagnostics.baseline),
-    renderCapturePanel("Candidate", job.diagnostics.candidate),
-  );
-  section.append(grid);
-  return section;
-}
-
-function renderCapturePanel(label, capture) {
-  const panel = node("article", `capture-panel ${capture ? "" : "is-empty"}`.trim());
-  panel.append(node("h4", null, label));
-  if (!capture) {
-    panel.append(node("p", "diagnostic-empty", "Stage not captured."));
-    return panel;
-  }
-  const kv = node("div", "capture-kv");
-  [
-    ["Install", humanize(capture.installStatus)],
-    ["Install duration", formatDuration(capture.installDurationMs)],
-    ["Stabilized", capture.stabilization.passed ? "Yes" : "No"],
-    ["Stable samples", String(capture.stabilization.stableSamples)],
-    ["Stabilization", formatDuration(capture.stabilization.durationMs)],
-    ["Log entries", String(capture.logEntryCount)],
-  ].forEach(([key, value]) => kv.append(detail(key, value)));
-  panel.append(kv);
-
-  if (capture.preview) {
-    panel.append(renderPreview(capture.preview));
-  }
-
-  if (capture.logError) {
-    panel.append(node("p", "diagnostic-alert", `Logs: ${capture.logError}`));
-  }
-
-  if (capture.containers.length) {
-    panel.append(
-      diagnosticTable(
-        ["Container", "Service", "State", "Running", "Image"],
-        capture.containers.map((container) => [
-          container.name,
-          container.serviceName,
-          container.state,
-          container.running ? "yes" : "no",
-          container.image,
-        ]),
-      ),
-    );
-  }
-
-  if (capture.stabilization.samples.length) {
-    panel.append(node("h5", null, "Stabilization samples"));
-    panel.append(
-      diagnosticTable(
-        ["Observed", "Healthy", "Containers", "Non-running / error"],
-        capture.stabilization.samples.map((sample) => [
-          formatDate(sample.observedAt),
-          sample.allRunning ? "yes" : "no",
-          sample.containerNames.join(", ") || "none",
-          sample.error || sample.nonRunningStates.join(", ") || "none",
-        ]),
-      ),
-    );
-  }
-  return panel;
-}
-
-function renderInventory(job) {
-  const section = diagnosticSection("Package inventory", "diagnostic-wide", false);
-  const rows = [];
-  job.diagnostics.initialPackages.forEach((pkg) =>
-    rows.push(["Before", pkg.dnpName, pkg.version, pkg.isCore ? "yes" : "no"]),
-  );
-  job.diagnostics.finalPackages.forEach((pkg) =>
-    rows.push(["After", pkg.dnpName, pkg.version, pkg.isCore ? "yes" : "no"]),
-  );
-  section.append(
-    rows.length
-      ? diagnosticTable(["Snapshot", "Package", "Version", "Core"], rows)
-      : node("p", "diagnostic-empty", "No package inventory captured."),
-  );
-  return section;
-}
-
-function renderComparison(job) {
-  const section = diagnosticSection("Comparison", "diagnostic-wide");
-  const comparison = job.diagnostics.comparison;
-  if (!comparison) {
-    section.append(node("p", "diagnostic-empty", "No comparison produced."));
-    return section;
-  }
-  const grid = node("div", "diagnostic-kv");
-  [
-    ["Baseline version", comparison.baselineVersion || "Unknown"],
-    ["Candidate version", comparison.candidateVersion || "Unknown"],
-    ["Baseline hard check", comparison.baselineHardCheck ? "Passed" : "Failed"],
-    ["Candidate hard check", comparison.candidateHardCheck ? "Passed" : "Failed"],
-    ["Baseline stabilization", formatDuration(comparison.baselineStabilizationMs)],
-    ["Candidate stabilization", formatDuration(comparison.candidateStabilizationMs)],
-    ["Baseline logs", comparison.baselineLogsCollected ? "Collected" : "Missing"],
-    ["Candidate logs", comparison.candidateLogsCollected ? "Collected" : "Missing"],
-  ].forEach(([key, value]) => grid.append(detail(key, value)));
-  section.append(grid);
-  const changes = [
-    ["Containers added", comparison.containersAdded],
-    ["Containers removed", comparison.containersRemoved],
-    ["Baseline non-running", comparison.baselineLastNonRunningStates],
-    ["Candidate non-running", comparison.candidateLastNonRunningStates],
-    ["Deterministic regressions", comparison.deterministicRegressions],
-  ].filter(([, values]) => values?.length);
-  if (changes.length) {
-    section.append(
-      diagnosticTable(
-        ["Signal", "Values"],
-        changes.map(([label, values]) => [label, values.join(", ")]),
-      ),
-    );
-  }
-  return section;
-}
-
-function renderErrors(job) {
-  const section = diagnosticSection("Errors & analysis", "diagnostic-wide");
-  const errors = [...(job.diagnostics.errors || [])];
-  if (job.diagnostics.workerError) {
-    errors.unshift({
-      phase: "worker",
-      code: job.diagnostics.workerError.code,
-      message: job.diagnostics.workerError.summary,
-    });
-  }
-  if (errors.length) {
-    section.append(
-      diagnosticTable(
-        ["Stage", "Code", "Message"],
-        errors.map((error) => [humanize(error.phase), humanize(error.code), error.message]),
-      ),
-    );
-  } else {
-    section.append(node("p", "diagnostic-empty", "No execution errors recorded."));
-  }
-  const analysis = job.diagnostics.logAnalysis;
-  if (analysis) {
-    section.append(
-      node(
-        "p",
-        "diagnostic-copy",
-        `Log analysis · ${humanize(analysis.analyzer)} · ${humanize(analysis.status)} · ${analysis.summary}`,
-      ),
-    );
-    if (analysis.newFindings?.length) {
-      section.append(
-        diagnosticTable(
-          ["Severity", "Container", "Reason", "Evidence"],
-          analysis.newFindings.map((finding) => [
-            humanize(finding.severity),
-            finding.container,
-            finding.reason,
-            finding.evidence,
-          ]),
-        ),
-      );
-    }
-  }
-  return section;
-}
-
-function renderPreview(preview) {
-  const wrapper = node("div", "preview-block");
-  const heading = node("h5", null, "Install preview");
-  wrapper.append(heading);
-
-  const meta = node("dl", "preview-meta");
-  const fields = [
-    ["Package", preview.packageName],
-    ["Version", preview.version],
-    ["Images", preview.imageCount === null || preview.imageCount === undefined ? null : String(preview.imageCount)],
-    ["Requires input", preview.requiresUserInput ? "yes" : "no"],
-  ];
-  fields
-    .filter(([, value]) => value !== null && value !== "")
-    .forEach(([label, value]) => {
-      const term = node("dt", null, label);
-      const detail = node("dd", null, value);
-      meta.append(term, detail);
-    });
-  if (meta.childElementCount) wrapper.append(meta);
-
-  const formatted = tryFormatJson(preview.summary);
-  if (formatted) {
-    const pre = node("pre", "json-block");
-    const code = node("code", null, formatted);
-    pre.append(code);
-    wrapper.append(pre);
-  } else if (preview.summary) {
-    wrapper.append(node("p", "diagnostic-copy", preview.summary));
-  }
-  return wrapper;
+function yesNo(value) {
+  return value ? "Yes" : "No";
 }
 
 function tryFormatJson(raw) {
@@ -462,64 +132,577 @@ function tryFormatJson(raw) {
   }
 }
 
-function renderExpertDiagnostics(job) {
-  const expert = node("section", "expert-diagnostics");
-  const heading = node("div", "expert-heading");
-  heading.append(
-    node("div", null, "Expert telemetry"),
-    node("span", null, `stage=${job.phase} · status=${job.status}`),
-  );
-  expert.append(heading);
-  expert.append(renderCapturesSideBySide(job));
-  const grid = node("div", "diagnostics-grid");
-  grid.append(
-    renderPhaseTimeline(job),
-    renderWorkerDiagnostics(job),
-    renderComparison(job),
-    renderInventory(job),
-    renderErrors(job),
-  );
-  expert.append(grid);
-  return expert;
+/* -------------------------------------------------------------------------
+   DOM helpers
+   ------------------------------------------------------------------------- */
+
+function node(tag, className, text) {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  if (text !== undefined) element.textContent = text;
+  return element;
 }
 
-function jobMatches(job) {
-  const active =
-    !job.completionAcknowledged &&
-    (job.status === "queued" || job.status === "running");
-  const filterMatch =
-    state.filter === "all" ||
-    (state.filter === "attention" && job.requiresAttention) ||
-    (state.filter === "active" && active) ||
-    (state.filter === "completed" && job.status === "completed");
-  const haystack = `${job.runId} ${job.dnpName} ${job.repository}`.toLowerCase();
-  return filterMatch && haystack.includes(state.query);
+function isNode(value) {
+  return value && typeof value === "object" && "nodeType" in value;
 }
 
-function renderMetrics() {
-  elements.total.textContent = String(state.jobs.length);
-  const localAttention = state.jobs.filter((job) => job.requiresAttention).length;
-  const coordinatorAttention =
-    state.lostJob &&
-    !state.jobs.some(
-      (job) => job.runId === state.lostJob.jobId && job.requiresAttention,
-    )
-      ? 1
-      : 0;
-  elements.attention.textContent = String(
-    localAttention + coordinatorAttention,
+function setContent(element, value) {
+  if (isNode(value)) {
+    element.append(value);
+  } else {
+    element.textContent = value === null || value === undefined || value === "" ? "—" : value;
+  }
+  return element;
+}
+
+function badge(value) {
+  return node("span", `badge ${value || "pending"}`, humanize(value || "pending"));
+}
+
+function externalLink(label, href) {
+  const link = node("a", "external-link", label);
+  link.href = href;
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  return link;
+}
+
+/** `<div><dt/><dd/></div>` for use inside a `.kv` description list. */
+function kvItem(label, value, { mono = false } = {}) {
+  const item = node("div");
+  item.append(node("dt", null, label), setContent(node("dd", mono ? "mono" : null), value));
+  return item;
+}
+
+function kvList(entries, className = "kv") {
+  const list = node("dl", className);
+  entries.forEach(([label, value, options]) => list.append(kvItem(label, value, options)));
+  return list;
+}
+
+/**
+ * Plain table. Cells may be strings, nodes, or `{ value, className }`.
+ * `rowHeaders` renders the first cell of each row as a `<th scope="row">`.
+ */
+function table(headers, rows, { mono = false, rowHeaders = false, rowClass } = {}) {
+  const wrapper = node("div", "table-wrap");
+  const element = node("table", `table${mono ? " table-mono" : ""}`);
+  const head = node("thead");
+  const headRow = node("tr");
+  headers.forEach((header) => headRow.append(node("th", null, header)));
+  head.append(headRow);
+  const body = node("tbody");
+  rows.forEach((row, rowIndex) => {
+    const tr = node("tr", rowClass ? rowClass(rowIndex) : null);
+    row.forEach((cell, cellIndex) => {
+      const header = rowHeaders && cellIndex === 0;
+      const td = node(header ? "th" : "td");
+      if (header) td.scope = "row";
+      if (cell && typeof cell === "object" && !isNode(cell)) {
+        if (cell.className) td.className = cell.className;
+        setContent(td, cell.value);
+      } else {
+        setContent(td, cell);
+      }
+      tr.append(td);
+    });
+    body.append(tr);
+  });
+  element.append(head, body);
+  wrapper.append(element);
+  return wrapper;
+}
+
+function subsection(title, ...children) {
+  const section = node("section", "subsection");
+  if (title) section.append(node("h4", null, title));
+  section.append(...children);
+  return section;
+}
+
+function emptyCopy(text) {
+  return node("p", "empty-copy", text);
+}
+
+function flag(ok, good, bad) {
+  return { value: ok ? good : bad, className: ok ? "is-good" : "is-bad" };
+}
+
+/* -------------------------------------------------------------------------
+   Network
+   ------------------------------------------------------------------------- */
+
+async function readJson(response, failureLabel = "Request failed") {
+  let payload;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new Error(`${failureLabel}: invalid JSON response (${response.status})`);
+  }
+  if (!response.ok) {
+    throw new Error(payload?.error || `${failureLabel} (${response.status})`);
+  }
+  return payload;
+}
+
+function postJson(url, body) {
+  return fetch(url, {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+}
+
+/* -------------------------------------------------------------------------
+   Session storage
+   ------------------------------------------------------------------------- */
+
+function loadExpandedJobs() {
+  try {
+    return new Set(JSON.parse(sessionStorage.getItem("expandedHarnessJobs") || "[]"));
+  } catch {
+    return new Set();
+  }
+}
+
+function persistExpandedJobs() {
+  try {
+    sessionStorage.setItem("expandedHarnessJobs", JSON.stringify([...state.expandedJobs]));
+  } catch {
+    // The dashboard still works when browser storage is unavailable.
+  }
+}
+
+/* -------------------------------------------------------------------------
+   Job detail tabs
+   ------------------------------------------------------------------------- */
+
+function captureSummaryRows(baseline, candidate) {
+  const value = (capture, read) => (capture ? read(capture) : "Not captured");
+  const rows = [
+    ["Install", (c) => humanize(c.installStatus)],
+    ["Install duration", (c) => formatDuration(c.installDurationMs)],
+    ["Stabilized", (c) => flag(c.stabilization.passed, "Yes", "No")],
+    ["Stable samples", (c) => String(c.stabilization.stableSamples)],
+    ["Stabilization time", (c) => formatDuration(c.stabilization.durationMs)],
+    [
+      "Logs",
+      (c) =>
+        c.logError
+          ? { value: `${c.logEntryCount} entries · ${c.logError}`, className: "is-bad" }
+          : `${c.logEntryCount} entries`,
+    ],
+  ];
+  return rows.map(([label, read]) => [label, value(baseline, read), value(candidate, read)]);
+}
+
+function previewBlock(preview) {
+  if (!preview) return emptyCopy("No install preview.");
+  const wrapper = node("div", "preview");
+  const entries = [
+    ["Package", preview.packageName, { mono: true }],
+    ["Version", preview.version, { mono: true }],
+    ["Images", preview.imageCount === null || preview.imageCount === undefined ? null : String(preview.imageCount)],
+    ["Requires input", yesNo(preview.requiresUserInput)],
+  ].filter(([, value]) => value !== null && value !== undefined && value !== "");
+  wrapper.append(kvList(entries, "kv kv-2"));
+  const formatted = tryFormatJson(preview.summary);
+  if (formatted) {
+    const pre = node("pre", "json-block");
+    pre.append(node("code", null, formatted));
+    wrapper.append(pre);
+  } else if (preview.summary) {
+    wrapper.append(node("p", "muted", preview.summary));
+  }
+  return wrapper;
+}
+
+function containersTable(capture) {
+  if (!capture?.containers.length) return emptyCopy("No containers recorded.");
+  return table(
+    ["Service", "State", "Image"],
+    capture.containers.map((container) => [
+      container.serviceName,
+      { value: container.state, className: container.running ? "is-good" : "is-bad" },
+      { value: container.image, className: "mono" },
+    ]),
   );
-  elements.active.textContent = String(
-    state.jobs.filter(
-      (job) =>
-        !job.completionAcknowledged &&
-        (job.status === "queued" || job.status === "running"),
-    )
-      .length,
+}
+
+function samplesTable(capture) {
+  if (!capture?.stabilization.samples.length) return emptyCopy("No samples recorded.");
+  return table(
+    ["Observed", "All running", "Non-running / error"],
+    capture.stabilization.samples.map((sample) => [
+      formatTime(sample.observedAt),
+      flag(sample.allRunning, "yes", "no"),
+      sample.error || sample.nonRunningStates.join(", ") || "none",
+    ]),
   );
-  elements.delivered.textContent = String(
-    state.jobs.filter((job) => job.completionAcknowledged).length,
+}
+
+/** One baseline/candidate row: both columns start at the same height. */
+function pairRow(title, render, baseline, candidate) {
+  const pair = node("div", "pair");
+  [
+    ["Baseline", baseline],
+    ["Candidate", candidate],
+  ].forEach(([label, capture]) => {
+    const column = node("div");
+    column.append(node("div", "pair-label", label));
+    column.append(capture ? render(capture) : emptyCopy("Stage not captured."));
+    pair.append(column);
+  });
+  return subsection(title, pair);
+}
+
+function renderCapturesTab(job) {
+  const { baseline, candidate } = job.diagnostics;
+  return [
+    subsection(
+      "Stage summary",
+      table(["", "Baseline", "Candidate"], captureSummaryRows(baseline, candidate), {
+        rowHeaders: true,
+      }),
+    ),
+    pairRow("Containers", containersTable, baseline, candidate),
+    pairRow("Stabilization samples", samplesTable, baseline, candidate),
+    pairRow("Install preview", (capture) => previewBlock(capture.preview), baseline, candidate),
+  ];
+}
+
+function renderComparisonTab(job) {
+  const comparison = job.diagnostics.comparison;
+  if (!comparison) return [emptyCopy("No comparison produced yet.")];
+  const sections = [
+    subsection(
+      "Baseline vs candidate",
+      table(
+        ["", "Baseline", "Candidate"],
+        [
+          [
+            "Version",
+            { value: comparison.baselineVersion || "Unknown", className: "mono" },
+            { value: comparison.candidateVersion || "Unknown", className: "mono" },
+          ],
+          [
+            "Hard check",
+            flag(comparison.baselineHardCheck, "Passed", "Failed"),
+            flag(comparison.candidateHardCheck, "Passed", "Failed"),
+          ],
+          [
+            "Stabilization",
+            formatDuration(comparison.baselineStabilizationMs),
+            formatDuration(comparison.candidateStabilizationMs),
+          ],
+          [
+            "Logs",
+            flag(comparison.baselineLogsCollected, "Collected", "Missing"),
+            flag(comparison.candidateLogsCollected, "Collected", "Missing"),
+          ],
+        ],
+        { rowHeaders: true },
+      ),
+    ),
+  ];
+  const signals = [
+    ["Containers added", comparison.containersAdded],
+    ["Containers removed", comparison.containersRemoved],
+    ["Baseline non-running", comparison.baselineLastNonRunningStates],
+    ["Candidate non-running", comparison.candidateLastNonRunningStates],
+    ["Deterministic regressions", comparison.deterministicRegressions],
+  ].filter(([, values]) => values?.length);
+  sections.push(
+    subsection(
+      "Signals",
+      signals.length
+        ? table(
+            ["Signal", "Values"],
+            signals.map(([label, values]) => [label, { value: values.join(", "), className: "mono" }]),
+            { rowHeaders: true },
+          )
+        : emptyCopy("No differences detected."),
+    ),
   );
+  return sections;
+}
+
+function jobErrors(job) {
+  const errors = [...(job.diagnostics.errors || [])];
+  if (job.diagnostics.workerError) {
+    errors.unshift({
+      phase: "worker",
+      code: job.diagnostics.workerError.code,
+      message: job.diagnostics.workerError.summary,
+    });
+  }
+  return errors;
+}
+
+function renderErrorsTab(job) {
+  const errors = jobErrors(job);
+  const sections = [
+    subsection(
+      "Execution errors",
+      errors.length
+        ? table(
+            ["Stage", "Code", "Message"],
+            errors.map((error) => [
+              humanize(error.phase),
+              { value: error.code, className: "mono" },
+              error.message,
+            ]),
+          )
+        : emptyCopy("No execution errors recorded."),
+    ),
+  ];
+  const analysis = job.diagnostics.logAnalysis;
+  const analysisChildren = [];
+  if (analysis) {
+    analysisChildren.push(
+      kvList([
+        ["Analyzer", humanize(analysis.analyzer)],
+        ["Status", badge(analysis.status)],
+        ["Summary", analysis.summary],
+      ], "kv kv-3"),
+    );
+    if (analysis.newFindings?.length) {
+      analysisChildren.push(
+        table(
+          ["Severity", "Container", "Reason", "Evidence"],
+          analysis.newFindings.map((finding) => [
+            humanize(finding.severity),
+            finding.container,
+            finding.reason,
+            { value: finding.evidence, className: "mono" },
+          ]),
+        ),
+      );
+    }
+  } else {
+    analysisChildren.push(emptyCopy("Log analysis has not run."));
+  }
+  sections.push(subsection("Log analysis", ...analysisChildren));
+  return sections;
+}
+
+function renderTimelineTab(job) {
+  const history = job.diagnostics.phaseHistory || [];
+  if (!history.length) return [emptyCopy("No phase events recorded.")];
+  const currentIndex = history.findLastIndex((entry) => entry.phase === job.phase);
+  return [
+    table(
+      ["Time", "Phase", "Since previous"],
+      history.map((entry, index) => {
+        const previous = history[index - 1];
+        const elapsed = previous ? elapsedBetween(previous.at, entry.at) : null;
+        return [
+          formatDate(entry.at),
+          { value: entry.phase, className: "mono" },
+          elapsed === null ? "—" : `+${formatDuration(elapsed)}`,
+        ];
+      }),
+      { rowClass: (index) => (index === currentIndex ? "is-current" : null) },
+    ),
+  ];
+}
+
+function renderDeliveryTab(job) {
+  const diagnostics = job.diagnostics;
+  const sections = [
+    kvList([
+      ["Execution", humanize(job.status)],
+      ["Current stage", humanize(job.phase)],
+      ["Blocks next claim", yesNo(diagnostics.blocksWorker)],
+      ["Cleanup required", yesNo(diagnostics.cleanupRequired)],
+      ["Recovery plan", diagnostics.cleanupRequired ? humanize(diagnostics.targetRecovery) : "None"],
+      ["Claim", job.hasClaim ? "Persisted" : "Released"],
+      ["Saved completion", job.pendingCompletion ? "Pending" : "None"],
+      ["Acknowledged", yesNo(job.completionAcknowledged)],
+      ["Disposition", job.completionDisposition ? humanize(job.completionDisposition) : "—"],
+    ]),
+  ];
+  if (diagnostics.workerError) {
+    sections.push(
+      node("p", "alert", `${humanize(diagnostics.workerError.code)} · ${diagnostics.workerError.summary}`),
+    );
+  }
+  return sections;
+}
+
+function renderInventoryTab(job) {
+  const rows = [];
+  job.diagnostics.initialPackages.forEach((pkg) =>
+    rows.push(["Before", { value: pkg.dnpName, className: "mono" }, { value: pkg.version, className: "mono" }, yesNo(pkg.isCore)]),
+  );
+  job.diagnostics.finalPackages.forEach((pkg) =>
+    rows.push(["After", { value: pkg.dnpName, className: "mono" }, { value: pkg.version, className: "mono" }, yesNo(pkg.isCore)]),
+  );
+  return [
+    rows.length
+      ? table(["Snapshot", "Package", "Version", "Core"], rows)
+      : emptyCopy("No package inventory captured."),
+  ];
+}
+
+const JOB_TABS = [
+  { id: "captures", label: "Captures", render: renderCapturesTab },
+  { id: "comparison", label: "Comparison", render: renderComparisonTab },
+  {
+    id: "errors",
+    label: "Errors & analysis",
+    render: renderErrorsTab,
+    count: (job) => jobErrors(job).length,
+  },
+  {
+    id: "timeline",
+    label: "Timeline",
+    render: renderTimelineTab,
+    count: (job) => (job.diagnostics.phaseHistory || []).length,
+  },
+  { id: "delivery", label: "Worker & delivery", render: renderDeliveryTab },
+  { id: "inventory", label: "Inventory", render: renderInventoryTab },
+];
+
+function renderTabs(job) {
+  const wrapper = node("div", "job-tabs");
+  const tabList = node("div", "tabs");
+  tabList.setAttribute("role", "tablist");
+  const panel = node("div", "tab-panel");
+  panel.setAttribute("role", "tabpanel");
+  panel.id = `panel-${job.runId}`;
+
+  const buttons = JOB_TABS.map((tab) => {
+    const button = node("button", "tab");
+    button.type = "button";
+    button.id = `tab-${job.runId}-${tab.id}`;
+    button.setAttribute("role", "tab");
+    button.setAttribute("aria-controls", panel.id);
+    button.append(node("span", null, tab.label));
+    const count = tab.count?.(job);
+    if (count) {
+      const isAlert = tab.id === "errors";
+      button.append(node("span", `tab-count${isAlert ? " is-alert" : ""}`, String(count)));
+    }
+    button.addEventListener("click", () => select(tab.id));
+    tabList.append(button);
+    return button;
+  });
+
+  function select(id) {
+    const tab = JOB_TABS.find((candidate) => candidate.id === id) || JOB_TABS[0];
+    state.jobTabs.set(job.runId, tab.id);
+    buttons.forEach((button, index) => {
+      const selected = JOB_TABS[index] === tab;
+      button.setAttribute("aria-selected", String(selected));
+      button.tabIndex = selected ? 0 : -1;
+    });
+    panel.setAttribute("aria-labelledby", `tab-${job.runId}-${tab.id}`);
+    panel.replaceChildren(...tab.render(job));
+  }
+
+  tabList.addEventListener("keydown", (event) => {
+    if (event.key !== "ArrowRight" && event.key !== "ArrowLeft") return;
+    const current = JOB_TABS.findIndex((tab) => tab.id === state.jobTabs.get(job.runId));
+    const step = event.key === "ArrowRight" ? 1 : -1;
+    const next = (current + step + JOB_TABS.length) % JOB_TABS.length;
+    select(JOB_TABS[next].id);
+    buttons[next].focus();
+    event.preventDefault();
+  });
+
+  select(state.jobTabs.get(job.runId) || "captures");
+  wrapper.append(tabList, panel);
+  return wrapper;
+}
+
+/* -------------------------------------------------------------------------
+   Recovery
+   ------------------------------------------------------------------------- */
+
+const RECOVERY_TITLES = {
+  cleanup: "Manual cleanup must be verified",
+  completion_conflict: "Completion conflicts with Tropibot",
+};
+
+function recoveryActionButton(job, action, label, className = "button-primary") {
+  const button = node("button", `button ${className}`, label);
+  button.type = "button";
+  button.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    runRecoveryAction(job, action, button);
+  });
+  return button;
+}
+
+/** Guidance text and action buttons for a job that holds the worker. */
+function recoveryGuidance(job) {
+  if (job.recoveryKind === "cleanup") {
+    return {
+      text: "Verify the target package is restored or removed as intended. Confirming records the manual cleanup and asks the live worker to reconcile again.",
+      buttons: [recoveryActionButton(job, "continueAfterCleanup", "Cleanup verified — continue")],
+    };
+  }
+  if (job.recoveryKind === "completion_conflict") {
+    if (!["passed", "skipped"].includes(job.cleanupStatus)) {
+      return {
+        text: "Tropibot holds different state, but local cleanup is not recorded as safe. Verify the package state first; completion controls unlock after that confirmation.",
+        buttons: [recoveryActionButton(job, "confirmCleanup", "Cleanup verified — unlock resolution")],
+      };
+    }
+    return {
+      text: "Tropibot already holds different state for this claim. Retry is non-destructive and resends the exact saved payload. Accept coordinator result permanently discards the local pending payload and releases the claim.",
+      buttons: [
+        recoveryActionButton(job, "retryCompletion", "Retry exact completion"),
+        recoveryActionButton(job, "acceptCoordinatorResult", "Accept Tropibot result & release", "button-danger"),
+      ],
+    };
+  }
+  return {
+    text: "This hold has no safe automated override. Inspect the reason and local record, then refresh after correcting the underlying state.",
+    buttons: [],
+  };
+}
+
+function renderJobRecovery(job) {
+  const callout = node("section", "callout callout-warning");
+  const title = node("div", "panel-title");
+  title.append(node("h3", null, RECOVERY_TITLES[job.recoveryKind] || "Worker recovery required"));
+  callout.append(title, node("p", "callout-reason", job.manualRecoveryReason));
+  const guidance = recoveryGuidance(job);
+  callout.append(node("p", "callout-note", guidance.text));
+  if (guidance.buttons.length) {
+    const actions = node("div", "actions");
+    actions.append(...guidance.buttons);
+    callout.append(actions);
+  }
+  return callout;
+}
+
+function renderLocalRecovery() {
+  const job = state.jobs.find((candidate) => candidate.manualRecoveryReason);
+  elements.localRecovery.classList.toggle("is-hidden", !job);
+  if (!job) return;
+
+  elements.localRecoveryTitle.textContent = RECOVERY_TITLES[job.recoveryKind] || "Worker recovery required";
+  elements.localRecoveryKind.textContent = humanize(job.recoveryKind);
+  elements.localRecoveryReason.textContent = job.manualRecoveryReason;
+  elements.localRecoveryContext.replaceChildren(
+    kvItem("Package", job.dnpName),
+    kvItem("Run", job.runId, { mono: true }),
+    kvItem("Cleanup", humanize(job.cleanupStatus)),
+    kvItem("Saved delivery", job.pendingCompletion ? "Pending" : "None"),
+    kvItem("Local claim", job.hasClaim ? "Held" : "Released"),
+    kvItem("Tropibot acknowledgement", job.completionAcknowledged ? "Recorded" : "Missing"),
+  );
+  const guidance = recoveryGuidance(job);
+  elements.localRecoveryExplanation.textContent = guidance.text;
+  elements.localRecoveryActions.replaceChildren(...guidance.buttons);
 }
 
 function renderCoordinatorRecovery() {
@@ -534,99 +717,96 @@ function renderCoordinatorRecovery() {
     : "Not reported";
 }
 
-function recoveryContextItem(label, value) {
-  const item = node("div");
-  item.append(node("span", null, label), node("strong", null, value));
-  return item;
+/* -------------------------------------------------------------------------
+   Jobs
+   ------------------------------------------------------------------------- */
+
+function isActive(job) {
+  return !job.completionAcknowledged && (job.status === "queued" || job.status === "running");
 }
 
-function recoveryActionButton(job, action, label, className = "button-primary") {
-  const button = node("button", `button ${className}`, label);
-  button.type = "button";
-  button.addEventListener("click", (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    runRecoveryAction(job, action, button);
-  });
-  return button;
+function jobMatches(job) {
+  const filterMatch =
+    state.filter === "all" ||
+    (state.filter === "attention" && job.requiresAttention) ||
+    (state.filter === "active" && isActive(job)) ||
+    (state.filter === "completed" && job.status === "completed");
+  const haystack = `${job.runId} ${job.dnpName} ${job.repository}`.toLowerCase();
+  return filterMatch && haystack.includes(state.query);
 }
 
-function recoveryPanelContent(job, compact = false) {
-  const fragment = document.createDocumentFragment();
-  const copy = node("p", compact ? null : "recovery-guidance");
-  const actions = node("div", compact ? "stacked-actions" : "recovery-actions");
-
-  if (job.recoveryKind === "cleanup") {
-    copy.textContent =
-      "Verify the target package is restored or removed as intended. Confirming records the manual cleanup and asks the live worker to reconcile again.";
-    actions.append(
-      recoveryActionButton(
-        job,
-        "continueAfterCleanup",
-        "Cleanup verified — continue",
-      ),
-    );
-  } else if (job.recoveryKind === "completion_conflict") {
-    const cleanupConfirmed = ["passed", "skipped"].includes(job.cleanupStatus);
-    if (!cleanupConfirmed) {
-      copy.textContent =
-        "Tropibot holds different state, but local cleanup is not recorded as safe. Verify the package state first; completion controls unlock after that confirmation.";
-      actions.append(
-        recoveryActionButton(job, "confirmCleanup", "Cleanup verified — unlock resolution"),
-      );
-    } else {
-      copy.textContent =
-        "Tropibot already holds different state for this claim. Retry is non-destructive and resends the exact saved payload. Accept coordinator result permanently discards the local pending payload and releases the claim.";
-      actions.append(
-        recoveryActionButton(job, "retryCompletion", "Retry exact completion"),
-        recoveryActionButton(
-          job,
-          "acceptCoordinatorResult",
-          "Accept Tropibot result & release",
-          "button-danger",
-        ),
-      );
-    }
-  } else {
-    copy.textContent =
-      "This hold has no safe automated override. Inspect the reason and local record, then refresh after correcting the underlying state.";
-  }
-  fragment.append(copy, actions);
-  return fragment;
+function cell(className, primary, secondary) {
+  const element = node("div", `cell ${className}`);
+  element.append(isNode(primary) ? primary : node("div", "cell-primary", primary));
+  if (secondary) element.append(node("div", "cell-secondary", secondary));
+  return element;
 }
 
-function renderLocalRecovery() {
-  const job = state.jobs.find((candidate) => candidate.manualRecoveryReason);
-  elements.localRecovery.classList.toggle("is-hidden", !job);
-  if (!job) return;
-
-  const titles = {
-    cleanup: "Manual cleanup must be verified",
-    completion_conflict: "Completion conflicts with Tropibot",
-  };
-  elements.localRecoveryTitle.textContent = titles[job.recoveryKind];
-  elements.localRecoveryKind.textContent = humanize(job.recoveryKind);
-  elements.localRecoveryReason.textContent = job.manualRecoveryReason;
-  elements.localRecoveryContext.replaceChildren(
-    recoveryContextItem("Package", job.dnpName),
-    recoveryContextItem("Run", job.runId),
-    recoveryContextItem("Cleanup", humanize(job.cleanupStatus)),
-    recoveryContextItem(
-      "Saved delivery",
-      job.pendingCompletion ? "Pending" : "None",
-    ),
-    recoveryContextItem("Local claim", job.hasClaim ? "Held" : "Released"),
-    recoveryContextItem(
-      "Tropibot acknowledgement",
-      job.completionAcknowledged ? "Recorded" : "Missing",
-    ),
+function renderJobSummary(job) {
+  const summary = node("summary");
+  const date = cell(
+    "cell-date",
+    formatDate(job.createdAt),
+    relativeTime(job.finishedAt || job.startedAt || job.createdAt),
   );
-  elements.localRecoveryExplanation.replaceChildren();
-  elements.localRecoveryActions.replaceChildren();
-  const content = recoveryPanelContent(job);
-  const children = [...content.childNodes];
-  elements.localRecoveryExplanation.append(children[0]);
-  if (children[1]) elements.localRecoveryActions.append(...children[1].childNodes);
+  date.title = `Created ${new Date(job.createdAt).toLocaleString()}`;
+  summary.append(
+    cell("cell-package", job.dnpName, job.runId),
+    cell("cell-result", badge(job.verdict || job.status)),
+    cell("cell-stage", humanize(job.phase)),
+    cell("cell-cleanup", badge(job.cleanupStatus)),
+    date,
+    node("span", "chevron", "›"),
+  );
+  return summary;
+}
+
+function renderJobOverview(job) {
+  const repositoryUrl = `https://github.com/${job.repository}`;
+  const repository = node("span");
+  repository.append(
+    externalLink(job.repository, repositoryUrl),
+    document.createTextNode(" · "),
+    externalLink(`PR #${job.pullRequest}`, `${repositoryUrl}/pull/${job.pullRequest}`),
+  );
+  return kvList([
+    ["Repository", repository],
+    ["Head commit", externalLink(compactRef(job.headSha), `${repositoryUrl}/commit/${job.headSha}`), { mono: true }],
+    ["Baseline", compactRef(job.baselineRef), { mono: true }],
+    ["Candidate", compactRef(job.candidateRef), { mono: true }],
+    ["Execution", humanize(job.status)],
+    ["Reason", job.reasonCode ? humanize(job.reasonCode) : "—"],
+    ["Errors", String(job.errorCount)],
+    [
+      "Delivery",
+      job.completionAcknowledged
+        ? `Acknowledged${job.completionDisposition ? ` · ${humanize(job.completionDisposition)}` : ""}`
+        : "Not acknowledged",
+    ],
+    ["Created", formatDate(job.createdAt)],
+    ["Started", formatDate(job.startedAt)],
+    ["Finished", formatDate(job.finishedAt)],
+    [
+      "Elapsed",
+      formatDuration(elapsedBetween(job.startedAt || job.createdAt, job.finishedAt || new Date())),
+    ],
+  ], "kv kv-overview");
+}
+
+function renderJobNotes(job) {
+  const notes = [
+    ["Summary", job.summary, false],
+    ["Cleanup error", job.cleanupError, true],
+    ["Leftovers", job.leftoverPackages.join(", "), true],
+  ].filter(([, text]) => text);
+  if (!notes.length) return null;
+  const wrapper = node("div", "job-notes");
+  notes.forEach(([label, text, isError]) => {
+    const row = node("div", `job-note${isError ? " is-error" : ""}`);
+    row.append(node("span", "label", label), node("p", null, text));
+    wrapper.append(row);
+  });
+  return wrapper;
 }
 
 function renderJob(job) {
@@ -641,92 +821,15 @@ function renderJob(job) {
     }
     persistExpandedJobs();
   });
-  const summary = node("summary");
+  card.append(renderJobSummary(job));
 
-  const packageCell = node("div", "package-cell");
-  packageCell.append(node("div", "package-name", job.dnpName));
-  packageCell.append(node("div", "run-id", job.runId));
-
-  const statusCell = node("div", "status-cell");
-  statusCell.append(node("span", "cell-label", job.verdict ? "Verdict" : "Status"));
-  statusCell.append(badge(job.verdict || job.status));
-  statusCell.append(node("span", "phase", humanize(job.phase)));
-
-  const cleanupCell = node("div", "cleanup-cell");
-  cleanupCell.append(node("span", "cell-label", "Cleanup"));
-  cleanupCell.append(badge(job.cleanupStatus));
-
-  const dateCell = node("div", "date-cell");
-  dateCell.append(node("div", null, formatDate(job.createdAt)));
-  dateCell.append(node("div", "phase", relativeTime(job.finishedAt || job.startedAt || job.createdAt)));
-
-  summary.append(packageCell, statusCell, cleanupCell, dateCell, node("span", "chevron", "›"));
-  card.append(summary);
-
-  const body = node("div", "job-details");
-  const information = node("div");
-  const grid = node("div", "detail-grid");
-  const repositoryUrl = `https://github.com/${job.repository}`;
-  grid.append(
-    detail("Repository", repositoryLinks(job)),
-    detail(
-      "Head commit",
-      externalLink(compactRef(job.headSha), `${repositoryUrl}/commit/${job.headSha}`),
-    ),
-    detail("Current stage", humanize(job.phase)),
-    detail("Execution", humanize(job.status)),
-    detail("Baseline", compactRef(job.baselineRef)),
-    detail("Candidate", compactRef(job.candidateRef)),
-    detail("Reason", humanize(job.reasonCode)),
-    detail("Errors", String(job.errorCount)),
-    detail("Created", formatDate(job.createdAt)),
-    detail("Started", formatDate(job.startedAt)),
-    detail("Finished", formatDate(job.finishedAt)),
-    detail(
-      "Elapsed",
-      formatDuration(
-        elapsedBetween(job.startedAt || job.createdAt, job.finishedAt || new Date()),
-      ),
-    ),
-    detail(
-      "Delivery",
-      job.completionAcknowledged
-        ? `Acknowledged${job.completionDisposition ? ` · ${job.completionDisposition}` : ""}`
-        : "Not acknowledged",
-    ),
-  );
-  information.append(grid);
-  if (job.summary) information.append(node("p", "summary-copy", job.summary));
-  if (job.cleanupError) {
-    information.append(node("p", "summary-copy", `Cleanup: ${job.cleanupError}`));
-  }
-  if (job.leftoverPackages.length) {
-    information.append(
-      node("p", "summary-copy", `Leftovers: ${job.leftoverPackages.join(", ")}`),
-    );
-  }
-  body.append(information);
-
-  if (job.manualRecoveryReason) {
-    const recovery = node("aside", "recovery-panel");
-    recovery.append(
-      node(
-        "h3",
-        null,
-        job.recoveryKind === "completion_conflict"
-          ? "Completion conflict"
-          : "Manual cleanup required",
-      ),
-    );
-    recovery.append(
-      node("p", null, job.manualRecoveryReason),
-    );
-    recovery.append(recoveryPanelContent(job, true));
-    body.append(recovery);
-  }
-
-  body.append(renderExpertDiagnostics(job));
-
+  const body = node("div", "job-body");
+  if (job.manualRecoveryReason) body.append(renderJobRecovery(job));
+  const overview = node("div");
+  overview.append(renderJobOverview(job));
+  const notes = renderJobNotes(job);
+  if (notes) overview.append(notes);
+  body.append(overview, renderTabs(job));
   card.append(body);
   return card;
 }
@@ -735,8 +838,28 @@ function renderJobs() {
   const visible = state.jobs.filter(jobMatches);
   elements.jobs.replaceChildren(...visible.map(renderJob));
   elements.jobs.setAttribute("aria-busy", "false");
+  elements.jobTable.classList.toggle("is-hidden", visible.length === 0);
   elements.empty.classList.toggle("is-hidden", visible.length !== 0);
 }
+
+function renderMetrics() {
+  elements.total.textContent = String(state.jobs.length);
+  const localAttention = state.jobs.filter((job) => job.requiresAttention).length;
+  const coordinatorAttention =
+    state.lostJob &&
+    !state.jobs.some((job) => job.runId === state.lostJob.jobId && job.requiresAttention)
+      ? 1
+      : 0;
+  elements.attention.textContent = String(localAttention + coordinatorAttention);
+  elements.active.textContent = String(state.jobs.filter(isActive).length);
+  elements.delivered.textContent = String(
+    state.jobs.filter((job) => job.completionAcknowledged).length,
+  );
+}
+
+/* -------------------------------------------------------------------------
+   Worker
+   ------------------------------------------------------------------------- */
 
 function renderWorker(worker) {
   state.worker = worker;
@@ -745,10 +868,7 @@ function renderWorker(worker) {
   elements.workerMessage.textContent = worker.message;
   elements.drainLifecycle.textContent = humanize(worker.lifecycle);
   elements.drainLifecycle.className = `badge ${worker.safeToRestart ? "ready" : worker.lifecycle}`;
-  elements.drainMessage.textContent = worker.message;
-  const active = state.jobs.find(
-    (job) => !job.completionAcknowledged && job.hasClaim,
-  );
+  const active = state.jobs.find((job) => !job.completionAcknowledged && job.hasClaim);
   elements.drainCurrentJob.textContent = active
     ? `${active.dnpName} · ${humanize(active.phase)}`
     : "No active job";
@@ -761,6 +881,10 @@ function renderWorker(worker) {
   elements.drainWorker.disabled = worker.lifecycle !== "accepting";
   elements.resumeWorker.disabled = worker.lifecycle === "accepting";
 }
+
+/* -------------------------------------------------------------------------
+   Actions
+   ------------------------------------------------------------------------- */
 
 async function setWorkerLifecycle(action) {
   const draining = action === "drain";
@@ -775,14 +899,7 @@ async function setWorkerLifecycle(action) {
   elements.drainWorker.disabled = true;
   elements.resumeWorker.disabled = true;
   try {
-    const response = await fetch(`/operator/worker/${action}`, {
-      method: "POST",
-      headers: {
-        accept: "application/json",
-        "content-type": "application/json",
-      },
-      body: "{}",
-    });
+    const response = await postJson(`/operator/worker/${action}`, {});
     const payload = await readJson(response);
     toast(payload.message, "success");
     state.jobsFingerprint = "";
@@ -794,94 +911,23 @@ async function setWorkerLifecycle(action) {
   }
 }
 
-async function loadJobs({ quiet = false } = {}) {
-  if (state.loading) return;
-  state.loading = true;
-  elements.refresh.disabled = true;
-  if (!quiet) elements.error.classList.add("is-hidden");
-  try {
-    const response = await fetch("/api/jobs", {
-      headers: { accept: "application/json" },
-      cache: "no-store",
-    });
-    const payload = await readJson(response, "Loading jobs failed");
-    const jobsFingerprint = JSON.stringify(payload.jobs);
-    const jobsChanged = jobsFingerprint !== state.jobsFingerprint;
-    state.jobs = payload.jobs;
-    state.jobsFingerprint = jobsFingerprint;
-    renderWorker(payload.worker);
-    if (jobsChanged) {
-      renderMetrics();
-      renderJobs();
-      renderLocalRecovery();
-    }
-    elements.updated.textContent = `Updated ${new Intl.DateTimeFormat(undefined, {
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-    }).format(new Date())}`;
-  } catch (error) {
-    elements.error.textContent = error instanceof Error ? error.message : String(error);
-    elements.error.classList.remove("is-hidden");
-  } finally {
-    state.loading = false;
-    elements.refresh.disabled = false;
-  }
-}
-
-async function loadCoordinatorRecovery({ quiet = false } = {}) {
-  if (state.coordinatorLoading) return;
-  state.coordinatorLoading = true;
-  try {
-    const response = await fetch("/api/coordinator/lost-job", {
-      headers: { accept: "application/json" },
-      cache: "no-store",
-    });
-    let lostJob = null;
-    if (response.status !== 204) {
-      lostJob = await readJson(response, "Tropibot recovery check failed");
-    }
-    const fingerprint = JSON.stringify(lostJob);
-    if (fingerprint !== state.lostJobFingerprint) {
-      state.lostJob = lostJob;
-      state.lostJobFingerprint = fingerprint;
-      renderCoordinatorRecovery();
-      renderMetrics();
-    }
-  } catch (error) {
-    if (!quiet) {
-      elements.error.textContent =
-        error instanceof Error ? error.message : String(error);
-      elements.error.classList.remove("is-hidden");
-    }
-  } finally {
-    state.coordinatorLoading = false;
-  }
-}
-
 async function markCoordinatorReady(retry, button) {
   const job = state.lostJob;
   if (!job) return;
-  const action = retry ? "release the worker and retry this package" : "release the worker without retrying";
+  const action = retry
+    ? "release the worker and retry this package"
+    : "release the worker without retrying";
   const confirmed = window.confirm(
     `Confirm the old worker process is stopped and cleanup for ${job.package.dnpName} is complete.\n\nThis will ${action}.`,
   );
   if (!confirmed) return;
 
   const originalLabel = button.textContent;
-  button.disabled = true;
   elements.readyAndRetry.disabled = true;
   elements.readyWithoutRetry.disabled = true;
   button.textContent = retry ? "Releasing & retrying…" : "Releasing…";
   try {
-    const response = await fetch("/operator/coordinator/ready", {
-      method: "POST",
-      headers: {
-        accept: "application/json",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ jobId: job.jobId, retry }),
-    });
+    const response = await postJson("/operator/coordinator/ready", { jobId: job.jobId, retry });
     const payload = await readJson(response);
     const retryResult = humanize(payload.retryDisposition);
     const blocked = payload.blockingJobIds?.length
@@ -917,14 +963,7 @@ async function runRecoveryAction(job, action, button) {
   button.disabled = true;
   button.textContent = acceptingCoordinator ? "Releasing…" : "Working…";
   try {
-    const response = await fetch("/operator/recovery/action", {
-      method: "POST",
-      headers: {
-        accept: "application/json",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ runId: job.runId, action }),
-    });
+    const response = await postJson("/operator/recovery/action", { runId: job.runId, action });
     const payload = await readJson(response);
     toast(payload.message || "Worker recovery action accepted", "success");
     state.jobsFingerprint = "";
@@ -943,6 +982,75 @@ function toast(message, kind) {
   elements.toastRegion.append(item);
   window.setTimeout(() => item.remove(), 5000);
 }
+
+/* -------------------------------------------------------------------------
+   Loading
+   ------------------------------------------------------------------------- */
+
+function showError(error) {
+  elements.error.textContent = error instanceof Error ? error.message : String(error);
+  elements.error.classList.remove("is-hidden");
+}
+
+async function loadJobs({ quiet = false } = {}) {
+  if (state.loading) return;
+  state.loading = true;
+  elements.refresh.disabled = true;
+  if (!quiet) elements.error.classList.add("is-hidden");
+  try {
+    const response = await fetch("/api/jobs", {
+      headers: { accept: "application/json" },
+      cache: "no-store",
+    });
+    const payload = await readJson(response, "Loading jobs failed");
+    const jobsFingerprint = JSON.stringify(payload.jobs);
+    const jobsChanged = jobsFingerprint !== state.jobsFingerprint;
+    state.jobs = payload.jobs;
+    state.jobsFingerprint = jobsFingerprint;
+    renderWorker(payload.worker);
+    if (jobsChanged) {
+      renderMetrics();
+      renderJobs();
+      renderLocalRecovery();
+    }
+    elements.updated.textContent = `Updated ${formatTime(new Date())}`;
+  } catch (error) {
+    showError(error);
+  } finally {
+    state.loading = false;
+    elements.refresh.disabled = false;
+  }
+}
+
+async function loadCoordinatorRecovery({ quiet = false } = {}) {
+  if (state.coordinatorLoading) return;
+  state.coordinatorLoading = true;
+  try {
+    const response = await fetch("/api/coordinator/lost-job", {
+      headers: { accept: "application/json" },
+      cache: "no-store",
+    });
+    let lostJob = null;
+    if (response.status !== 204) {
+      lostJob = await readJson(response, "Tropibot recovery check failed");
+    }
+    const fingerprint = JSON.stringify(lostJob);
+    if (fingerprint !== state.lostJobFingerprint) {
+      state.lostJob = lostJob;
+      state.lostJobFingerprint = fingerprint;
+      renderCoordinatorRecovery();
+      renderMetrics();
+    }
+  } catch (error) {
+    if (!quiet) showError(error);
+  } finally {
+    state.coordinatorLoading = false;
+  }
+}
+
+/* -------------------------------------------------------------------------
+   Wiring
+   ------------------------------------------------------------------------- */
 
 elements.refresh.addEventListener("click", () => {
   loadJobs();

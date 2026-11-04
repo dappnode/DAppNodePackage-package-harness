@@ -4,144 +4,128 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
-    <meta name="theme-color" content="#11100f">
+    <meta name="theme-color" content="#0f0e0d">
     <title>Package Harness · Operator Console</title>
     <link rel="stylesheet" href="/dashboard.css">
     <script src="/dashboard.js" defer></script>
   </head>
   <body>
-    <div class="ambient ambient-one"></div>
-    <div class="ambient ambient-two"></div>
-    <main class="shell">
-      <header class="topbar">
+    <header class="topbar">
+      <div class="container topbar-inner">
         <a class="brand" href="/" aria-label="Package Harness dashboard">
           <span class="brand-mark" aria-hidden="true">H</span>
-          <span>
+          <span class="brand-text">
             <strong>Package Harness</strong>
             <small>Operator console</small>
           </span>
         </a>
-        <div class="worker-state" id="worker-state" aria-live="polite">
-          <span class="state-dot"></span>
-          <span id="worker-label">Connecting</span>
-        </div>
-      </header>
-
-      <section class="hero">
-        <div>
-          <p class="eyebrow">DAppNode validation operations</p>
-          <h1>Jobs, recovery, and delivery<br>in one place.</h1>
-          <p class="hero-copy" id="worker-message">
-            Loading the local worker state…
-          </p>
-        </div>
-        <div class="hero-actions">
-          <button class="button button-secondary" id="refresh-button" type="button">
-            Refresh now
-          </button>
+        <div class="topbar-meta">
           <span class="updated" id="last-updated">Not updated yet</span>
-        </div>
-      </section>
-
-      <section class="metrics" aria-label="Job overview">
-        <article class="metric">
-          <span>Total jobs</span>
-          <strong id="metric-total">—</strong>
-          <small>Persisted locally</small>
-        </article>
-        <article class="metric metric-attention">
-          <span>Needs attention</span>
-          <strong id="metric-attention">—</strong>
-          <small>Operator action required</small>
-        </article>
-        <article class="metric">
-          <span>In progress</span>
-          <strong id="metric-active">—</strong>
-          <small>Queued or running</small>
-        </article>
-        <article class="metric">
-          <span>Delivered</span>
-          <strong id="metric-delivered">—</strong>
-          <small>Acknowledged by Tropibot</small>
-        </article>
-      </section>
-
-      <section class="drain-control" id="drain-control" aria-live="polite">
-        <div class="recovery-heading">
-          <div>
-            <p class="eyebrow">Planned restart control</p>
-            <h2>Worker lifecycle</h2>
+          <div class="worker-state" id="worker-state" aria-live="polite">
+            <span class="state-dot" aria-hidden="true"></span>
+            <span id="worker-label">Connecting</span>
           </div>
-          <span class="badge ready" id="drain-lifecycle">Accepting</span>
-        </div>
-        <p class="drain-copy" id="drain-message">
-          The worker is accepting package jobs.
-        </p>
-        <div class="drain-status" id="drain-status">
-          <div>
-            <span>Current work</span>
-            <strong id="drain-current-job">Checking…</strong>
-          </div>
-          <div>
-            <span>Restart safety</span>
-            <strong id="drain-safety">Not drained</strong>
-          </div>
-        </div>
-        <div class="recovery-actions">
-          <button class="button button-primary" id="drain-worker" type="button">
-            Drain worker
-          </button>
-          <button class="button button-secondary" id="resume-worker" type="button" disabled>
-            Resume accepting jobs
+          <button class="button button-secondary button-sm" id="refresh-button" type="button">
+            Refresh
           </button>
         </div>
+      </div>
+    </header>
+
+    <main class="container page">
+      <section class="overview" aria-label="Worker overview">
+        <article class="panel worker-panel" id="drain-control" aria-live="polite">
+          <div class="panel-head">
+            <div class="panel-title">
+              <h2>Worker</h2>
+              <span class="badge" id="drain-lifecycle">Accepting</span>
+            </div>
+            <div class="actions">
+              <button class="button button-primary" id="drain-worker" type="button">
+                Drain worker
+              </button>
+              <button class="button button-secondary" id="resume-worker" type="button" disabled>
+                Resume
+              </button>
+            </div>
+          </div>
+          <p class="panel-copy" id="worker-message">Loading the local worker state…</p>
+          <dl class="kv kv-2" id="drain-status">
+            <div>
+              <dt>Current work</dt>
+              <dd id="drain-current-job">Checking…</dd>
+            </div>
+            <div>
+              <dt>Restart safety</dt>
+              <dd id="drain-safety">Not drained</dd>
+            </div>
+          </dl>
+        </article>
+
+        <div class="metrics" aria-label="Job overview">
+          <article class="metric">
+            <span class="metric-label">Total jobs</span>
+            <strong id="metric-total">—</strong>
+            <small>Persisted locally</small>
+          </article>
+          <article class="metric metric-attention">
+            <span class="metric-label">Needs attention</span>
+            <strong id="metric-attention">—</strong>
+            <small>Operator action required</small>
+          </article>
+          <article class="metric">
+            <span class="metric-label">In progress</span>
+            <strong id="metric-active">—</strong>
+            <small>Queued or running</small>
+          </article>
+          <article class="metric">
+            <span class="metric-label">Delivered</span>
+            <strong id="metric-delivered">—</strong>
+            <small>Acknowledged by Tropibot</small>
+          </article>
+        </div>
       </section>
 
-      <section class="local-recovery is-hidden" id="local-recovery" aria-live="polite">
-        <div class="recovery-heading">
-          <div>
-            <p class="eyebrow">Local worker control</p>
-            <h2 id="local-recovery-title">Worker recovery required</h2>
-          </div>
+      <section class="callout callout-warning is-hidden" id="local-recovery" aria-live="polite">
+        <p class="callout-eyebrow">Local worker control</p>
+        <div class="panel-title">
+          <h2 id="local-recovery-title">Worker recovery required</h2>
           <span class="badge failed" id="local-recovery-kind">Paused</span>
         </div>
-        <p class="local-recovery-copy" id="local-recovery-reason"></p>
-        <div class="recovery-context" id="local-recovery-context"></div>
-        <div class="recovery-explanation" id="local-recovery-explanation"></div>
-        <div class="recovery-actions" id="local-recovery-actions"></div>
+        <p class="callout-reason" id="local-recovery-reason"></p>
+        <dl class="kv kv-3" id="local-recovery-context"></dl>
+        <p class="callout-note" id="local-recovery-explanation"></p>
+        <div class="actions" id="local-recovery-actions"></div>
       </section>
 
-      <section class="coordinator-recovery is-hidden" id="coordinator-recovery" aria-live="polite">
-        <div class="recovery-heading">
-          <div>
-            <p class="eyebrow">Tropibot worker recovery</p>
-            <h2>Coordinator has fenced this worker</h2>
-          </div>
+      <section class="callout callout-danger is-hidden" id="coordinator-recovery" aria-live="polite">
+        <p class="callout-eyebrow">Tropibot worker recovery</p>
+        <div class="panel-title">
+          <h2>Coordinator has fenced this worker</h2>
           <span class="badge failed">Action required</span>
         </div>
-        <p class="coordinator-recovery-copy">
-          Tropibot will not assign more work until you confirm the old worker is stopped
-          and package cleanup is complete.
+        <p class="callout-reason">
+          Tropibot will not assign more work until you confirm the old worker is stopped and package cleanup is complete.
         </p>
-        <div class="recovery-context">
+        <dl class="kv kv-4">
           <div>
-            <span>Package</span>
-            <strong id="lost-job-package">—</strong>
+            <dt>Package</dt>
+            <dd id="lost-job-package">—</dd>
           </div>
           <div>
-            <span>Job</span>
-            <strong id="lost-job-id">—</strong>
+            <dt>Job</dt>
+            <dd class="mono" id="lost-job-id">—</dd>
           </div>
           <div>
-            <span>Last phase</span>
-            <strong id="lost-job-phase">—</strong>
+            <dt>Last phase</dt>
+            <dd id="lost-job-phase">—</dd>
           </div>
           <div>
-            <span>Last heartbeat</span>
-            <strong id="lost-job-heartbeat">—</strong>
+            <dt>Last heartbeat</dt>
+            <dd id="lost-job-heartbeat">—</dd>
           </div>
-        </div>
-        <div class="recovery-actions">
+        </dl>
+        <div class="actions">
           <button class="button button-primary" id="ready-and-retry" type="button">
             Cleanup done — release &amp; retry
           </button>
@@ -151,18 +135,15 @@
         </div>
       </section>
 
-      <section class="jobs-section">
-        <div class="section-heading">
-          <div>
-            <p class="eyebrow">Local run history</p>
-            <h2>Package jobs</h2>
-          </div>
+      <section class="jobs-section" aria-labelledby="jobs-title">
+        <div class="section-head">
+          <h2 id="jobs-title">Package jobs</h2>
           <div class="controls">
             <label class="search">
               <span class="sr-only">Search jobs</span>
               <input id="search-input" type="search" placeholder="Search package or run ID">
             </label>
-            <div class="filters" role="group" aria-label="Filter jobs">
+            <div class="segmented" role="group" aria-label="Filter jobs">
               <button class="filter is-active" data-filter="all" type="button">All</button>
               <button class="filter" data-filter="attention" type="button">Needs action</button>
               <button class="filter" data-filter="active" type="button">Active</button>
@@ -172,10 +153,20 @@
         </div>
 
         <div class="notice is-hidden" id="error-notice" role="alert"></div>
-        <div class="jobs" id="jobs" aria-live="polite" aria-busy="true"></div>
+
+        <div class="job-table" id="job-table">
+          <div class="job-columns" aria-hidden="true">
+            <span>Package</span>
+            <span>Result</span>
+            <span class="col-stage">Stage</span>
+            <span class="col-cleanup">Cleanup</span>
+            <span class="col-date">Created</span>
+            <span></span>
+          </div>
+          <div class="jobs" id="jobs" aria-live="polite" aria-busy="true"></div>
+        </div>
 
         <div class="empty is-hidden" id="empty-state">
-          <span class="empty-mark" aria-hidden="true">◎</span>
           <h3>No matching jobs</h3>
           <p>Try another filter or wait for Tropibot to assign work.</p>
         </div>

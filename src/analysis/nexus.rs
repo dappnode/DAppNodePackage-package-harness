@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::{
-    analysis::{heuristic::analyze_heuristically, redaction::truncate_utf8},
+    analysis::{
+        heuristic::analyze_heuristically,
+        redaction::{redact_and_bound_single_line, truncate_utf8},
+    },
     model::{AnalyzerComponent, AnalyzerKind, AnalyzerStatus, LogAnalysisInput, LogAnalysisResult},
 };
 
@@ -165,8 +168,13 @@ impl LogAnalyzer for NexusLogAnalyzer {
                     )));
                 }
                 let response_bytes = bounded_response_bytes(response).await?;
-                let response: ChatResponse = serde_json::from_slice(&response_bytes)
-                    .map_err(|error| AnalyzerError::InvalidResponse(error.to_string()))?;
+                let response: ChatResponse =
+                    serde_json::from_slice(&response_bytes).map_err(|error| {
+                        AnalyzerError::InvalidResponse(format!(
+                            "Nexus response is not a chat completion ({error}); it starts with: {}",
+                            preview(&String::from_utf8_lossy(&response_bytes))
+                        ))
+                    })?;
                 let content = response
                     .choices
                     .first()
@@ -174,8 +182,7 @@ impl LogAnalyzer for NexusLogAnalyzer {
                     .ok_or_else(|| {
                         AnalyzerError::InvalidResponse("missing choice content".to_owned())
                     })?;
-                let mut result: LogAnalysisResult = serde_json::from_str(content)
-                    .map_err(|error| AnalyzerError::InvalidResponse(error.to_string()))?;
+                let mut result = parse_analysis(content)?;
                 normalize_result(&mut result);
                 result.analyzer = AnalyzerKind::Nexus;
                 Ok(result)
@@ -204,6 +211,45 @@ impl LogAnalyzer for NexusLogAnalyzer {
         }
         result
     }
+}
+
+/// Parses the model's answer. `nexus/auto` can route to reasoning models that
+/// put a `<think>...</think>` block before the answer, and models sometimes
+/// wrap the object in a Markdown fence or a sentence despite the prompt, so
+/// reasoning is dropped and the outermost `{...}` is accepted.
+fn parse_analysis(content: &str) -> Result<LogAnalysisResult, AnalyzerError> {
+    let content = content
+        .rsplit_once("</think>")
+        .map_or(content, |(_, answer)| answer)
+        .trim();
+    let strict_error = match serde_json::from_str(content) {
+        Ok(result) => return Ok(result),
+        Err(error) => error,
+    };
+    let embedded = content
+        .find('{')
+        .zip(content.rfind('}'))
+        .filter(|(start, end)| start < end)
+        .map(|(start, end)| serde_json::from_str(&content[start..=end]));
+    let error = match embedded {
+        Some(Ok(result)) => return Ok(result),
+        Some(Err(error)) => error,
+        None => strict_error,
+    };
+    Err(AnalyzerError::InvalidResponse(if content.is_empty() {
+        "Nexus answer is empty".to_owned()
+    } else {
+        format!(
+            "Nexus answer is not the requested JSON object ({error}); it starts with: {}",
+            preview(content)
+        )
+    }))
+}
+
+/// A short redacted single-line excerpt that shows what came back without
+/// copying analyzed log content into errors.
+fn preview(text: &str) -> String {
+    redact_and_bound_single_line(text.trim(), 120)
 }
 
 fn request_error(error: reqwest::Error) -> AnalyzerError {

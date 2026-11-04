@@ -943,6 +943,88 @@ async fn malformed_nexus_response_falls_back_to_heuristic() -> Result<(), Box<dy
     Ok(())
 }
 
+async fn nexus_answering(content: &str) -> Result<NexusLogAnalyzer, Box<dyn Error>> {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": content}}]
+        })))
+        .mount(&server)
+        .await;
+    let nexus = NexusLogAnalyzer::new(
+        "test-key".to_owned(),
+        server.uri(),
+        "test-model".to_owned(),
+        Duration::from_secs(1),
+        4096,
+    )?;
+    // The analyzer only holds the URL; keep the mock alive for the test.
+    std::mem::forget(server);
+    Ok(nexus)
+}
+
+#[tokio::test]
+async fn nexus_accepts_an_answer_wrapped_in_a_fence_or_prose() -> Result<(), Box<dyn Error>> {
+    let analysis = json!({
+        "analyzer": "nexus",
+        "status": "suspicious",
+        "summary": "candidate warns about a deprecated setting",
+        "baseline": {"status": "clean", "summary": "clean"},
+        "candidate": {"status": "suspicious", "summary": "deprecation warning"},
+        "newFindings": []
+    })
+    .to_string();
+    let input = LogAnalysisInput {
+        baseline: Vec::new(),
+        candidate: Vec::new(),
+    };
+    for content in [
+        format!("```json\n{analysis}\n```"),
+        format!("Here is the analysis:\n{analysis}\nLet me know if you need more."),
+        // Reasoning models answer like this; the reasoning may contain braces.
+        format!(
+            "<think>Fields: analyzer, status {{clean|suspicious}}, newFindings.</think>\n\n{analysis}"
+        ),
+    ] {
+        let result = nexus_answering(&content).await?.analyze(&input).await?;
+        assert_eq!(
+            result.status,
+            dappnode_package_harness::model::AnalyzerStatus::Suspicious
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn nexus_parse_errors_show_what_the_model_answered() -> Result<(), Box<dyn Error>> {
+    let input = LogAnalysisInput {
+        baseline: Vec::new(),
+        candidate: Vec::new(),
+    };
+    let Err(error) = nexus_answering("I cannot analyze these logs.")
+        .await?
+        .analyze(&input)
+        .await
+    else {
+        return Err("prose without JSON must be rejected".into());
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("not the requested JSON object"),
+        "{message}"
+    );
+    assert!(
+        message.contains("I cannot analyze these logs."),
+        "{message}"
+    );
+
+    let Err(error) = nexus_answering("  ").await?.analyze(&input).await else {
+        return Err("an empty answer must be rejected".into());
+    };
+    assert!(error.to_string().contains("Nexus answer is empty"));
+    Ok(())
+}
+
 #[tokio::test]
 async fn nexus_accepts_useful_responses_over_the_original_bounds() -> Result<(), Box<dyn Error>> {
     let server = MockServer::start().await;

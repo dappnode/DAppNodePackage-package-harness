@@ -20,6 +20,10 @@ Top-level fields:
 | `cleanup` | Cleanup status, bounded error, and packages not present in the initial snapshot. |
 | `errors` | Bounded typed run errors with the phase where each occurred. |
 
+An unresolvable published baseline completes with `verdict: "inconclusive"`, `reasonCode: "baseline_unresolvable"`, and `cleanup.status: "skipped"`. Its summary explains that upgrade comparison was skipped without changing packages and suggests repairing or publishing the registry entry or supplying a known-good IPFS `baselineRef`. Both sides' install and log-collection statuses remain `pending` to mean not attempted; their hard checks are false with reason `baseline_unresolvable`, rather than falsely reporting unstable containers. The coordinator receives and acknowledges this normal result, and the worker can accept the next job. Generic RPC failures and contract reverts are not treated as evidence of a missing baseline.
+
+The local recovery plan can be `restore_baseline` for an initially installed target with an explicit IPFS baseline. Its immutable reference comes from the persisted request's `package.baselineRef`, so recovery does not require a published release. Cleanup preserves volumes and verifies the restored package's IPFS origin. Existing records with `restore_latest` or `remove` retain their recorded recovery policy.
+
 If Dappmanager rejects the baseline package signature, the harness retries that
 baseline mutation with the signed-package restriction bypass. A successful
 retry continues the comparison, changes an otherwise passing verdict to

@@ -83,14 +83,23 @@ pub(super) fn build_result(
     reason_code: ReasonCode,
     summary: String,
 ) -> HarnessResult {
-    let baseline = result_side(
+    let mut baseline = result_side(
         record.evidence.baseline.as_ref(),
         ReasonCode::BaselineContainersUnstable,
     );
-    let candidate = result_side(
+    let mut candidate = result_side(
         record.evidence.candidate.as_ref(),
         ReasonCode::CandidateContainersUnstable,
     );
+    if reason_code == ReasonCode::BaselineUnresolvable {
+        // Pending records unattempted steps in the existing protocol, rather
+        // than inventing installation failures or unstable containers.
+        for side in [&mut baseline, &mut candidate] {
+            side.install.status = StepStatus::Pending;
+            side.log_collection.status = StepStatus::Pending;
+            side.hard_check.reason_codes = vec![ReasonCode::BaselineUnresolvable];
+        }
+    }
     let started = record.started_at.unwrap_or(record.created_at);
     let finished = record.finished_at.unwrap_or_else(Utc::now);
     HarnessResult {

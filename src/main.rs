@@ -15,9 +15,10 @@ use dappnode_package_harness::{
     coordinator::CoordinatorClient,
     model::ExplicitPackageResolver,
     package_manager::{
-        DappmanagerPackageManager, FakePackageManager, PackageManager, UnavailablePackageManager,
+        DappmanagerPackageManager, FakePackageManager, PackageManager, PackageManagerError,
     },
     runner::{RunController, RunnerConfig, stabilization::StabilizationConfig},
+    startup::validate_dependencies,
     storage::{FileRunStore, RunStore},
     worker::{
         PackageHarnessWorker, WorkerConfig, WorkerDependencies, WorkerDrainControl,
@@ -46,6 +47,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let config = Arc::new(Config::from_env()?);
+    if !env::args().any(|argument| argument == "--mcp-smoke")
+        && let Some(error) = config.acceptance_error()
+    {
+        return Err(error.into());
+    }
     info!(
         event = "harness_starting",
         version = %env!("CARGO_PKG_VERSION"),
@@ -80,7 +86,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         nexus_max_input_bytes = config.nexus_max_input_bytes,
         "Coordinator and analyzer policy loaded"
     );
-    let package_manager = package_manager(&config);
+    let package_manager = package_manager(&config)?;
     debug!(
         event = "package_manager_ready",
         mode = ?config.package_manager_mode,
@@ -126,6 +132,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         mcp_enabled = config.package_manager_mode == PackageManagerMode::Mcp,
         "Tropibot coordinator client ready"
     );
+    info!(
+        event = "startup_validation_started",
+        "Validating dependencies before accepting jobs"
+    );
+    validate_dependencies(&config, package_manager.as_ref(), &coordinator).await?;
+    // Bind before spawning: a port conflict must never leave a worker claiming jobs.
+    let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
+    info!(
+        event = "startup_validation_passed",
+        "Startup checks passed; worker may reconcile local state and accept jobs"
+    );
     let accepting = Arc::new(AtomicBool::new(true));
     let worker_readiness = WorkerReadiness::default();
     let worker_recovery_control = WorkerRecoveryControl::default();
@@ -162,7 +179,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         worker_recovery_control: worker_recovery_control.clone(),
         worker_drain_control: worker_drain_control.clone(),
     };
-    let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
     info!(
         event = "supervision_server_started",
         address = %config.listen_addr,
@@ -188,32 +204,29 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn package_manager(config: &Config) -> Arc<dyn PackageManager> {
+fn package_manager(config: &Config) -> Result<Arc<dyn PackageManager>, PackageManagerError> {
     match config.package_manager_mode {
-        PackageManagerMode::Fake => Arc::new(FakePackageManager::new()),
-        PackageManagerMode::Mcp => match (
-            config.dappmanager_mcp_url.clone(),
-            config.dappmanager_mcp_token.clone(),
-        ) {
-            (Some(url), Some(token)) => DappmanagerPackageManager::new(
+        PackageManagerMode::Fake => Ok(Arc::new(FakePackageManager::new())),
+        PackageManagerMode::Mcp => {
+            let url = config.dappmanager_mcp_url.clone().ok_or_else(|| {
+                PackageManagerError::Configuration(
+                    "DAPPMANAGER_MCP_URL must be configured".to_owned(),
+                )
+            })?;
+            let token = config.dappmanager_mcp_token.clone().ok_or_else(|| {
+                PackageManagerError::Configuration(
+                    "DAPPMANAGER_MCP_TOKEN must be configured".to_owned(),
+                )
+            })?;
+            Ok(Arc::new(DappmanagerPackageManager::new(
                 url,
                 token,
                 config.mcp_timeout,
                 config.mcp_mutation_timeout,
                 config.mcp_mutation_attempts,
                 config.mcp_mutation_retry_delay,
-            )
-            .map_or_else(
-                |error| {
-                    Arc::new(UnavailablePackageManager::new(error.to_string()))
-                        as Arc<dyn PackageManager>
-                },
-                |manager| Arc::new(manager) as Arc<dyn PackageManager>,
-            ),
-            _ => Arc::new(UnavailablePackageManager::new(
-                "Dappmanager MCP configuration is incomplete",
-            )),
-        },
+            )?))
+        }
     }
 }
 
@@ -235,12 +248,8 @@ fn analyzer(config: &Config) -> Result<Arc<dyn LogAnalyzer>, Box<dyn Error>> {
 
 async fn mcp_smoke(package_manager: Arc<dyn PackageManager>) -> Result<(), Box<dyn Error>> {
     let tools = package_manager.verify_tools().await?;
-    if !tools
-        .available
-        .iter()
-        .any(|tool| tool == "dappnode_list_packages")
-    {
-        return Err("dappnode_list_packages is not available".into());
+    if !tools.ready() {
+        return Err(tools.message().into());
     }
     let packages = package_manager.list_packages().await?;
     println!("{}", serde_json::to_string_pretty(&packages)?);

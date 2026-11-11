@@ -709,6 +709,7 @@ impl PackageHarnessWorker {
             Arc::clone(&self.clock),
             target,
             recovery_plan,
+            record.request.package.baseline_ref.as_ref(),
             &record.evidence.initial_packages,
             self.config.cleanup_timeout,
         )

@@ -71,6 +71,52 @@ impl NexusLogAnalyzer {
             max_input_bytes,
         })
     }
+
+    /// Verifies inference access to the configured model with a one-token
+    /// synthetic request. Catalog endpoints may be public and cannot prove that
+    /// the key has inference permission or sufficient credit.
+    pub async fn validate_access(&self) -> Result<(), AnalyzerError> {
+        info!(event = "startup_nexus_validation_started", model = %self.model, "Checking Nexus inference access with a one-token synthetic request");
+        tokio::time::timeout(self.timeout, async {
+            let endpoint = self
+                .base_url
+                .join("chat/completions")
+                .map_err(|error| AnalyzerError::Configuration(error.to_string()))?;
+            let response = self
+                .client
+                .post(endpoint)
+                .bearer_auth(&self.api_key)
+                .json(&serde_json::json!({
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": "Reply OK."}],
+                    "stream": false,
+                    "max_tokens": 1
+                }))
+                .send()
+                .await
+                .map_err(request_error)?;
+            if !response.status().is_success() {
+                return Err(AnalyzerError::Configuration(format!(
+                    "Nexus startup inference check returned HTTP {}",
+                    response.status().as_u16()
+                )));
+            }
+            let bytes = bounded_response_bytes(response).await?;
+            let response: ChatResponse = serde_json::from_slice(&bytes).map_err(|_| {
+                AnalyzerError::InvalidResponse(
+                    "Nexus startup check did not return a chat completion".to_owned(),
+                )
+            })?;
+            if response.choices.is_empty() {
+                return Err(AnalyzerError::InvalidResponse(
+                    "Nexus startup check returned no choices".to_owned(),
+                ));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| AnalyzerError::Timeout)?
+    }
 }
 
 #[derive(Serialize)]

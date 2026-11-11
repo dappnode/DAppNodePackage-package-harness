@@ -11,6 +11,7 @@ pub enum ReasonCode {
     BaselineInstallFailed,
     BaselineSignatureInvalid,
     BaselineUnavailable,
+    BaselineUnresolvable,
     UnsupportedRequiredSetup,
     CorePackageRefused,
     HarnessPackageRefused,

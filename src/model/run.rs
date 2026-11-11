@@ -67,6 +67,9 @@ pub enum TargetRecoveryPlan {
     /// The target existed before the run and must be freshly installed from
     /// the latest published registry release while preserving its volumes.
     RestoreLatest,
+    /// Restore the explicit IPFS baseline persisted in the run request. This
+    /// supports installed targets that have no resolvable published release.
+    RestoreBaseline,
 }
 
 /// Delivery state owned by the polling worker.

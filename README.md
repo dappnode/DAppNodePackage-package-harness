@@ -23,7 +23,11 @@ For every accepted job, the deterministic controller:
 5. captures normalized details and bounded, redacted log tails;
 6. upgrades the baseline in place to the candidate;
 7. repeats stabilization and capture, compares both observations, and performs optional Nexus analysis;
-8. restores a pre-existing target by removing it without deleting volumes and freshly installing the latest published release (`*`), or removes a target that was initially absent with `deleteVolumes: true`; cleanup fails when final inventory cannot be verified or contains unexpected dependencies. A cleanup that already passed, automatically or through an operator, is never repeated.
+8. restores a pre-existing target by removing it without deleting volumes and freshly installing the explicit IPFS baseline when supplied, or the latest published release (`*`) otherwise; a target that was initially absent is removed with `deleteVolumes: true`. Cleanup fails when the pinned origin or final inventory cannot be verified or inventory contains unexpected dependencies. A cleanup that already passed, automatically or through an operator, is never repeated.
+
+If ENS cannot resolve a requested registry baseline (`UnreachableName`, `ResolverNotFound`, or Dappmanager's `NOREPO` error), the job completes as `inconclusive` with reason `baseline_unresolvable`: “No resolvable published baseline; upgrade comparison skipped.” No package is installed, updated, or removed, including when a copy is already installed. This is a package prerequisite, not a worker-wide outage or a failed candidate test. The result is acknowledged normally and the worker continues polling; deterministic resolution failures are not retried within the job. Network failures, timeouts, and unrelated contract reverts retain their infrastructure-error classification.
+
+For a package without a resolvable published release, the coordinator can supply a known-good `baselineRef` such as `/ipfs/<cid>` to test the upgrade path. This does not silently substitute the currently installed package or turn the job into an installation-only test. For an existing target, cleanup and restart recovery use that exact persisted IPFS reference, preserve volumes, and verify the restored origin. A missing or non-IPFS reference for a pinned recovery plan blocks cleanup before removal. Registry baselines (omitted, `*`, or semver) keep the latest-release restoration policy.
 
 Nexus is advisory. With no key, the harness uses the heuristic analyzer only. With a key, it sends one bounded redacted request with no tools; Nexus failures fall back safely, and Nexus can never override a deterministic failure.
 
@@ -39,9 +43,19 @@ PACKAGE_HARNESS_POLL_SECONDS=10
 PACKAGE_HARNESS_HEARTBEAT_SECONDS=20
 ```
 
+Startup fails with a nonzero exit before the worker can claim jobs if any required check fails. Fix the reported setting or dependency and restart the harness. Checks include:
+
+- Valid package identity, nonempty data directory, credential formatting, and absolute service URLs without embedded credentials, queries, or fragments. Tropibot requires HTTPS; local Dappmanager and Nexus endpoints may use HTTP.
+- The destructive-test acknowledgement (`ALLOW_DESTRUCTIVE_PACKAGE_TESTS=true`).
+- Durable storage: create, write, sync, rename, read back, and delete a temporary probe in `DATA_DIR`. Existing records are reconciled before polling begins.
+- Authenticated Dappmanager tool discovery, including all three mutation tools, followed by package inventory, details, a one-line log sample, and an install preview for an installed package. These checks never install, update, or remove a package; the log sample is discarded.
+- Authenticated Tropibot worker-protocol access through the read-only lost-job endpoint. This does not claim or release work, and an existing lost job remains available for recovery.
+- When `NEXUS_API_KEY` is configured, a synthetic chat completion with `max_tokens: 1` verifies access to `NEXUS_MODEL`, including inference authorization and credit checks. This uses a small amount of inference credit and sends no package evidence. Startup fails if this check fails; analysis during an accepted job still has the heuristic fallback.
+- Binding the supervision port before starting the worker.
+
 The shared bearer token is appropriate for this small trusted v1 deployment. The protocol deliberately leaves room for later per-worker credentials or mTLS, but neither is part of this version. The worker never logs the token.
 
-Use [`.env.example`](.env.example) for all timeout, Dappmanager, cleanup, and optional Nexus settings. `MCP_TIMEOUT_MS` bounds read-only Dappmanager calls at 30 seconds by default, while `MCP_MUTATION_TIMEOUT_MS` gives each install, update, or removal attempt 30 minutes by default (up to one hour). Transient transport and package-download failures are retried three times with bounded exponential backoff; tune this with `MCP_MUTATION_ATTEMPTS` and `MCP_MUTATION_RETRY_DELAY_MS`. A mutation that exceeds its deadline is never resent, because Dappmanager keeps running it: the harness instead polls for the requested state for up to another `MCP_MUTATION_TIMEOUT_MS` and fails the step if it is not reached. `NEXUS_TIMEOUT_MS` gives advisory Nexus analysis five minutes by default. If the target package was installed before a run, cleanup preserves its volumes and freshly installs the latest published release; otherwise cleanup removes the target and its volumes. The pre-run package version never replaces the requested baseline. `TROPIBOT_TIMEOUT_MS` bounds each coordinator request. The Dappmanager MCP token and Nexus key remain local and are never sent to Tropibot or persisted in a job record.
+Use [`.env.example`](.env.example) for all timeout, Dappmanager, cleanup, and optional Nexus settings. `MCP_TIMEOUT_MS` bounds read-only Dappmanager calls at 30 seconds by default, while `MCP_MUTATION_TIMEOUT_MS` gives each install, update, or removal attempt 30 minutes by default (up to one hour). Transient transport and package-download failures are retried three times with bounded exponential backoff; tune this with `MCP_MUTATION_ATTEMPTS` and `MCP_MUTATION_RETRY_DELAY_MS`. A mutation that exceeds its deadline is never resent, because Dappmanager keeps running it: the harness instead polls for the requested state for up to another `MCP_MUTATION_TIMEOUT_MS` and fails the step if it is not reached. `NEXUS_TIMEOUT_MS` gives advisory Nexus analysis five minutes by default. If the target package was installed before a run, cleanup preserves its volumes and freshly installs the explicit IPFS baseline when supplied, or the latest published release otherwise; an initially absent target and its volumes are removed. The pre-run package version never replaces the requested baseline. `TROPIBOT_TIMEOUT_MS` bounds each coordinator request. The Dappmanager MCP token and Nexus key remain local and are never sent to Tropibot or persisted in a job record.
 
 ## Local fake mode
 
@@ -114,7 +128,7 @@ DAPPMANAGER_MCP_URL=https://dedicated-test-dappnode.example/mcp
 DAPPMANAGER_MCP_TOKEN=<token>
 ```
 
-Dappmanager must expose all seven tools listed in [`src/package_manager/mod.rs`](src/package_manager/mod.rs), including mutation tools. Before using a new Dappmanager version, run:
+Dappmanager must expose all seven tools listed in [`src/package_manager/mod.rs`](src/package_manager/mod.rs), including mutation tools. Use a valid MCP bearer token and enable external MCP mutating tools in **System > Advanced**. The harness checks these capabilities automatically before accepting work. Before using a new Dappmanager version, you can also run:
 
 ```bash
 TROPIBOT_URL=https://tropibot.example \
@@ -125,7 +139,7 @@ DAPPMANAGER_MCP_TOKEN=... \
 cargo run -- --mcp-smoke
 ```
 
-This checks the MCP transport, tool inventory, and normalized package listing without running a destructive test.
+This requires all seven tools and checks the MCP transport and normalized package listing without running a destructive test. It does not require the destructive-test acknowledgement or contact Tropibot or Nexus.
 
 ## Development and package build
 

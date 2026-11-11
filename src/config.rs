@@ -136,7 +136,7 @@ impl Config {
             });
         }
 
-        Ok(Self {
+        let config = Self {
             listen_addr,
             data_dir: env::var_os("DATA_DIR")
                 .map(PathBuf::from)
@@ -168,21 +168,58 @@ impl Config {
             package_harness_poll,
             package_harness_heartbeat,
             tropibot_timeout: millis("TROPIBOT_TIMEOUT_MS", 15_000)?,
-        })
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Validates settings that would otherwise fail only after claiming work.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.listen_addr.port() == 0 {
+            return Err(invalid("PORT", "must be greater than zero"));
+        }
+        if self.data_dir.as_os_str().is_empty() {
+            return Err(invalid("DATA_DIR", "must not be empty"));
+        }
+        crate::model::DnpName::parse(&self.harness_dnp_name)
+            .map_err(|_| invalid("HARNESS_DNP_NAME", "must be a valid Dappnode package name"))?;
+        validate_url("TROPIBOT_URL", &self.tropibot_url)?;
+        validate_worker_id(&self.package_harness_worker_id)?;
+        validate_token(
+            "PACKAGE_HARNESS_WORKER_TOKEN",
+            &self.package_harness_worker_token,
+        )?;
+        if self.package_manager_mode == PackageManagerMode::Mcp {
+            let url = self
+                .dappmanager_mcp_url
+                .as_deref()
+                .ok_or_else(|| invalid("DAPPMANAGER_MCP_URL", "must be configured in MCP mode"))?;
+            validate_http_url("DAPPMANAGER_MCP_URL", url, false)?;
+            let token = self.dappmanager_mcp_token.as_deref().ok_or_else(|| {
+                invalid("DAPPMANAGER_MCP_TOKEN", "must be configured in MCP mode")
+            })?;
+            validate_token("DAPPMANAGER_MCP_TOKEN", token)?;
+        }
+        if let Some(key) = &self.nexus_api_key {
+            validate_token("NEXUS_API_KEY", key)?;
+            validate_http_url("NEXUS_BASE_URL", &self.nexus_base_url, false)?;
+            if self.nexus_model.trim().is_empty() || self.nexus_model.trim() != self.nexus_model {
+                return Err(invalid(
+                    "NEXUS_MODEL",
+                    "must be nonempty without surrounding whitespace",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Returns the first startup problem that makes destructive tests unsafe.
     pub fn acceptance_error(&self) -> Option<String> {
+        if let Err(error) = self.validate() {
+            return Some(error.to_string());
+        }
         if !self.allow_destructive_tests {
             return Some("ALLOW_DESTRUCTIVE_PACKAGE_TESTS must be true".to_owned());
-        }
-        if self.package_manager_mode == PackageManagerMode::Mcp {
-            if self.dappmanager_mcp_url.is_none() {
-                return Some("DAPPMANAGER_MCP_URL is not configured".to_owned());
-            }
-            if self.dappmanager_mcp_token.is_none() {
-                return Some("DAPPMANAGER_MCP_TOKEN is not configured".to_owned());
-            }
         }
         None
     }
@@ -206,15 +243,60 @@ fn optional(name: &'static str) -> Option<String> {
 }
 
 fn validate_url(name: &'static str, value: &str) -> Result<(), ConfigError> {
+    validate_http_url(name, value, true)
+}
+
+fn invalid(name: &'static str, message: &str) -> ConfigError {
+    ConfigError::Invalid {
+        name,
+        message: message.to_owned(),
+    }
+}
+
+fn validate_token(name: &'static str, value: &str) -> Result<(), ConfigError> {
+    if value.is_empty()
+        || value.len() > 4096
+        || !value.bytes().all(|byte| (33..=126).contains(&byte))
+    {
+        return Err(invalid(
+            name,
+            "must contain 1-4096 visible ASCII characters without whitespace",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_http_url(name: &'static str, value: &str, https_only: bool) -> Result<(), ConfigError> {
     let parsed = reqwest::Url::parse(value).map_err(|error| ConfigError::Invalid {
         name,
         message: error.to_string(),
     })?;
-    if parsed.scheme() != "https" || parsed.host_str().is_none() {
+    if !matches!(parsed.scheme(), "http" | "https")
+        || (https_only && parsed.scheme() != "https")
+        || parsed.host_str().is_none()
+    {
         return Err(ConfigError::Invalid {
             name,
-            message: "must be an absolute HTTPS URL".to_owned(),
+            message: if https_only {
+                "must be an absolute HTTPS URL"
+            } else {
+                "must be an absolute HTTP(S) URL"
+            }
+            .to_owned(),
         });
+    }
+    if value
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(invalid(
+            name,
+            "must not contain credentials, a query, a fragment, whitespace, or control characters",
+        ));
     }
     Ok(())
 }

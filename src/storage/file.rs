@@ -19,6 +19,10 @@ impl FileRunStore {
                 root.display()
             ))
         })?;
+        let probe_root = root.clone();
+        tokio::task::spawn_blocking(move || verify_writable(&probe_root))
+            .await
+            .map_err(|error| StoreError::Io(error.to_string()))??;
         Ok(Self { root })
     }
 
@@ -63,6 +67,39 @@ impl FileRunStore {
         .await
         .map_err(|error| StoreError::Io(error.to_string()))?
     }
+}
+
+/// Exercise the same write, fsync, rename, read, and removal operations needed
+/// for durable job records before a coordinator claim can be made.
+fn verify_writable(root: &std::path::Path) -> Result<(), StoreError> {
+    let probe = || -> Result<(), std::io::Error> {
+        let mut temporary = tempfile::Builder::new()
+            .prefix(".startup-check-")
+            .tempfile_in(root)?;
+        let destination = tempfile::Builder::new()
+            .prefix(".startup-check-")
+            .tempfile_in(root)?
+            .into_temp_path();
+        temporary.write_all(b"package-harness storage check")?;
+        temporary.as_file().sync_all()?;
+        let persisted = temporary
+            .persist(&destination)
+            .map_err(|error| error.error)?;
+        if fs::read(&destination)? != b"package-harness storage check" {
+            return Err(std::io::Error::other(
+                "storage check read did not match write",
+            ));
+        }
+        drop(persisted);
+        destination.close()?;
+        fs::File::open(root)?.sync_all()
+    };
+    probe().map_err(|error| {
+        StoreError::Io(format!(
+            "data directory {} failed startup write check: {error}",
+            root.display()
+        ))
+    })
 }
 
 #[async_trait]

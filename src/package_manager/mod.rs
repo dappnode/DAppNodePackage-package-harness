@@ -60,7 +60,7 @@ impl ToolAvailability {
             .any(|tool| MUTATING_MCP_TOOLS.contains(&tool.as_str()));
         if mutating_missing {
             format!(
-                "required MCP tools are missing: {}; external MCP mutating tools are probably disabled",
+                "required MCP tools are missing: {}; enable external MCP mutating tools in Dappmanager System > Advanced and use a valid MCP bearer token",
                 self.missing.join(", ")
             )
         } else {
@@ -92,6 +92,26 @@ pub enum PackageManagerError {
 }
 
 impl PackageManagerError {
+    /// A deterministic registry-name resolution failure, rather than a network
+    /// outage or a generic contract revert. Inspect the full tool error before
+    /// bounding it: provider wrappers may prepend RPC failures.
+    pub fn is_unresolvable_registry_name(&self) -> bool {
+        let Self::Tool { tool, message } = self else {
+            return false;
+        };
+        if tool != "dappnode_fetch_install_preview" {
+            return false;
+        }
+        let lower = message.to_ascii_lowercase();
+        lower.contains("unreachablename(")
+            || lower.contains("resolvernotfound(")
+            // ENS Universal Resolver's UnreachableName(bytes) and
+            // ResolverNotFound(bytes) error selectors.
+            || lower.contains("0x5fe9a5df")
+            || lower.contains("0x77209fe8")
+            || (lower.contains("could not resolve name") && lower.contains(": norepo"))
+    }
+
     /// Whether repeating a package mutation may recover from this failure.
     pub fn is_transient_mutation_failure(&self) -> bool {
         match self {
@@ -224,6 +244,49 @@ pub trait PackageManager: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::PackageManagerError;
+
+    #[test]
+    fn identifies_only_deterministic_registry_resolution_failures() {
+        let preview_error = |message: &str| PackageManagerError::Tool {
+            tool: "dappnode_fetch_install_preview".to_owned(),
+            message: message.to_owned(),
+        };
+        for message in [
+            "execution reverted: UnreachableName(bytes)",
+            "execution reverted: ResolverNotFound(bytes)",
+            "MultiUrlJsonRpcProvider: all RPC endpoints failed. local: TypeError: fetch failed; fallback: execution reverted (data=\"0x5fe9a5df00000000\")",
+            "execution reverted (data=\"0x77209fe800000000\")",
+            "Could not resolve name pi-hole.dnp.dappnode.eth: NOREPO",
+        ] {
+            assert!(
+                preview_error(message).is_unresolvable_registry_name(),
+                "{message}"
+            );
+        }
+        for message in [
+            "all RPC endpoints failed: fetch failed",
+            "execution reverted (unknown custom error)",
+            "registry version lookup reverted",
+            "IPFS block not found",
+            "401 unauthorized",
+        ] {
+            assert!(
+                !preview_error(message).is_unresolvable_registry_name(),
+                "{message}"
+            );
+        }
+        assert!(
+            !PackageManagerError::Transport("UnreachableName(bytes)".to_owned())
+                .is_unresolvable_registry_name()
+        );
+        assert!(
+            !PackageManagerError::Tool {
+                tool: "dappnode_update_package".to_owned(),
+                message: "UnreachableName(bytes)".to_owned(),
+            }
+            .is_unresolvable_registry_name()
+        );
+    }
 
     #[test]
     fn identifies_signature_rejections_without_matching_unrelated_errors() {

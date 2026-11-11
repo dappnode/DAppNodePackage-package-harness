@@ -16,6 +16,7 @@ pub mod coordinator;
 pub mod model;
 pub mod package_manager;
 pub mod runner;
+pub mod startup;
 pub mod storage;
 mod tls;
 pub mod worker;

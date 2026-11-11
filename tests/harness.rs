@@ -29,7 +29,7 @@ use dappnode_package_harness::{
     package_manager::{PackageManager, PackageManagerError, REQUIRED_MCP_TOOLS, ToolAvailability},
     runner::{
         NoopRunProgress, RunControl, RunController, RunProgress, RunnerConfig,
-        cleanup::cleanup_target,
+        cleanup::{cleanup_target, reconcile_target},
         stabilization::{StabilizationConfig, stabilize},
     },
     storage::{FileRunStore, RunStore},
@@ -295,14 +295,14 @@ impl PackageManager for ScriptedPackageManager {
         dnp_name: &DnpName,
         version: Option<&PackageRef>,
     ) -> Result<PreviewSummary, PackageManagerError> {
+        self.state()?
+            .preview_requests
+            .push(version.map(ToString::to_string));
         if version.is_none()
             && let Some(error) = &self.baseline_preview_error
         {
             return Err(error.clone());
         }
-        self.state()?
-            .preview_requests
-            .push(version.map(ToString::to_string));
         let (version, resolved_ref) = version.map_or_else(
             || {
                 (
@@ -664,6 +664,302 @@ async fn baseline_preview_tool_failure_is_not_reported_as_mcp_unavailable()
 }
 
 #[tokio::test]
+async fn unresolved_published_baselines_are_skipped_without_mutation_or_retry()
+-> Result<(), Box<dyn Error>> {
+    for (name, installed) in [
+        ("pi-hole.dnp.dappnode.eth", false),
+        ("supabase.public.dappnode.eth", true),
+    ] {
+        let mut request = request("unresolvable-baseline")?;
+        request.package.dnp_name = DnpName::parse(name)?;
+        let mut manager = ScriptedPackageManager::new(request.package.dnp_name.clone());
+        if installed {
+            manager = manager.with_installed_baseline("0.1.7")?;
+        }
+        // Match the live provider wrapper: a failed local RPC followed by a
+        // deterministic ENS revert from the working public endpoint.
+        manager.baseline_preview_error = Some(PackageManagerError::Tool {
+            tool: "dappnode_fetch_install_preview".to_owned(),
+            message: format!(
+                "MultiUrlJsonRpcProvider: all RPC endpoints failed: local fetch failed; fallback execution reverted data=\"0x5fe9a5df00000000\"; {}",
+                "x".repeat(600)
+            ),
+        });
+        let observation = Arc::new(manager);
+        let (_directory, _store, record) =
+            execute_with(request, observation.clone(), &NoopRunProgress).await?;
+        let result = record.result.as_ref().ok_or("missing result")?;
+        assert_eq!(result.verdict, Verdict::Inconclusive);
+        assert_eq!(result.reason_code, ReasonCode::BaselineUnresolvable);
+        assert!(result.summary.contains("upgrade comparison skipped"));
+        assert!(result.summary.contains(name));
+        assert_eq!(record.status, ExecutionStatus::Completed);
+        assert_eq!(record.cleanup.status, CleanupStatus::Skipped);
+        assert!(!record.worker.cleanup_required);
+        assert!(record.evidence.baseline.is_none());
+        assert!(record.evidence.candidate.is_none());
+        assert_eq!(observation.install_calls()?, 0);
+        assert_eq!(observation.cleanup_calls()?, 0);
+        assert!(observation.update_versions()?.is_empty());
+        assert_eq!(observation.preview_requests()?, vec![None]);
+        assert_eq!(
+            observation.installed_version()?.as_deref(),
+            installed.then_some("0.1.7")
+        );
+        assert_eq!(
+            result.baseline.install.status,
+            dappnode_package_harness::model::StepStatus::Pending
+        );
+        assert_eq!(
+            result.candidate.install.status,
+            dappnode_package_harness::model::StepStatus::Pending
+        );
+        assert_eq!(
+            result.candidate.hard_check.reason_codes,
+            vec![ReasonCode::BaselineUnresolvable]
+        );
+        assert_eq!(
+            serde_json::to_value(result)?["reasonCode"],
+            "baseline_unresolvable"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn registry_transport_failures_remain_infrastructure_errors() -> Result<(), Box<dyn Error>> {
+    for error in [
+        PackageManagerError::Tool {
+            tool: "dappnode_fetch_install_preview".to_owned(),
+            message: "all RPC endpoints failed: fetch failed".to_owned(),
+        },
+        PackageManagerError::Timeout {
+            tool: "dappnode_fetch_install_preview".to_owned(),
+        },
+        PackageManagerError::Transport("connection reset".to_owned()),
+    ] {
+        let request = request("registry-transport-failure")?;
+        let mut manager = ScriptedPackageManager::new(request.package.dnp_name.clone());
+        manager.baseline_preview_error = Some(error);
+        let (_directory, _store, record) =
+            execute_with(request, Arc::new(manager), &NoopRunProgress).await?;
+        let result = record.result.ok_or("missing result")?;
+        assert_eq!(result.verdict, Verdict::InfrastructureError);
+        assert_ne!(result.reason_code, ReasonCode::BaselineUnresolvable);
+        assert_eq!(result.cleanup.status, CleanupStatus::Skipped);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn pinned_recovery_rejects_missing_or_mutable_references_without_mutation()
+-> Result<(), Box<dyn Error>> {
+    let request = request("invalid-pinned-recovery")?;
+    let manager = ScriptedPackageManager::new(request.package.dnp_name.clone())
+        .with_installed_baseline("candidate")?;
+    for reference in [
+        None,
+        Some(PackageRef::parse("1.0.0")?),
+        Some(PackageRef::parse("*")?),
+    ] {
+        let (cleanup, _) = reconcile_target(
+            &manager,
+            Arc::new(ImmediateClock),
+            &request.package.dnp_name,
+            TargetRecoveryPlan::RestoreBaseline,
+            reference.as_ref(),
+            &[],
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(cleanup.status, CleanupStatus::Failed);
+        assert_eq!(manager.cleanup_calls()?, 0);
+        assert_eq!(manager.install_calls()?, 0);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn pinned_recovery_rejects_a_successful_install_with_the_wrong_origin()
+-> Result<(), Box<dyn Error>> {
+    let request = request("wrong-pinned-recovery")?;
+    let mut manager = ScriptedPackageManager::new(request.package.dnp_name.clone())
+        .with_installed_build("candidate", "/ipfs/QmCandidate")?;
+    manager.remove_leaves_installed = true;
+    manager.resolver_noop_when_installed = true;
+    let baseline = PackageRef::parse("/ipfs/QmPinnedBaseline")?;
+    let (cleanup, _) = reconcile_target(
+        &manager,
+        Arc::new(ImmediateClock),
+        &request.package.dnp_name,
+        TargetRecoveryPlan::RestoreBaseline,
+        Some(&baseline),
+        &[],
+        Duration::from_secs(1),
+    )
+    .await;
+    assert_eq!(cleanup.status, CleanupStatus::Failed);
+    assert!(
+        cleanup
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("does not match the pinned IPFS baseline"))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn worker_acknowledges_a_skipped_comparison_and_continues_polling()
+-> Result<(), Box<dyn Error>> {
+    let server = MockServer::start().await;
+    mount_heartbeat(
+        &server,
+        "gh-pr-42-0123456789ab-abcdef1234567890",
+        ResponseTemplate::new(200)
+            .set_body_json(json!({"schemaVersion": 1, "cancelRequested": false})),
+    )
+    .await;
+    let accepting = Arc::new(AtomicBool::new(true));
+    let stop_after_next_poll = accepting.clone();
+    let claims = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let request_count = claims.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/package-harness/jobs/claim"))
+        .respond_with(move |_: &wiremock::Request| {
+            if request_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(200)
+                    .set_body_string(include_str!("fixtures/claim-response.json"))
+            } else {
+                stop_after_next_poll.store(false, Ordering::SeqCst);
+                ResponseTemplate::new(204)
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    let completion_path =
+        "/v1/package-harness/jobs/gh-pr-42-0123456789ab-abcdef1234567890/complete";
+    Mock::given(method("POST"))
+        .and(path(completion_path))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"schemaVersion": 1,"disposition": "recorded"})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let directory = tempfile::tempdir()?;
+    let store = Arc::new(FileRunStore::new(directory.path().to_path_buf()).await?);
+    let request = request("skipped-comparison-worker")?;
+    let mut manager = ScriptedPackageManager::new(request.package.dnp_name.clone());
+    manager.baseline_preview_error = Some(PackageManagerError::Tool {
+        tool: "dappnode_fetch_install_preview".to_owned(),
+        message: "UnreachableName(bytes)".to_owned(),
+    });
+    let observation = Arc::new(manager);
+    let worker = worker_for(&server, store, observation.clone(), accepting)?;
+    tokio::time::timeout(Duration::from_secs(2), worker.run()).await?;
+    assert_eq!(claims.load(Ordering::SeqCst), 2);
+    assert_eq!(observation.install_calls()?, 0);
+    assert_eq!(observation.cleanup_calls()?, 0);
+    let requests = server
+        .received_requests()
+        .await
+        .ok_or("no coordinator requests")?;
+    let completed_at = requests
+        .iter()
+        .position(|request| request.url.path() == completion_path)
+        .ok_or("completion missing")?;
+    let second_claim_at = requests
+        .iter()
+        .rposition(|request| request.url.path().ends_with("/claim"))
+        .ok_or("next poll missing")?;
+    assert!(completed_at < second_claim_at);
+    let completion: serde_json::Value = serde_json::from_slice(&requests[completed_at].body)?;
+    assert_eq!(completion["outcome"]["type"], "result");
+    assert_eq!(completion["outcome"]["result"]["verdict"], "inconclusive");
+    assert_eq!(
+        completion["outcome"]["result"]["reasonCode"],
+        "baseline_unresolvable"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn restart_recovery_restores_the_persisted_ipfs_baseline_without_registry_access()
+-> Result<(), Box<dyn Error>> {
+    let (directory, store, mut request) = interrupted_record(
+        "restart-pinned-baseline",
+        TargetRecoveryPlan::RestoreBaseline,
+    )
+    .await?;
+    let baseline = PackageRef::parse("/ipfs/QmPinnedBaseline")?;
+    request.package.baseline_ref = Some(baseline);
+    let mut record = store
+        .get(&request.run_id)
+        .await?
+        .ok_or("interrupted record missing")?;
+    record.request = request.clone();
+    record.evidence.initial_packages = vec![PackageSummary {
+        dnp_name: request.package.dnp_name.clone(),
+        version: Some("baseline".to_owned()),
+        is_core: false,
+    }];
+    store.save(&record).await?;
+    // Reopen the file store to exercise the serialized recovery plan and ref.
+    let store = Arc::new(FileRunStore::new(directory.path().to_path_buf()).await?);
+    let server = MockServer::start().await;
+    mount_heartbeat(
+        &server,
+        "restart-pinned-baseline",
+        ResponseTemplate::new(200)
+            .set_body_json(json!({"schemaVersion": 1, "cancelRequested": false})),
+    )
+    .await;
+    let accepting = Arc::new(AtomicBool::new(true));
+    let stop_after_completion = accepting.clone();
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1/package-harness/jobs/restart-pinned-baseline/complete",
+        ))
+        .respond_with(move |_: &wiremock::Request| {
+            stop_after_completion.store(false, Ordering::SeqCst);
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"schemaVersion": 1,"disposition": "recorded"}))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    let manager = Arc::new(
+        ScriptedPackageManager::new(request.package.dnp_name.clone())
+            .with_installed_build("candidate", "/ipfs/QmCandidate")?,
+    );
+    let worker = worker_for(&server, store.clone(), manager.clone(), accepting)?;
+    tokio::time::timeout(Duration::from_secs(2), worker.run()).await?;
+    let recovered = store
+        .get(&request.run_id)
+        .await?
+        .ok_or("recovered record missing")?;
+    assert_eq!(recovered.cleanup.status, CleanupStatus::Passed);
+    assert!(recovered.worker.completion_acknowledged);
+    assert_eq!(
+        manager.installed_version()?.as_deref(),
+        Some("/ipfs/QmPinnedBaseline")
+    );
+    assert!(manager.preview_requests()?.is_empty());
+    assert!(manager.update_versions()?.is_empty());
+    assert_eq!(
+        recovered
+            .worker
+            .worker_error
+            .as_ref()
+            .map(|error| error.code),
+        Some(WorkerErrorCode::Interrupted)
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn candidate_update_that_does_not_apply_is_an_infrastructure_error()
 -> Result<(), Box<dyn Error>> {
     // An applied candidate that reports its previewed version still passes.
@@ -847,15 +1143,24 @@ async fn target_absent_before_run_is_removed_after_candidate_test() -> Result<()
 }
 
 #[tokio::test]
-async fn explicit_baseline_is_tested_then_latest_is_restored() -> Result<(), Box<dyn Error>> {
+async fn explicit_ipfs_baseline_is_tested_and_restored_without_registry_access()
+-> Result<(), Box<dyn Error>> {
     let mut request = request("explicit-installed-baseline")?;
     request.package.baseline_ref = Some(PackageRef::parse("/ipfs/QmRequestedBaseline")?);
-    let manager = Arc::new(
-        ScriptedPackageManager::new(request.package.dnp_name.clone())
-            .with_installed_baseline("/ipfs/QmOriginal")?,
-    );
+    let mut manager = ScriptedPackageManager::new(request.package.dnp_name.clone())
+        .with_installed_baseline("/ipfs/QmOriginal")?;
+    manager.baseline_preview_error = Some(PackageManagerError::Tool {
+        tool: "dappnode_fetch_install_preview".to_owned(),
+        message: "UnreachableName(bytes)".to_owned(),
+    });
+    let manager = Arc::new(manager);
     let observation = manager.clone();
     let (_directory, _store, record) = execute_with(request, manager, &NoopRunProgress).await?;
+    assert_eq!(
+        record.worker.target_recovery,
+        TargetRecoveryPlan::RestoreBaseline
+    );
+    assert_eq!(record.cleanup.status, CleanupStatus::Passed);
     let result = record.result.ok_or("missing result")?;
     assert_eq!(
         result.package.baseline_resolved_version.as_deref(),
@@ -864,7 +1169,7 @@ async fn explicit_baseline_is_tested_then_latest_is_restored() -> Result<(), Box
     assert_eq!(observation.update_versions()?, vec!["/ipfs/QmCandidate"]);
     assert_eq!(
         observation.installed_version()?.as_deref(),
-        Some("baseline")
+        Some("/ipfs/QmRequestedBaseline")
     );
     Ok(())
 }

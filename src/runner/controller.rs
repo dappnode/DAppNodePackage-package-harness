@@ -164,6 +164,7 @@ impl RunController {
                 Arc::clone(&self.clock),
                 &package.dnp_name,
                 recovery_plan,
+                record.request.package.baseline_ref.as_ref(),
                 &record.evidence.initial_packages,
                 self.config.cleanup_timeout,
             )
@@ -357,7 +358,15 @@ impl RunController {
             "Inventory inspected"
         );
         record.worker.target_recovery = if installed_baseline.is_some() {
-            TargetRecoveryPlan::RestoreLatest
+            if package
+                .baseline_ref
+                .as_ref()
+                .is_some_and(|reference| reference.is_ipfs())
+            {
+                TargetRecoveryPlan::RestoreBaseline
+            } else {
+                TargetRecoveryPlan::RestoreLatest
+            }
         } else {
             TargetRecoveryPlan::Remove
         };
@@ -371,7 +380,22 @@ impl RunController {
             .package_manager
             .preview_install(&package.dnp_name, package.baseline_ref.as_ref())
             .await
-            .map_err(|error| package_failure(error, ReasonCode::BaselineUnavailable))?;
+            .map_err(|error| {
+                if !package.baseline_ref.as_ref().is_some_and(|reference| reference.is_ipfs())
+                    && error.is_unresolvable_registry_name()
+                {
+                    Failure {
+                        verdict: Verdict::Inconclusive,
+                        reason: ReasonCode::BaselineUnresolvable,
+                        summary: format!(
+                            "No resolvable published baseline for {}; upgrade comparison skipped without changing packages. Publish or repair the registry entry, or supply an explicit known-good IPFS baselineRef",
+                            package.dnp_name
+                        ),
+                    }
+                } else {
+                    package_failure(error, ReasonCode::BaselineUnavailable)
+                }
+            })?;
         let baseline_resolved_ref = baseline_preview.resolved_ref.clone();
         let baseline_expected_version = baseline_preview.version.clone();
         let installed_version_matches = installed_baseline.is_some_and(|installed| {

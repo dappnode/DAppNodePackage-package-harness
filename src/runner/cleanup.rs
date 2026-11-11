@@ -9,7 +9,10 @@ use tracing::{info, warn};
 use crate::{
     analysis::redaction::truncate_utf8,
     clock::Clock,
-    model::{CleanupResult, CleanupStatus, DnpName, PackageSummary, TargetRecoveryPlan},
+    model::{
+        CleanupResult, CleanupStatus, DnpName, PackageRef, PackageSummary, TargetRecoveryPlan,
+        same_install_origin,
+    },
     package_manager::PackageManager,
 };
 
@@ -123,12 +126,20 @@ pub async fn restore_latest_target(
     package_manager: &dyn PackageManager,
     dnp_name: &DnpName,
 ) -> CleanupResult {
+    restore_target(package_manager, dnp_name, None).await
+}
+
+async fn restore_target(
+    package_manager: &dyn PackageManager,
+    dnp_name: &DnpName,
+    reference: Option<&PackageRef>,
+) -> CleanupResult {
     info!(
-        event = "cleanup_restore_latest_started",
+        event = "cleanup_restore_target_started",
         dnp_name = %dnp_name,
         delete_volumes = false,
-        baseline_ref = "*",
-        "Reinstalling the latest published release while preserving volumes"
+        baseline_ref = reference.map_or("*", PackageRef::as_str),
+        "Reinstalling the recovery baseline while preserving volumes"
     );
     if let Err(error) = package_manager.remove_package(dnp_name, false).await
         && !matches!(error, crate::package_manager::PackageManagerError::NotFound)
@@ -139,20 +150,41 @@ pub async fn restore_latest_target(
             error: Some(truncate_utf8(&error.to_string(), 300)),
         };
     }
-    if let Err(error) = package_manager.install_package(dnp_name, None).await {
+    if let Err(error) = package_manager.install_package(dnp_name, reference).await {
         return CleanupResult {
             status: CleanupStatus::Failed,
             leftover_packages: Vec::new(),
             error: Some(truncate_utf8(&error.to_string(), 300)),
         };
     }
+    if let Some(reference) = reference {
+        // A success response alone is insufficient: check the immutable origin
+        // before declaring a pinned recovery complete.
+        let error = match package_manager.get_package_details(dnp_name).await {
+            Ok(details)
+                if details.dnp_name == *dnp_name
+                    && same_install_origin(Some(reference.as_str()), details.origin.as_deref()) =>
+            {
+                None
+            }
+            Ok(_) => Some("restored package does not match the pinned IPFS baseline".to_owned()),
+            Err(error) => Some(error.to_string()),
+        };
+        if let Some(error) = error {
+            return CleanupResult {
+                status: CleanupStatus::Failed,
+                leftover_packages: Vec::new(),
+                error: Some(truncate_utf8(&error, 300)),
+            };
+        }
+    }
     match package_manager.list_packages().await {
         Ok(packages) if packages.iter().any(|package| package.dnp_name == *dnp_name) => {
             info!(
-                event = "cleanup_restore_latest_verified",
+                event = "cleanup_restore_target_verified",
                 dnp_name = %dnp_name,
-                baseline_ref = "*",
-                "Latest published release reinstall verified"
+                baseline_ref = reference.map_or("*", PackageRef::as_str),
+                "Recovery baseline reinstall verified"
             );
             CleanupResult {
                 status: CleanupStatus::Passed,
@@ -163,7 +195,7 @@ pub async fn restore_latest_target(
         Ok(_) => CleanupResult {
             status: CleanupStatus::Failed,
             leftover_packages: Vec::new(),
-            error: Some("latest published release was not present after reinstall".to_owned()),
+            error: Some("recovery baseline was not present after reinstall".to_owned()),
         },
         Err(error) => CleanupResult {
             status: CleanupStatus::Failed,
@@ -179,11 +211,20 @@ pub async fn reconcile_target(
     clock: Arc<dyn Clock>,
     dnp_name: &DnpName,
     plan: TargetRecoveryPlan,
+    baseline_ref: Option<&PackageRef>,
     initial_packages: &[PackageSummary],
     timeout: Duration,
 ) -> (CleanupResult, Vec<PackageSummary>) {
     let mut cleanup = match plan {
         TargetRecoveryPlan::RestoreLatest => restore_latest_target(package_manager, dnp_name).await,
+        TargetRecoveryPlan::RestoreBaseline => match baseline_ref.filter(|reference| reference.is_ipfs()) {
+            Some(reference) => restore_target(package_manager, dnp_name, Some(reference)).await,
+            None => CleanupResult {
+                status: CleanupStatus::Failed,
+                leftover_packages: Vec::new(),
+                error: Some("pinned recovery requires an explicit IPFS baselineRef; package was not changed".to_owned()),
+            },
+        },
         TargetRecoveryPlan::Remove => {
             cleanup_target(package_manager, Arc::clone(&clock), dnp_name, timeout).await
         }

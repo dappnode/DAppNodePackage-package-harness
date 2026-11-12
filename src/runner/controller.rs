@@ -17,7 +17,7 @@ use crate::{
     },
     package_manager::{PackageManager, PackageManagerError},
     runner::{
-        cleanup::reconcile_target,
+        cleanup::{RecoverySpec, reconcile_target},
         comparison::{compare, deterministic_verdict},
         progress::{RunControl, RunProgress},
         result::{analysis_failure, build_result, comparison_from_partial, inconclusive_analysis},
@@ -27,8 +27,9 @@ use crate::{
 };
 
 /// Runtime policy for one package test execution.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RunnerConfig {
+    pub readiness_profiles: Arc<crate::runner::readiness::ReadinessProfiles>,
     /// Harness package name, refused as a target to avoid self-removal.
     pub harness_dnp_name: String,
     /// Container stabilization hard-check policy.
@@ -151,6 +152,10 @@ impl RunController {
             self.phase(&mut record, ExecutionPhase::Cleanup, progress)
                 .await?;
             let recovery_plan = record.worker.target_recovery;
+            let readiness = self
+                .config
+                .readiness_profiles
+                .for_package(package.dnp_name.as_str());
             info!(
                 event = "cleanup_plan_started",
                 run_id = %record.request.run_id,
@@ -163,9 +168,13 @@ impl RunController {
                 self.package_manager.as_ref(),
                 Arc::clone(&self.clock),
                 &package.dnp_name,
-                recovery_plan,
-                record.request.package.baseline_ref.as_ref(),
-                &record.evidence.initial_packages,
+                RecoverySpec {
+                    plan: recovery_plan,
+                    baseline_ref: record.request.package.baseline_ref.as_ref(),
+                    initial_packages: &record.evidence.initial_packages,
+                    readiness: &readiness,
+                    stabilization: self.config.stabilization,
+                },
                 self.config.cleanup_timeout,
             )
             .await;
@@ -299,6 +308,10 @@ impl RunController {
         progress: &dyn RunProgress,
     ) -> Result<(), Failure> {
         let package = self.resolver.resolve(&record.request);
+        let readiness_policy = self
+            .config
+            .readiness_profiles
+            .for_package(package.dnp_name.as_str());
         self.phase_failure(record, ExecutionPhase::Preflight, progress)
             .await?;
         let tools = self
@@ -529,6 +542,7 @@ impl RunController {
             &package.dnp_name,
             self.config.stabilization,
             progress,
+            &readiness_policy,
         )
         .await;
         self.control_failure(progress)?;
@@ -609,6 +623,7 @@ impl RunController {
             &package.dnp_name,
             self.config.stabilization,
             progress,
+            &readiness_policy,
         )
         .await;
         self.control_failure(progress)?;

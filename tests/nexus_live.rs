@@ -5,6 +5,31 @@ use dappnode_package_harness::{
 use std::{collections::BTreeMap, error::Error, time::Duration};
 
 #[tokio::test]
+#[ignore = "manual Nexus startup probe; uses one synthetic inference token"]
+async fn startup_live_probe() -> Result<(), Box<dyn Error>> {
+    let settings: BTreeMap<String, String> =
+        dotenvy::from_path_iter(".env")?.collect::<Result<_, _>>()?;
+    let nexus = NexusLogAnalyzer::new(
+        settings
+            .get("NEXUS_API_KEY")
+            .ok_or("Nexus key missing")?
+            .clone(),
+        settings
+            .get("NEXUS_BASE_URL")
+            .ok_or("Nexus base URL missing")?,
+        settings
+            .get("NEXUS_MODEL")
+            .cloned()
+            .unwrap_or_else(|| "nexus/auto".into()),
+        Duration::from_secs(30),
+        65536,
+    )?;
+    nexus.validate_access().await?;
+    println!("Live Nexus startup inference access verified");
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "manual Nexus contract probe; uses configured inference credit and synthetic logs"]
 async fn synthetic_live_probe() -> Result<(), Box<dyn Error>> {
     let settings: BTreeMap<String, String> =

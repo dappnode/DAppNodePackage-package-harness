@@ -1,9 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
   <defs>
-    <linearGradient id="avatar-bg" x1="70" y1="30" x2="442" y2="482" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#092449"/>
-      <stop offset="1" stop-color="#031126"/>
-    </linearGradient>
     <linearGradient id="dappnode-purple" x1="2.345" y1="5.53" x2="129.31" y2="126.8" gradientUnits="userSpaceOnUse">
       <stop stop-color="#5231C6"/>
       <stop offset="1" stop-color="#E60AF6"/>
@@ -13,10 +9,6 @@
       <stop offset="1" stop-color="#FC7A16"/>
     </linearGradient>
   </defs>
-
-  <rect width="512" height="512" fill="#06172F"/>
-  <rect x="8" y="8" width="496" height="496" rx="86" fill="url(#avatar-bg)"/>
-  <rect x="16" y="16" width="480" height="480" rx="78" fill="none" stroke="#102F59" stroke-width="5"/>
 
   <!-- Official DAppNode logo paths from https://docs.dappnode.io/img/logo.svg -->
   <g transform="translate(122 44) scale(2)">

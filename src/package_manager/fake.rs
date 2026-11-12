@@ -93,6 +93,7 @@ impl PackageManager for FakePackageManager {
                 running,
                 image: Some(format!("fake/{dnp_name}:{version}")),
                 created: Some("fake".to_owned()),
+                ..ContainerSnapshot::default()
             }],
         })
     }

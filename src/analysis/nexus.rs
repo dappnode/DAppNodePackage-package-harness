@@ -118,12 +118,27 @@ impl NexusLogAnalyzer {
                     "Nexus startup check did not return a chat completion".to_owned(),
                 )
             })?;
-            if response.choices.is_empty() {
-                return Err(AnalyzerError::InvalidResponse(
+            let choice = response.choices.first().ok_or_else(|| {
+                AnalyzerError::InvalidResponse(
                     "Nexus startup check returned no choices".to_owned(),
-                ));
+                )
+            })?;
+            // A one-token inference can exhaust its budget before the provider
+            // emits content (including when it spends the token on reasoning).
+            // That terminal completion proves access; a usable analysis answer
+            // is deliberately not required by this synthetic check.
+            let generated_text = choice
+                .message
+                .content
+                .as_deref()
+                .is_some_and(|content| !content.trim().is_empty());
+            match choice.finish_reason.as_deref() {
+                Some("length") => Ok(()),
+                None | Some("stop") if generated_text => Ok(()),
+                _ => Err(AnalyzerError::InvalidResponse(
+                    "Nexus startup check returned neither generated text nor a token-limit completion".to_owned(),
+                )),
             }
-            Ok(())
         })
         .await
         .map_err(|_| AnalyzerError::Timeout)?
@@ -158,7 +173,7 @@ struct ChatChoice {
 
 #[derive(Deserialize)]
 struct ChatResponseMessage {
-    content: String,
+    content: Option<String>,
 }
 
 #[async_trait]
@@ -341,7 +356,9 @@ impl NexusLogAnalyzer {
                         "Nexus response reached the model output token limit".to_owned(),
                     ));
                 }
-                let content = content.message.content.as_str();
+                let content = content.message.content.as_deref().ok_or_else(|| {
+                    AnalyzerError::InvalidResponse("missing choice content".to_owned())
+                })?;
                 let mut result = parse_analysis(content)?;
                 normalize_result(&mut result);
                 result.analyzer = AnalyzerKind::Nexus;

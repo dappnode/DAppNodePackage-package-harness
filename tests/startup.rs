@@ -31,6 +31,7 @@ fn config() -> Result<Config, Box<dyn Error>> {
         stabilization_required_samples: 1,
         log_tail: 1,
         cleanup_timeout: Duration::from_secs(1),
+        readiness_profiles: Default::default(),
         nexus_api_key: None,
         nexus_base_url: "https://nexus.example/v1".into(),
         nexus_model: "nexus/auto".into(),
@@ -312,6 +313,78 @@ async fn startup_checks_configured_nexus_access_before_acceptance() -> Result<()
         config.nexus_api_key = Some("nexus-test-key".into());
         config.nexus_base_url = format!("{}/v1", server.uri());
         assert_eq!(validate(&config, &server).await.is_ok(), status == 200);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn startup_accepts_token_limited_nexus_completions_without_content()
+-> Result<(), Box<dyn Error>> {
+    for message in [
+        json!({"role": "assistant"}),
+        json!({"role": "assistant", "content": null}),
+        json!({"role": "assistant", "content": ""}),
+        json!({"role": "assistant", "reasoning_content": "thinking"}),
+    ] {
+        let server = MockServer::start().await;
+        mount_mcp(&server, McpResponse::default()).await;
+        mount_coordinator(&server, ResponseTemplate::new(204), 1).await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("authorization", "Bearer nexus-test-key"))
+            .and(wiremock::matchers::body_json(json!({
+                "model": "nexus/auto", "messages": [{"role": "user", "content": "Reply OK."}],
+                "stream": false, "max_tokens": 1
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": message, "finish_reason": "length"}],
+                "usage": {"prompt_tokens": 201, "completion_tokens": 1, "total_tokens": 202}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = config()?;
+        config.nexus_api_key = Some("nexus-test-key".into());
+        config.nexus_base_url = format!("{}/v1", server.uri());
+        validate(&config, &server).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn startup_still_rejects_empty_malformed_and_error_nexus_responses()
+-> Result<(), Box<dyn Error>> {
+    for response in [
+        ResponseTemplate::new(200).set_body_json(json!({"choices": []})),
+        ResponseTemplate::new(200).set_body_json(json!({"error": {"message": "denied"}})),
+        ResponseTemplate::new(200).set_body_json(json!({"choices": [{}]})),
+        ResponseTemplate::new(200).set_body_string("not JSON"),
+        ResponseTemplate::new(200).set_body_json(json!({"choices": [{"message": {"role": "assistant"}}]})),
+        ResponseTemplate::new(200).set_body_json(json!({"choices": [{"message": {"content": null}, "finish_reason": "stop"}]})),
+        ResponseTemplate::new(200).set_body_json(json!({"choices": [{"message": {"content": " "}, "finish_reason": "stop"}]})),
+        ResponseTemplate::new(200).set_body_json(json!({"choices": [{"message": {"content": []}, "finish_reason": "length"}]})),
+        ResponseTemplate::new(200).set_body_json(json!({"choices": [{"message": {"content": "filtered"}, "finish_reason": "content_filter"}]})),
+        ResponseTemplate::new(200).set_delay(Duration::from_secs(2)),
+    ] {
+        let server = MockServer::start().await;
+        mount_mcp(&server, McpResponse::default()).await;
+        mount_coordinator(&server, ResponseTemplate::new(204), 1).await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(response)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = config()?;
+        config.nexus_api_key = Some("nexus-test-key".into());
+        config.nexus_base_url = format!("{}/v1", server.uri());
+        let error = validate(&config, &server)
+            .await
+            .err()
+            .ok_or("startup accepted invalid Nexus inference response")?
+            .to_string();
+        assert!(error.contains("Nexus inference access"));
+        assert!(!error.contains("nexus-test-key"));
     }
     Ok(())
 }

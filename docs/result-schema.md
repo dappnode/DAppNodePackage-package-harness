@@ -24,6 +24,8 @@ An unresolvable published baseline completes with `verdict: "inconclusive"`, `re
 
 The local recovery plan can be `restore_baseline` for an initially installed target with an explicit IPFS baseline. Its immutable reference comes from the persisted request's `package.baselineRef`, so recovery does not require a published release. Cleanup preserves volumes and verifies the restored package's IPFS origin. Existing records with `restore_latest` or `remove` retain their recorded recovery policy.
 
+The v1 coordinator container shape remains `name`, `serviceName`, `state`, `running`, `image`, and `created`. Optional Docker health, container identity, restart count, and start time are kept only in local capture diagnostics, along with each stabilization sample's safe `probeResults`. No probe URL, authentication header, or response body is persisted. Existing reason codes such as `candidate_containers_stable` and `candidate_containers_unstable` now include configured application readiness and reported Docker health in the hard check. Cleanup passes only after restoration identity/readiness and final inventory verification; it fails for changed or missing unrelated packages as well as unexpected additions.
+
 If Dappmanager rejects the baseline package signature, the harness retries that
 baseline mutation with the signed-package restriction bypass. A successful
 retry continues the comparison, changes an otherwise passing verdict to
@@ -56,7 +58,7 @@ Representative successful result:
   },
   "verdict": "passed",
   "reasonCode": "candidate_containers_stable",
-  "summary": "Baseline and candidate containers became stably running",
+  "summary": "Baseline and candidate passed readiness checks",
   "baseline": {
     "install": { "status": "passed", "durationMs": 1000 },
     "hardCheck": {

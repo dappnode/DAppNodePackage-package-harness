@@ -19,8 +19,10 @@ pub fn compare(baseline: &CaptureEvidence, candidate: &CaptureEvidence) -> Compa
         .collect();
     let mut deterministic_regressions = Vec::new();
     if baseline.stabilization.passed && !candidate.stabilization.passed {
-        deterministic_regressions
-            .push("candidate containers did not become stably running".to_owned());
+        deterministic_regressions.push(
+            "candidate did not pass container and configured application readiness checks"
+                .to_owned(),
+        );
     }
     ComparisonEvidence {
         baseline_hard_check: baseline.stabilization.passed,
@@ -58,29 +60,29 @@ pub fn deterministic_verdict(
         (true, false) => (
             Verdict::Failed,
             ReasonCode::CandidateContainersUnstable,
-            "The canonical baseline stabilized, but the candidate did not".to_owned(),
+            "The canonical baseline passed readiness checks, but the candidate did not".to_owned(),
         ),
         (true, true) if analysis.status == AnalyzerStatus::Critical => (
             Verdict::Warning,
             ReasonCode::CandidateContainersStable,
-            "Both versions stabilized; advisory log analysis found a critical candidate-only signature"
+            "Both versions passed readiness checks; advisory log analysis found a critical candidate-only signature"
                 .to_owned(),
         ),
         (true, true) => (
             Verdict::Passed,
             ReasonCode::CandidateContainersStable,
-            "Baseline and candidate containers became stably running".to_owned(),
+            "Baseline and candidate passed the configured readiness checks".to_owned(),
         ),
         (false, true) => (
             Verdict::Warning,
             ReasonCode::BaselineContainersUnstable,
-            "The candidate stabilized, but the canonical control was unhealthy, so this is not a clean pass"
+            "The candidate passed readiness checks, but the canonical control was unhealthy, so this is not a clean pass"
                 .to_owned(),
         ),
         (false, false) => (
             Verdict::Inconclusive,
             ReasonCode::BaselineContainersUnstable,
-            "Neither baseline nor candidate became stably running".to_owned(),
+            "Neither baseline nor candidate passed readiness checks".to_owned(),
         ),
     }
 }

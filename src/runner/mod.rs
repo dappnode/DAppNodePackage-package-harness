@@ -2,6 +2,7 @@ pub mod cleanup;
 pub mod comparison;
 pub mod controller;
 pub mod progress;
+pub mod readiness;
 mod result;
 pub mod stabilization;
 

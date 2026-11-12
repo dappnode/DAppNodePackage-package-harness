@@ -38,10 +38,10 @@ impl LogAnalyzer for HeuristicLogAnalyzer {
 /// Performs signature analysis without any network dependency.
 ///
 /// Findings are reported only when the candidate contains a configured
-/// signature that did not appear anywhere in the baseline logs.
+/// signature that did not appear in that container's baseline logs.
 pub fn analyze_heuristically(input: &LogAnalysisInput) -> LogAnalysisResult {
-    let baseline_signatures = signatures(&input.baseline);
-    let candidate_signatures = signatures(&input.candidate);
+    let baseline_signatures = signatures(input.baseline.iter());
+    let candidate_signatures = signatures(input.candidate.iter());
     let baseline = side(&baseline_signatures);
     let candidate = side(&candidate_signatures);
     let mut new_findings = Vec::new();
@@ -49,9 +49,11 @@ pub fn analyze_heuristically(input: &LogAnalysisInput) -> LogAnalysisResult {
 
     for (container, log) in &input.candidate {
         let lower = log.to_ascii_lowercase();
+        let baseline_for_container =
+            signatures(input.baseline.iter().filter(|(name, _)| name == container));
         for (pattern, severity) in SIGNATURES {
-            if !lower.contains(pattern)
-                || baseline_signatures.contains(pattern)
+            if signature_index(&lower, pattern).is_none()
+                || baseline_for_container.contains(pattern)
                 || !deduplicated.insert((container.clone(), pattern))
             {
                 continue;
@@ -100,17 +102,42 @@ pub fn analyze_heuristically(input: &LogAnalysisInput) -> LogAnalysisResult {
     }
 }
 
-fn signatures(logs: &[(Option<String>, String)]) -> BTreeSet<&'static str> {
+fn signatures<'a>(
+    logs: impl Iterator<Item = &'a (Option<String>, String)>,
+) -> BTreeSet<&'static str> {
     let mut found = BTreeSet::new();
     for (_, log) in logs {
         let lower = log.to_ascii_lowercase();
         for (pattern, _) in SIGNATURES {
-            if lower.contains(pattern) {
+            if signature_index(&lower, pattern).is_some() {
                 found.insert(pattern);
             }
         }
     }
     found
+}
+
+fn signature_index(lower: &str, pattern: &str) -> Option<usize> {
+    lower.match_indices(pattern).find_map(|(index, _)| {
+        if pattern == "fatal" {
+            let prefix = &lower[..index];
+            if prefix.ends_with("non-")
+                || prefix.ends_with("non ")
+                || prefix.ends_with("non_")
+                || prefix
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                || lower
+                    .as_bytes()
+                    .get(index + pattern.len())
+                    .is_some_and(u8::is_ascii_alphanumeric)
+            {
+                return None;
+            }
+        }
+        Some(index)
+    })
 }
 
 fn side(signatures: &BTreeSet<&str>) -> AnalysisSide {
@@ -135,7 +162,7 @@ fn side(signatures: &BTreeSet<&str>) -> AnalysisSide {
 
 fn excerpt(log: &str, pattern: &str) -> String {
     let lower = log.to_ascii_lowercase();
-    let Some(index) = lower.find(pattern) else {
+    let Some(index) = signature_index(&lower, pattern) else {
         return String::new();
     };
     let start = index.saturating_sub(80);
@@ -149,4 +176,41 @@ fn excerpt(log: &str, pattern: &str) -> String {
         safe_end -= 1;
     }
     log.get(safe_start..safe_end).unwrap_or_default().to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::analyze_heuristically;
+    use crate::model::{AnalyzerStatus, LogAnalysisInput};
+
+    #[test]
+    fn nonfatal_messages_are_not_critical_but_a_later_actual_fatal_is_detected() {
+        let mut input = LogAnalysisInput {
+            candidate: vec![(
+                Some("bitcoin".into()),
+                "fee estimator: non-fatal warning; nonfatal condition; non_fatal fallback".into(),
+            )],
+            ..Default::default()
+        };
+        assert_eq!(analyze_heuristically(&input).status, AnalyzerStatus::Clean);
+        input.candidate[0].1.push_str("\nFATAL: engine crashed");
+        let result = analyze_heuristically(&input);
+        assert_eq!(result.status, AnalyzerStatus::Critical);
+        assert!(result.new_findings[0].evidence.contains("engine crashed"));
+    }
+
+    #[test]
+    fn a_baseline_error_in_one_service_does_not_hide_a_new_error_in_another() {
+        let input = LogAnalysisInput {
+            baseline: vec![(Some("cache".into()), "fatal: cache error".into())],
+            candidate: vec![
+                (Some("cache".into()), "fatal: cache error".into()),
+                (Some("api".into()), "fatal: database failed".into()),
+            ],
+            ..Default::default()
+        };
+        let result = analyze_heuristically(&input);
+        assert_eq!(result.new_findings.len(), 1);
+        assert_eq!(result.new_findings[0].container.as_deref(), Some("api"));
+    }
 }

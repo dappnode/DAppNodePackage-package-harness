@@ -30,7 +30,7 @@ use dappnode_package_harness::{
     package_manager::{PackageManager, PackageManagerError, REQUIRED_MCP_TOOLS, ToolAvailability},
     runner::{
         NoopRunProgress, RunControl, RunController, RunProgress, RunnerConfig,
-        cleanup::{cleanup_target, reconcile_target},
+        cleanup::{RecoverySpec, cleanup_target, reconcile_target},
         stabilization::{StabilizationConfig, stabilize},
     },
     storage::{FileRunStore, RunStore},
@@ -433,6 +433,7 @@ fn details(dnp_name: &DnpName, version: &str, running: bool, name: &str) -> Pack
             running,
             image: Some("example:latest".to_owned()),
             created: None,
+            ..ContainerSnapshot::default()
         }],
     }
 }
@@ -456,6 +457,7 @@ fn request(run_id: &str) -> Result<RunRequest, Box<dyn Error>> {
 
 fn runner_config() -> RunnerConfig {
     RunnerConfig {
+        readiness_profiles: Arc::new(Default::default()),
         harness_dnp_name: "package-harness.dnp.dappnode.eth".to_owned(),
         stabilization: StabilizationConfig {
             timeout: Duration::from_millis(10),
@@ -565,6 +567,8 @@ fn worker_for_with_controls(
             clock,
         },
         WorkerConfig {
+            readiness_profiles: Arc::new(Default::default()),
+            stabilization: runner_config().stabilization,
             worker_id: "worker-01".to_owned(),
             harness_dnp_name: "package-harness.dnp.dappnode.eth".to_owned(),
             poll_interval: Duration::from_millis(1),
@@ -774,9 +778,13 @@ async fn pinned_recovery_rejects_missing_or_mutable_references_without_mutation(
             &manager,
             Arc::new(ImmediateClock),
             &request.package.dnp_name,
-            TargetRecoveryPlan::RestoreBaseline,
-            reference.as_ref(),
-            &[],
+            RecoverySpec {
+                plan: TargetRecoveryPlan::RestoreBaseline,
+                baseline_ref: reference.as_ref(),
+                initial_packages: &[],
+                readiness: &Default::default(),
+                stabilization: runner_config().stabilization,
+            },
             Duration::from_secs(1),
         )
         .await;
@@ -800,9 +808,13 @@ async fn pinned_recovery_rejects_a_successful_install_with_the_wrong_origin()
         &manager,
         Arc::new(ImmediateClock),
         &request.package.dnp_name,
-        TargetRecoveryPlan::RestoreBaseline,
-        Some(&baseline),
-        &[],
+        RecoverySpec {
+            plan: TargetRecoveryPlan::RestoreBaseline,
+            baseline_ref: Some(&baseline),
+            initial_packages: &[],
+            readiness: &Default::default(),
+            stabilization: runner_config().stabilization,
+        },
         Duration::from_secs(1),
     )
     .await;
@@ -1103,7 +1115,7 @@ async fn installed_target_is_restored_to_latest_published_baseline() -> Result<(
     assert_eq!(observation.installed_version()?.as_deref(), Some("0.3.0"));
     assert_eq!(
         observation.preview_requests()?,
-        vec![None, Some("/ipfs/QmCandidate".to_owned())],
+        vec![None, Some("/ipfs/QmCandidate".to_owned()), None],
         "the pre-run version must never be used as a baseline reference"
     );
     Ok(())
@@ -1318,6 +1330,7 @@ async fn stabilization_stops_when_progress_requests_cancellation() -> Result<(),
             required_samples: 3,
         },
         progress.as_ref(),
+        &Default::default(),
     )
     .await;
     assert!(!result.passed);

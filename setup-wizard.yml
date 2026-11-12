@@ -104,6 +104,19 @@ fields:
     secret: true
     required: false
 
+  - id: readiness-profiles
+    target:
+      type: environment
+      name: READINESS_PROFILES
+      service: package-harness
+    title: Application readiness profiles (optional JSON)
+    description: >-
+      Per-package HTTP, TCP, or read-only JSON-RPC checks for test and restoration
+      readiness. Leave empty to use container observations. Probe headers may
+      contain credentials, so this setting is kept secret.
+    secret: true
+    required: false
+
   - id: nexus-model
     target:
       type: environment

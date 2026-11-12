@@ -40,6 +40,7 @@ pub struct Config {
     pub stabilization_required_samples: usize,
     pub log_tail: usize,
     pub cleanup_timeout: Duration,
+    pub readiness_profiles: crate::runner::readiness::ReadinessProfiles,
     pub nexus_api_key: Option<String>,
     pub nexus_base_url: String,
     pub nexus_model: String,
@@ -158,6 +159,13 @@ impl Config {
             stabilization_required_samples: required_samples,
             log_tail,
             cleanup_timeout: millis("CLEANUP_TIMEOUT_MS", 60_000)?,
+            readiness_profiles: crate::runner::readiness::ReadinessProfiles::from_json(
+                &env::var("READINESS_PROFILES").unwrap_or_else(|_| "{}".to_owned()),
+            )
+            .map_err(|message| ConfigError::Invalid {
+                name: "READINESS_PROFILES",
+                message,
+            })?,
             nexus_api_key: optional("NEXUS_API_KEY"),
             nexus_base_url: env::var("NEXUS_BASE_URL")
                 .unwrap_or_else(|_| "https://nexus-api.dappnode.com/v1".to_owned()),

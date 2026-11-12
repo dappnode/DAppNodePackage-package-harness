@@ -19,11 +19,11 @@ For every accepted job, the deterministic controller:
 1. verifies Dappmanager MCP tools and target safety;
 2. checks whether the target is already installed and persists whether cleanup must restore or remove it;
 3. previews the requested `baselineRef`, or previews the latest published release when it was omitted, and reuses an installed package only when both its version and its install origin match that resolved baseline (an IPFS build can share a released version);
-4. waits for a stable, non-empty all-running container set;
+4. waits for a stable, non-empty all-running container set, reported Docker health, and every configured application readiness probe;
 5. captures normalized details and bounded, redacted log tails;
 6. upgrades the baseline in place to the candidate;
 7. repeats stabilization and capture, compares both observations, and performs optional Nexus analysis;
-8. restores a pre-existing target by removing it without deleting volumes and freshly installing the explicit IPFS baseline when supplied, or the latest published release (`*`) otherwise; a target that was initially absent is removed with `deleteVolumes: true`. Cleanup fails when the pinned origin or final inventory cannot be verified or inventory contains unexpected dependencies. A cleanup that already passed, automatically or through an operator, is never repeated.
+8. restores a pre-existing target by removing it without deleting volumes and freshly installing the explicit IPFS baseline when supplied, or the latest published release (`*`) otherwise; a target that was initially absent is removed with `deleteVolumes: true`. Cleanup verifies the restored version/origin and readiness, then confirms that unrelated packages and their versions are unchanged and no unexpected dependencies remain. A cleanup that already passed, automatically or through an operator, is never repeated.
 
 If ENS cannot resolve a requested registry baseline (`UnreachableName`, `ResolverNotFound`, or Dappmanager's `NOREPO` error), the job completes as `inconclusive` with reason `baseline_unresolvable`: “No resolvable published baseline; upgrade comparison skipped.” No package is installed, updated, or removed, including when a copy is already installed. This is a package prerequisite, not a worker-wide outage or a failed candidate test. The result is acknowledged normally and the worker continues polling; deterministic resolution failures are not retried within the job. Network failures, timeouts, and unrelated contract reverts retain their infrastructure-error classification.
 
@@ -54,12 +54,36 @@ Startup fails with a nonzero exit before the worker can claim jobs if any requir
 - Durable storage: create, write, sync, rename, read back, and delete a temporary probe in `DATA_DIR`. Existing records are reconciled before polling begins.
 - Authenticated Dappmanager tool discovery, including all three mutation tools, followed by package inventory, details, a one-line log sample, and an install preview for an installed package. These checks never install, update, or remove a package; the log sample is discarded.
 - Authenticated Tropibot worker-protocol access through the read-only lost-job endpoint. This does not claim or release work, and an existing lost job remains available for recovery.
-- When `NEXUS_API_KEY` is configured, a synthetic chat completion with `max_tokens: 1` verifies access to `NEXUS_MODEL`, including inference authorization and credit checks. This uses a small amount of inference credit and sends no package evidence. Startup fails if this check fails; analysis during an accepted job still has the heuristic fallback.
+- When `NEXUS_API_KEY` is configured, a synthetic chat completion with `max_tokens: 1` verifies access to `NEXUS_MODEL`, including inference authorization and credit checks. This uses a small amount of inference credit and sends no package evidence. A token-limit completion proves access even if the provider omits message content; actual log analysis still requires usable, complete output. Startup fails if this check fails; analysis during an accepted job still has the heuristic fallback.
 - Binding the supervision port before starting the worker.
 
 The shared bearer token is appropriate for this small trusted v1 deployment. The protocol deliberately leaves room for later per-worker credentials or mTLS, but neither is part of this version. The worker never logs the token.
 
 Use [`.env.example`](.env.example) for all timeout, Dappmanager, cleanup, and optional Nexus settings. `MCP_TIMEOUT_MS` bounds read-only Dappmanager calls at 30 seconds by default, while `MCP_MUTATION_TIMEOUT_MS` gives each install, update, or removal attempt 30 minutes by default (up to one hour). Transient transport and package-download failures are retried three times with bounded exponential backoff; tune this with `MCP_MUTATION_ATTEMPTS` and `MCP_MUTATION_RETRY_DELAY_MS`. A mutation that exceeds its deadline is never resent, because Dappmanager keeps running it: the harness instead polls for the requested state for up to another `MCP_MUTATION_TIMEOUT_MS` and fails the step if it is not reached. `NEXUS_TIMEOUT_MS` gives advisory Nexus analysis five minutes by default. If the target package was installed before a run, cleanup preserves its volumes and freshly installs the explicit IPFS baseline when supplied, or the latest published release otherwise; an initially absent target and its volumes are removed. The pre-run package version never replaces the requested baseline. `TROPIBOT_TIMEOUT_MS` bounds each coordinator request. The Dappmanager MCP token and Nexus key remain local and are never sent to Tropibot or persisted in a job record.
+
+## Application readiness and recovery
+
+Set `READINESS_PROFILES` to a JSON object keyed by package name. Profiles are operator configuration; coordinator jobs, package manifests, and model output cannot supply probe destinations. Invalid profiles prevent startup. With the default `{}`, readiness checks container state and any reported Docker health, but does not infer application health from a running process.
+
+```json
+{
+  "example.dnp.dappnode.eth": {
+    "probes": [
+      {"type": "http", "name": "health", "url": "http://example.dappnode:8080/healthz", "expectedStatus": 200, "bodyContains": "ok"},
+      {"type": "tcp", "name": "database-port", "host": "database.example.dappnode", "port": 5432},
+      {"type": "json_rpc", "name": "rpc", "url": "http://example.dappnode:8545", "method": "net_listening", "expectedResult": true}
+    ]
+  }
+}
+```
+
+Replace these illustrative endpoints with addresses reachable from the harness container. HTTP probes default to status 200 and can require a body substring. TCP checks prove only that a port accepts connections. JSON-RPC checks reject error responses and missing/null results; `expectedResult` optionally requires an exact JSON value, and `net_listening` requires `true` by default. Supported methods are `web3_clientVersion`, `eth_blockNumber`, `eth_syncing`, `net_listening`, `getblockchaininfo`, and `getnetworkinfo`. HTTP and JSON-RPC probes accept a `headers` object for authentication. URLs, headers, and response bodies are never recorded in readiness diagnostics; only safe probe names and generic failures are retained. HTTP redirects are not followed.
+
+All probes must pass for the configured consecutive stabilization samples. A changed container set, identity, creation/start time, or restart count resets that streak when Dappmanager exposes those fields. Reported `starting` or `unhealthy` Docker health blocks readiness. Set `requireDockerHealth: true` in a profile to also reject missing Docker health. The live Dappmanager checked during development exposes container identity but does not expose Docker health or restart count, so those missing fields appear as **Not reported** in the dashboard; application probes provide the additional observation on that server.
+
+`STABILIZATION_TIMEOUT_MS` bounds the entire readiness phase, including metadata calls, probes, and polling waits. Each individual probe has a five-second deadline; response bodies used for matching or JSON-RPC parsing are limited to 64 KiB. Cleanup resolves the latest release before removal, then checks the restored package's version/origin, readiness, and final inventory within one post-install `CLEANUP_TIMEOUT_MS` verification budget. Mutation calls retain their separate MCP deadlines. Restart recovery uses the same readiness profiles. Failed recovery holds the worker and prevents new jobs until recovery is resolved.
+
+Reinstallation preserves existing volumes. It does not restore a volume snapshot or reverse database migrations; a downgrade that cannot become ready requires operator recovery.
 
 ## Local fake mode
 

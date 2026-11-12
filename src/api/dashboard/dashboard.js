@@ -286,8 +286,12 @@ function captureSummaryRows(baseline, candidate) {
   const rows = [
     ["Install", (c) => humanize(c.installStatus)],
     ["Install duration", (c) => formatDuration(c.installDurationMs)],
-    ["Stabilized", (c) => flag(c.stabilization.passed, "Yes", "No")],
+    ["Readiness passed", (c) => flag(c.stabilization.passed, "Yes", "No")],
     ["Stable samples", (c) => String(c.stabilization.stableSamples)],
+    ["Application checks", (c) => {
+      const checks = c.stabilization.samples?.at(-1)?.probeResults || [];
+      return checks.length ? checks.map((check) => `${check.name}: ${check.passed ? "ready" : check.error || "not ready"}`).join(" · ") : "No application probes recorded";
+    }],
     ["Stabilization time", (c) => formatDuration(c.stabilization.durationMs)],
     [
       "Logs",
@@ -324,10 +328,12 @@ function previewBlock(preview) {
 function containersTable(capture) {
   if (!capture?.containers.length) return emptyCopy("No containers recorded.");
   return table(
-    ["Service", "State", "Image"],
+    ["Service", "State", "Docker health", "Restarts", "Image"],
     capture.containers.map((container) => [
       container.serviceName,
       { value: container.state, className: container.running ? "is-good" : "is-bad" },
+      container.health || "Not reported",
+      container.restartCount === undefined || container.restartCount === null ? "Not reported" : String(container.restartCount),
       { value: container.image, className: "mono" },
     ]),
   );
@@ -336,11 +342,11 @@ function containersTable(capture) {
 function samplesTable(capture) {
   if (!capture?.stabilization.samples.length) return emptyCopy("No samples recorded.");
   return table(
-    ["Observed", "All running", "Non-running / error"],
+    ["Observed", "Containers ready", "Checks / error"],
     capture.stabilization.samples.map((sample) => [
       formatTime(sample.observedAt),
       flag(sample.allRunning, "yes", "no"),
-      sample.error || sample.nonRunningStates.join(", ") || "none",
+      sample.error || [...sample.nonRunningStates, ...(sample.probeResults || []).map((probe) => `${probe.name}: ${probe.passed ? "ready" : probe.error || "not ready"}`)].join(", ") || "none",
     ]),
   );
 }

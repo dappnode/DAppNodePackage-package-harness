@@ -108,6 +108,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Arc::new(ExplicitPackageResolver),
         Arc::clone(&clock),
         RunnerConfig {
+            readiness_profiles: Arc::new(config.readiness_profiles.clone()),
             harness_dnp_name: config.harness_dnp_name.clone(),
             stabilization: StabilizationConfig {
                 timeout: config.stabilization_timeout,
@@ -157,6 +158,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
             clock,
         },
         WorkerConfig {
+            readiness_profiles: Arc::new(config.readiness_profiles.clone()),
+            stabilization: StabilizationConfig {
+                timeout: config.stabilization_timeout,
+                poll_interval: config.stabilization_poll,
+                required_samples: config.stabilization_required_samples,
+            },
             worker_id: config.package_harness_worker_id.clone(),
             harness_dnp_name: config.harness_dnp_name.clone(),
             poll_interval: config.package_harness_poll,

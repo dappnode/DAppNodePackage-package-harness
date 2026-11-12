@@ -27,7 +27,10 @@ use crate::{
         WorkerError, WorkerErrorCode,
     },
     package_manager::PackageManager,
-    runner::{RunController, RunProgress, cleanup::reconcile_target},
+    runner::{
+        RunController, RunProgress,
+        cleanup::{RecoverySpec, reconcile_target},
+    },
     storage::RunStore,
 };
 
@@ -35,8 +38,10 @@ use self::{heartbeat::HeartbeatTask, progress::WorkerProgress};
 
 /// Configuration that belongs to the polling worker rather than the package
 /// execution algorithm.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WorkerConfig {
+    pub readiness_profiles: Arc<crate::runner::readiness::ReadinessProfiles>,
+    pub stabilization: crate::runner::stabilization::StabilizationConfig,
     pub worker_id: String,
     pub harness_dnp_name: String,
     pub poll_interval: Duration,
@@ -696,6 +701,7 @@ impl PackageHarnessWorker {
             return Err("refusing restart cleanup of a core package".to_owned());
         }
         let recovery_plan = record.worker.target_recovery;
+        let readiness = self.config.readiness_profiles.for_package(target.as_str());
         progress.publish(ExecutionPhase::Cleanup, true);
         info!(
             event = "restart_cleanup_started",
@@ -708,9 +714,13 @@ impl PackageHarnessWorker {
             self.package_manager.as_ref(),
             Arc::clone(&self.clock),
             target,
-            recovery_plan,
-            record.request.package.baseline_ref.as_ref(),
-            &record.evidence.initial_packages,
+            RecoverySpec {
+                plan: recovery_plan,
+                baseline_ref: record.request.package.baseline_ref.as_ref(),
+                initial_packages: &record.evidence.initial_packages,
+                readiness: &readiness,
+                stabilization: self.config.stabilization,
+            },
             self.config.cleanup_timeout,
         )
         .await;

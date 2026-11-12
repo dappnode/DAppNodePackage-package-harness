@@ -379,28 +379,17 @@ impl PackageManager for DappmanagerPackageManager {
         &self,
         dnp_name: &DnpName,
     ) -> Result<PackageDetails, PackageManagerError> {
-        let details = self
+        // The typed 0.2 client discards identity/health/restart metadata. Keep a
+        // single MCP read and preserve optional observations when reported.
+        let raw: serde_json::Value = self
             .client
-            .get_package_details(dnp_name)
+            .call_raw(
+                "dappnode_get_package_details",
+                serde_json::json!({"dnpName": dnp_name}),
+            )
             .await
             .map_err(package_error)?;
-        Ok(PackageDetails {
-            dnp_name: details.dnp_name,
-            version: details.version.map(|version| version.to_string()),
-            origin: details.origin,
-            containers: details
-                .containers
-                .into_iter()
-                .map(|container| ContainerSnapshot {
-                    name: container.name,
-                    service_name: container.service_name,
-                    state: container.state.map(container_state),
-                    running: container.running,
-                    image: container.image,
-                    created: container.created,
-                })
-                .collect(),
-        })
+        normalize_readiness_details(raw)
     }
 
     async fn get_package_logs(
@@ -543,17 +532,100 @@ fn package_error(error: DappnodeMcpError) -> PackageManagerError {
     }
 }
 
-fn container_state(state: ContainerState) -> String {
-    match state {
-        ContainerState::Created => "created",
-        ContainerState::Restarting => "restarting",
-        ContainerState::Running => "running",
-        ContainerState::Paused => "paused",
-        ContainerState::Exited => "exited",
-        ContainerState::Dead => "dead",
-        ContainerState::Removing => "removing",
+fn normalize_readiness_details(
+    raw: serde_json::Value,
+) -> Result<PackageDetails, PackageManagerError> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Details {
+        dnp_name: DnpName,
+        version: Option<dappnode_types::PackageVersion>,
+        origin: Option<String>,
+        containers: Vec<Container>,
     }
-    .to_owned()
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Container {
+        #[serde(rename = "containerName", alias = "name")]
+        name: String,
+        service_name: Option<String>,
+        state: Option<ContainerState>,
+        #[serde(default)]
+        running: bool,
+        image: Option<String>,
+        created: Option<serde_json::Value>,
+        container_id: Option<String>,
+        #[serde(alias = "healthStatus")]
+        health: Option<serde_json::Value>,
+        restart_count: Option<u64>,
+        started_at: Option<String>,
+    }
+    let invalid = || PackageManagerError::InvalidResponse {
+        tool: "dappnode_get_package_details".to_owned(),
+        message: "invalid package or container readiness metadata".to_owned(),
+    };
+    let details: Details = serde_json::from_value(raw).map_err(|_| invalid())?;
+    let containers = details
+        .containers
+        .into_iter()
+        .map(|container| {
+            if container.name.trim().is_empty() {
+                return Err(invalid());
+            }
+            let health = match container.health {
+                Some(serde_json::Value::String(status)) => Some(status),
+                Some(value) if value.is_object() => Some(
+                    value
+                        .get("Status")
+                        .or_else(|| value.get("status"))
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(invalid)?
+                        .to_owned(),
+                ),
+                Some(_) => return Err(invalid()),
+                None => None,
+            };
+            let created = container.created.and_then(|value| match value {
+                serde_json::Value::String(value) => Some(value),
+                serde_json::Value::Number(value) => Some(value.to_string()),
+                _ => None,
+            });
+            if health.as_deref().is_some_and(|health| {
+                !["healthy", "unhealthy", "starting", "none"].contains(&health)
+            }) {
+                return Err(invalid());
+            }
+            Ok(ContainerSnapshot {
+                name: container.name,
+                service_name: container.service_name,
+                state: container.state.map(|state| {
+                    match state {
+                        ContainerState::Created => "created",
+                        ContainerState::Restarting => "restarting",
+                        ContainerState::Running => "running",
+                        ContainerState::Paused => "paused",
+                        ContainerState::Exited => "exited",
+                        ContainerState::Dead => "dead",
+                        ContainerState::Removing => "removing",
+                    }
+                    .to_owned()
+                }),
+                running: container.running,
+                image: container.image,
+                created,
+                container_id: container.container_id,
+                health,
+                restart_count: container.restart_count,
+                started_at: container.started_at,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(PackageDetails {
+        dnp_name: details.dnp_name,
+        version: details.version.map(|version| version.to_string()),
+        origin: details.origin.filter(|origin| !origin.trim().is_empty()),
+        containers,
+    })
 }
 
 fn install_options(version: Option<&PackageRef>, bypass_signature: bool) -> InstallOptions {
@@ -614,6 +686,29 @@ fn retry_delay(initial: Duration, failed_attempt: usize) -> Duration {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn preserves_optional_readiness_metadata_and_accepts_legacy_responses()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let raw = serde_json::json!({"dnpName":"example.dnp.dappnode.eth","version":"1.0.0","containers":[{
+            "containerName":"api","containerId":"docker-id","serviceName":"api","state":"running","running":true,
+            "health":{"Status":"healthy"},"restartCount":2,"startedAt":"2026-11-12T10:00:00Z","created":1234
+        }]});
+        let details = super::normalize_readiness_details(raw)?;
+        assert_eq!(details.containers[0].health.as_deref(), Some("healthy"));
+        assert_eq!(details.containers[0].restart_count, Some(2));
+        assert_eq!(details.containers[0].created.as_deref(), Some("1234"));
+        assert_eq!(
+            details.containers[0].container_id.as_deref(),
+            Some("docker-id")
+        );
+        let legacy = super::normalize_readiness_details(
+            serde_json::json!({"dnpName":"example.dnp.dappnode.eth","containers":[{"containerName":"api","running":true}]}),
+        )?;
+        assert!(legacy.containers[0].health.is_none());
+        assert!(legacy.containers[0].restart_count.is_none());
+        Ok(())
+    }
+
     use std::{
         error::Error,
         future::ready,

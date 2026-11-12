@@ -47,7 +47,7 @@
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 
   /* Shared column template for the job list header and every job row. */
-  --job-cols: minmax(0, 2.4fr) 120px minmax(0, 1.3fr) 110px 132px 16px;
+  --job-cols: minmax(0, 2.4fr) 180px minmax(0, 1.3fr) 110px 132px 16px;
 
   font-family: var(--font);
   font-size: 13px;
@@ -727,6 +727,16 @@ a:hover {
   min-width: 0;
 }
 
+.cell-result > .badge {
+  max-width: 100%;
+  height: auto;
+  min-height: 20px;
+  padding-block: 3px;
+  line-height: 1.2;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
 .cell-primary,
 .cell-secondary {
   overflow: hidden;
@@ -1091,7 +1101,7 @@ a:hover {
 
 @media (max-width: 1080px) {
   :root {
-    --job-cols: minmax(0, 2fr) 110px minmax(0, 1.2fr) 110px 16px;
+    --job-cols: minmax(0, 2fr) 180px minmax(0, 1.2fr) 110px 16px;
   }
 
   .col-date,
@@ -1114,7 +1124,7 @@ a:hover {
 
 @media (max-width: 760px) {
   :root {
-    --job-cols: minmax(0, 1fr) auto 16px;
+    --job-cols: minmax(0, 1fr) minmax(0, 1fr) 16px;
   }
 
   .container {

@@ -147,8 +147,34 @@ pub struct ResultExecution {
 pub struct ResultSide {
     pub install: InstallResult,
     pub hard_check: HardCheckResult,
-    pub containers: Vec<ContainerSnapshot>,
+    pub containers: Vec<ReportedContainer>,
     pub log_collection: LogCollectionResult,
+}
+
+/// Preserve the v1 coordinator container shape; richer readiness metadata stays
+/// in local capture diagnostics until the coordinator protocol supports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportedContainer {
+    pub name: String,
+    pub service_name: Option<String>,
+    pub state: Option<String>,
+    pub running: bool,
+    pub image: Option<String>,
+    pub created: Option<String>,
+}
+
+impl From<&ContainerSnapshot> for ReportedContainer {
+    fn from(container: &ContainerSnapshot) -> Self {
+        Self {
+            name: container.name.clone(),
+            service_name: container.service_name.clone(),
+            state: container.state.clone(),
+            running: container.running,
+            image: container.image.clone(),
+            created: container.created.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

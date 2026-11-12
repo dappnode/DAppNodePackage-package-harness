@@ -795,6 +795,7 @@ mod tests {
             stabilization_required_samples: 1,
             log_tail: 1,
             cleanup_timeout: Duration::from_secs(1),
+            readiness_profiles: Default::default(),
             nexus_api_key: None,
             nexus_base_url: "https://nexus.example/v1".to_owned(),
             nexus_model: "nexus/auto".to_owned(),

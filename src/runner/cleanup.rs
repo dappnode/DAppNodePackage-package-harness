@@ -14,7 +14,20 @@ use crate::{
         same_install_origin,
     },
     package_manager::PackageManager,
+    runner::{
+        NoopRunProgress,
+        readiness::PackageReadiness,
+        stabilization::{StabilizationConfig, stabilize},
+    },
 };
+
+pub struct RecoverySpec<'a> {
+    pub plan: TargetRecoveryPlan,
+    pub baseline_ref: Option<&'a PackageRef>,
+    pub initial_packages: &'a [PackageSummary],
+    pub readiness: &'a PackageReadiness,
+    pub stabilization: StabilizationConfig,
+}
 
 pub async fn cleanup_target(
     package_manager: &dyn PackageManager,
@@ -126,14 +139,75 @@ pub async fn restore_latest_target(
     package_manager: &dyn PackageManager,
     dnp_name: &DnpName,
 ) -> CleanupResult {
-    restore_target(package_manager, dnp_name, None).await
+    let mut expected = None;
+    restore_target(
+        package_manager,
+        dnp_name,
+        None,
+        Duration::from_secs(60),
+        &mut expected,
+    )
+    .await
+}
+
+struct RestorationExpectation {
+    version: Option<String>,
+    origin: Option<String>,
+    deadline: tokio::time::Instant,
+}
+
+impl RestorationExpectation {
+    fn matches(&self, details: &crate::model::PackageDetails, name: &DnpName) -> bool {
+        details.dnp_name == *name
+            && self
+                .version
+                .as_ref()
+                .is_none_or(|version| details.version.as_ref() == Some(version))
+            && match &self.origin {
+                Some(origin) => same_install_origin(Some(origin), details.origin.as_deref()),
+                None => details.origin.is_none(),
+            }
+    }
 }
 
 async fn restore_target(
     package_manager: &dyn PackageManager,
     dnp_name: &DnpName,
     reference: Option<&PackageRef>,
+    timeout: Duration,
+    expected: &mut Option<RestorationExpectation>,
 ) -> CleanupResult {
+    let failed = |message: String| CleanupResult {
+        status: CleanupStatus::Failed,
+        leftover_packages: Vec::new(),
+        error: Some(truncate_utf8(&message, 300)),
+    };
+    // Resolve the expected registry release before removal, so an unavailable
+    // registry or ambiguous restore target cannot destroy an installed package.
+    let (expected_version, expected_origin) = if let Some(reference) = reference {
+        (None, Some(reference.to_string()))
+    } else {
+        let preview = match package_manager.preview_install(dnp_name, None).await {
+            Ok(preview) => preview,
+            Err(error) => {
+                return failed(format!(
+                    "cannot resolve latest recovery release before removal: {error}"
+                ));
+            }
+        };
+        if preview
+            .package_name
+            .as_deref()
+            .is_some_and(|name| name != dnp_name.as_str())
+            || preview
+                .version
+                .as_ref()
+                .is_none_or(|version| version.trim().is_empty())
+        {
+            return failed("latest recovery preview did not identify the expected package and resolved version; package was not changed".to_owned());
+        }
+        (preview.version, preview.resolved_ref)
+    };
     info!(
         event = "cleanup_restore_target_started",
         dnp_name = %dnp_name,
@@ -157,18 +231,38 @@ async fn restore_target(
             error: Some(truncate_utf8(&error.to_string(), 300)),
         };
     }
-    if let Some(reference) = reference {
-        // A success response alone is insufficient: check the immutable origin
-        // before declaring a pinned recovery complete.
-        let error = match package_manager.get_package_details(dnp_name).await {
-            Ok(details)
-                if details.dnp_name == *dnp_name
-                    && same_install_origin(Some(reference.as_str()), details.origin.as_deref()) =>
+    let deadline = tokio::time::Instant::now() + timeout;
+    *expected = Some(RestorationExpectation {
+        version: expected_version,
+        origin: expected_origin,
+        deadline,
+    });
+    {
+        let error = match tokio::time::timeout_at(
+            deadline,
+            package_manager.get_package_details(dnp_name),
+        )
+        .await
+        {
+            Ok(Ok(details))
+                if expected
+                    .as_ref()
+                    .is_some_and(|expected| expected.matches(&details, dnp_name)) =>
             {
                 None
             }
-            Ok(_) => Some("restored package does not match the pinned IPFS baseline".to_owned()),
-            Err(error) => Some(error.to_string()),
+            Ok(Ok(_)) => Some(
+                if reference.is_some() {
+                    "restored package does not match the pinned IPFS baseline"
+                } else {
+                    "restored package does not match the resolved latest release version and origin"
+                }
+                .to_owned(),
+            ),
+            Ok(Err(error)) => Some(error.to_string()),
+            Err(_) => Some(
+                "restored package details exceeded the cleanup verification deadline".to_owned(),
+            ),
         };
         if let Some(error) = error {
             return CleanupResult {
@@ -178,8 +272,8 @@ async fn restore_target(
             };
         }
     }
-    match package_manager.list_packages().await {
-        Ok(packages) if packages.iter().any(|package| package.dnp_name == *dnp_name) => {
+    match tokio::time::timeout_at(deadline, package_manager.list_packages()).await {
+        Ok(Ok(packages)) if packages.iter().any(|package| package.dnp_name == *dnp_name) => {
             info!(
                 event = "cleanup_restore_target_verified",
                 dnp_name = %dnp_name,
@@ -192,16 +286,19 @@ async fn restore_target(
                 error: None,
             }
         }
-        Ok(_) => CleanupResult {
+        Ok(Ok(_)) => CleanupResult {
             status: CleanupStatus::Failed,
             leftover_packages: Vec::new(),
             error: Some("recovery baseline was not present after reinstall".to_owned()),
         },
-        Err(error) => CleanupResult {
+        Ok(Err(error)) => CleanupResult {
             status: CleanupStatus::Failed,
             leftover_packages: Vec::new(),
             error: Some(truncate_utf8(&error.to_string(), 300)),
         },
+        Err(_) => {
+            failed("restored inventory exceeded the cleanup verification deadline".to_owned())
+        }
     }
 }
 
@@ -210,15 +307,14 @@ pub async fn reconcile_target(
     package_manager: &dyn PackageManager,
     clock: Arc<dyn Clock>,
     dnp_name: &DnpName,
-    plan: TargetRecoveryPlan,
-    baseline_ref: Option<&PackageRef>,
-    initial_packages: &[PackageSummary],
+    spec: RecoverySpec<'_>,
     timeout: Duration,
 ) -> (CleanupResult, Vec<PackageSummary>) {
-    let mut cleanup = match plan {
-        TargetRecoveryPlan::RestoreLatest => restore_latest_target(package_manager, dnp_name).await,
-        TargetRecoveryPlan::RestoreBaseline => match baseline_ref.filter(|reference| reference.is_ipfs()) {
-            Some(reference) => restore_target(package_manager, dnp_name, Some(reference)).await,
+    let mut expected = None;
+    let mut cleanup = match spec.plan {
+        TargetRecoveryPlan::RestoreLatest => restore_target(package_manager, dnp_name, None, timeout, &mut expected).await,
+        TargetRecoveryPlan::RestoreBaseline => match spec.baseline_ref.filter(|reference| reference.is_ipfs()) {
+            Some(reference) => restore_target(package_manager, dnp_name, Some(reference), timeout, &mut expected).await,
             None => CleanupResult {
                 status: CleanupStatus::Failed,
                 leftover_packages: Vec::new(),
@@ -230,19 +326,106 @@ pub async fn reconcile_target(
         }
     };
 
-    let final_packages = match package_manager.list_packages().await {
-        Ok(packages) => packages,
-        Err(error) => {
-            if cleanup.status == CleanupStatus::Passed {
-                cleanup.status = CleanupStatus::Failed;
-            }
-            if cleanup.error.is_none() {
-                cleanup.error = Some(truncate_utf8(&error.to_string(), 300));
-            }
-            return (cleanup, Vec::new());
+    let deadline = expected.as_ref().map_or_else(
+        || tokio::time::Instant::now() + timeout,
+        |expected| expected.deadline,
+    );
+    if cleanup.status == CleanupStatus::Passed && spec.plan != TargetRecoveryPlan::Remove {
+        let config = StabilizationConfig {
+            timeout: deadline.saturating_duration_since(tokio::time::Instant::now()),
+            ..spec.stabilization
+        };
+        let readiness = stabilize(
+            package_manager,
+            Arc::clone(&clock),
+            dnp_name,
+            config,
+            &NoopRunProgress,
+            spec.readiness,
+        )
+        .await;
+        if !readiness.passed {
+            cleanup.status = CleanupStatus::TimedOut;
+            let detail = readiness
+                .samples
+                .last()
+                .and_then(|sample| sample.error.clone())
+                .or_else(|| readiness.last_non_running_states.last().cloned())
+                .unwrap_or_else(|| {
+                    "no stable healthy container/application observations".to_owned()
+                });
+            cleanup.error = Some(truncate_utf8(
+                &format!("restored package did not pass readiness verification: {detail}"),
+                300,
+            ));
         }
-    };
-    cleanup.leftover_packages = leftover_packages(initial_packages, &final_packages);
+        if cleanup.status == CleanupStatus::Passed
+            && let Some(expected) = &expected
+        {
+            let verified =
+                tokio::time::timeout_at(deadline, package_manager.get_package_details(dnp_name))
+                    .await;
+            if !matches!(verified, Ok(Ok(ref details)) if expected.matches(details, dnp_name)) {
+                cleanup.status = CleanupStatus::Failed;
+                cleanup.error = Some(
+                    "restored version/origin could not be confirmed after readiness verification"
+                        .to_owned(),
+                );
+            }
+        }
+    }
+
+    let final_packages =
+        match tokio::time::timeout_at(deadline, package_manager.list_packages()).await {
+            Ok(Ok(packages)) => packages,
+            result => {
+                if cleanup.status == CleanupStatus::Passed {
+                    cleanup.status = CleanupStatus::Failed;
+                }
+                if cleanup.error.is_none() {
+                    cleanup.error = Some(match result {
+                    Ok(Err(error)) => truncate_utf8(&error.to_string(), 300),
+                    _ => "final inventory verification exceeded the cleanup verification deadline"
+                        .to_owned(),
+                });
+                }
+                return (cleanup, Vec::new());
+            }
+        };
+    cleanup.leftover_packages = leftover_packages(spec.initial_packages, &final_packages);
+    let target_present = final_packages
+        .iter()
+        .any(|package| package.dnp_name == *dnp_name);
+    if cleanup.status == CleanupStatus::Passed
+        && target_present != (spec.plan != TargetRecoveryPlan::Remove)
+    {
+        cleanup.status = CleanupStatus::Failed;
+        cleanup.error = Some("final inventory does not match the target recovery plan".to_owned());
+    }
+    let changed = spec
+        .initial_packages
+        .iter()
+        .filter(|package| package.dnp_name != *dnp_name)
+        .filter(|package| {
+            final_packages
+                .iter()
+                .find(|current| current.dnp_name == package.dnp_name)
+                .is_none_or(|current| {
+                    package.version.is_some() && current.version != package.version
+                })
+        })
+        .map(|package| package.dnp_name.to_string())
+        .collect::<Vec<_>>();
+    if cleanup.status == CleanupStatus::Passed && !changed.is_empty() {
+        cleanup.status = CleanupStatus::Failed;
+        cleanup.error = Some(truncate_utf8(
+            &format!(
+                "cleanup changed or removed pre-existing packages: {}",
+                changed.join(", ")
+            ),
+            300,
+        ));
+    }
     if cleanup.status == CleanupStatus::Passed && !cleanup.leftover_packages.is_empty() {
         cleanup.status = CleanupStatus::Failed;
         cleanup.error = Some(truncate_utf8(

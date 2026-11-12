@@ -171,16 +171,46 @@ async fn failed_batches_never_produce_a_clean_full_coverage_result() -> Result<(
 #[tokio::test]
 async fn output_token_truncation_is_detected_even_if_the_json_is_parseable()
 -> Result<(), Box<dyn Error>> {
-    let server = MockServer::start().await;
-    Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(json!({
-        "choices": [{"message": {"content": answer("clean", "apparently healthy").to_string()}, "finish_reason": "length"}]
-    }))).mount(&server).await;
-    let error = analyzer(&server, Duration::from_secs(1))?
-        .analyze(&LogAnalysisInput::default())
-        .await
-        .err()
-        .ok_or("truncated output accepted")?;
-    assert!(error.to_string().contains("output token limit"));
+    for message in [
+        json!({"content": answer("clean", "apparently healthy").to_string()}),
+        json!({"role": "assistant"}),
+        json!({"content": null}),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": message, "finish_reason": "length"}]
+            })))
+            .mount(&server)
+            .await;
+        let error = analyzer(&server, Duration::from_secs(1))?
+            .analyze(&LogAnalysisInput::default())
+            .await
+            .err()
+            .ok_or("truncated output accepted")?;
+        assert!(error.to_string().contains("output token limit"));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn analysis_requires_content_even_when_startup_access_is_valid() -> Result<(), Box<dyn Error>>
+{
+    for message in [json!({"role": "assistant"}), json!({"content": null})] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": message, "finish_reason": "stop"}]
+            })))
+            .mount(&server)
+            .await;
+        let error = analyzer(&server, Duration::from_secs(1))?
+            .analyze(&LogAnalysisInput::default())
+            .await
+            .err()
+            .ok_or("empty analysis accepted")?;
+        assert!(error.to_string().contains("missing choice content"));
+    }
     Ok(())
 }
 

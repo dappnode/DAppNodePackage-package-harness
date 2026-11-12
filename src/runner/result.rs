@@ -149,7 +149,13 @@ pub(super) fn build_result(
 fn result_side(capture: Option<&CaptureEvidence>, unstable_reason: ReasonCode) -> ResultSide {
     let containers = capture
         .and_then(|capture| capture.details.as_ref())
-        .map(|details| details.containers.clone())
+        .map(|details| {
+            details
+                .containers
+                .iter()
+                .map(crate::model::ReportedContainer::from)
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     ResultSide {
         install: InstallResult {

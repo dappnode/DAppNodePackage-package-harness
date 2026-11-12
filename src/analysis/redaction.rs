@@ -30,12 +30,35 @@ static COMPILED_REDACTION_PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyL
 });
 
 pub fn redact_and_bound(input: &str, maximum_bytes: usize) -> String {
+    truncate_utf8(&redact(input), maximum_bytes)
+}
+
+/// Preserves the most recent log output when the capture limit is reached.
+pub fn redact_and_bound_tail(input: &str, maximum_bytes: usize) -> String {
+    let redacted = redact(input);
+    if redacted.len() <= maximum_bytes {
+        return redacted;
+    }
+    let marker = "[earlier log bytes omitted]\n";
+    let marker = if marker.len() <= maximum_bytes {
+        marker
+    } else {
+        ""
+    };
+    let mut start = redacted.len().saturating_sub(maximum_bytes - marker.len());
+    while !redacted.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("{marker}{}", &redacted[start..])
+}
+
+fn redact(input: &str) -> String {
     let mut output = input.to_owned();
     for (regex, replacement) in COMPILED_REDACTION_PATTERNS.iter() {
         output = regex.replace_all(&output, *replacement).into_owned();
     }
     output = redact_long_tokens(&output);
-    truncate_utf8(&output, maximum_bytes)
+    output
 }
 
 /// Redacts an untrusted value and makes it safe for one-line text logs.
@@ -133,5 +156,18 @@ mod tests {
 
         assert_eq!(bounded.len(), 500);
         assert!(bounded.ends_with(TRUNCATION_SUFFIX));
+    }
+
+    #[test]
+    fn bounded_log_tails_keep_latest_output_and_redact_before_selecting() {
+        let logs = format!(
+            "Authorization: Bearer sensitive-value\n{}\napplication ready 🦀",
+            "old startup line\n".repeat(500)
+        );
+        let bounded = super::redact_and_bound_tail(&logs, 256);
+        assert!(bounded.len() <= 256);
+        assert!(bounded.ends_with("application ready 🦀"));
+        assert!(bounded.starts_with("[earlier log bytes omitted]"));
+        assert!(!bounded.contains("sensitive-value"));
     }
 }

@@ -9,6 +9,7 @@ use thiserror::Error;
 
 use crate::model::{LogAnalysisInput, LogAnalysisResult};
 
+mod batching;
 pub mod heuristic;
 pub mod nexus;
 pub mod redaction;
@@ -32,6 +33,12 @@ pub enum AnalyzerError {
 /// Compares baseline and candidate logs and emits a bounded result.
 #[async_trait]
 pub trait LogAnalyzer: Send + Sync {
+    /// Advisory request for another bounded log sample. It cannot approve a
+    /// test, suppress analysis, or delay collection indefinitely.
+    async fn needs_more_logs(&self, _input: &LogAnalysisInput) -> Result<bool, AnalyzerError> {
+        Ok(false)
+    }
+
     /// Runs the analyzer against already-redacted log excerpts.
     async fn analyze(&self, input: &LogAnalysisInput) -> Result<LogAnalysisResult, AnalyzerError>;
 }

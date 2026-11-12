@@ -29,7 +29,11 @@ If ENS cannot resolve a requested registry baseline (`UnreachableName`, `Resolve
 
 For a package without a resolvable published release, the coordinator can supply a known-good `baselineRef` such as `/ipfs/<cid>` to test the upgrade path. This does not silently substitute the currently installed package or turn the job into an installation-only test. For an existing target, cleanup and restart recovery use that exact persisted IPFS reference, preserve volumes, and verify the restored origin. A missing or non-IPFS reference for a pinned recovery plan blocks cleanup before removal. Registry baselines (omitted, `*`, or semver) keep the latest-release restoration policy.
 
-Nexus is advisory. With no key, the harness uses the heuristic analyzer only. With a key, it sends one bounded redacted request with no tools; Nexus failures fall back safely, and Nexus can never override a deterministic failure.
+Nexus is advisory. With no key, the harness uses the heuristic analyzer only. With a key, it analyzes the captured redacted logs in bounded JSON batches with no tools. Every captured container and every byte of its final captured window is included; serialized JSON is never cut to fit. Container pairs stay together when possible, and larger pairs are explicitly marked as partial service windows. Batch scope and deterministic stabilization/collection facts prevent a request for one service from being mistaken for evidence missing from the whole package. Nexus can never override a deterministic failure.
+
+`NEXUS_MAX_INPUT_BYTES` limits each batch's serialized evidence, rather than cutting off later containers. The analyzer runs at most three requests concurrently and at most 64 requests overall, within one `NEXUS_TIMEOUT_MS` deadline. It combines findings with critical findings first; failed or unfinished batches are reported as partial coverage, while completed findings are retained. A request-count or metadata-size limit produces an explicit analyzer error rather than silently dropping evidence. Capture keeps the latest redacted 64 KiB per container, and analysis does not apply another 16 KiB cut or a 20-container cutoff. `LOG_TAIL` still controls the finite source log window; genuinely empty or unavailable evidence can remain inconclusive.
+
+With Nexus enabled, `NEXUS_CLASSIFIER_MODEL` defaults to `jev`; set it to an empty value to disable classification. Jev uses Nexus's `/systemone` endpoint, separately from the `/chat/completions` explanation model. It assesses a small sample from every captured container and can request more startup evidence only when both confidence and selected probability are at least 0.8. It never approves a test, drops a container, or suppresses comparative analysis. Each side can collect at most two additional samples, five seconds apart, with a five-second classifier deadline and ten-second follow-up read deadlines. Empty log captures also get bounded follow-up attempts. Unknown decisions, malformed responses, unsupported models, and classifier outages leave the existing evidence available for normal analysis.
 
 ## Configuration
 
@@ -149,6 +153,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 cargo build --release
 ```
+
+The opt-in live Nexus contract probe uses `.env` credentials and a small amount of inference credit, sends synthetic logs only, and checks both Jev collection advice and a regression after a large cAdvisor log: `cargo test --test nexus_live -- --ignored --nocapture`. It is excluded from normal test runs.
 
 The `Makefile` provides matching development commands. To build the container and package scaffold:
 

@@ -7,13 +7,13 @@ use tracing::{error, info, warn};
 use crate::{
     analysis::{
         LogAnalyzer,
-        redaction::{redact_and_bound, truncate_utf8},
+        redaction::{redact_and_bound, redact_and_bound_tail, truncate_utf8},
     },
     clock::Clock,
     model::{
         CaptureEvidence, CleanupStatus, DnpName, ExecutionPhase, ExecutionStatus, LogAnalysisInput,
-        PackageResolver, ReasonCode, RunError, RunId, RunRecord, StabilizationResult, StepStatus,
-        TargetRecoveryPlan, Verdict, same_install_origin,
+        LogCollectionContext, PackageResolver, ReasonCode, RunError, RunId, RunRecord,
+        StabilizationResult, StepStatus, TargetRecoveryPlan, Verdict, same_install_origin,
     },
     package_manager::{PackageManager, PackageManagerError},
     runner::{
@@ -721,7 +721,7 @@ impl RunController {
             .package_manager
             .get_package_details(context.dnp_name)
             .await?;
-        let (logs, log_error) = match self
+        let (mut logs, mut log_error) = match self
             .package_manager
             .get_package_logs(context.dnp_name, self.config.log_tail)
             .await
@@ -730,7 +730,7 @@ impl RunController {
                 for entry in &mut logs.entries {
                     // Persisted logs are evidence, but still need strict size
                     // and secret bounds before storage or coordinator delivery.
-                    entry.text = redact_and_bound(&entry.text, 64 * 1024);
+                    entry.text = redact_and_bound_tail(&entry.text, 64 * 1024);
                 }
                 (Some(logs), None)
             }
@@ -747,6 +747,72 @@ impl RunController {
                 (None, Some(error))
             }
         };
+        // Classifier advice may only request bounded extra observations. It
+        // never suppresses logs, decides success, or bypasses mandatory cleanup.
+        if let Some(current) = &mut logs {
+            for attempt in 0..2 {
+                let blocks = current
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.container.clone(), entry.text.clone()))
+                    .collect();
+                let mut input = LogAnalysisInput::default();
+                let mut collection = LogCollectionContext::default();
+                if context.side == "baseline" {
+                    input.baseline = blocks;
+                    collection.baseline_stable = stabilization.passed;
+                    collection.baseline_expected_containers = details.containers.len();
+                } else {
+                    input.candidate = blocks;
+                    collection.candidate_stable = stabilization.passed;
+                    collection.candidate_expected_containers = details.containers.len();
+                }
+                input.context = Some(collection);
+                let empty = current
+                    .entries
+                    .iter()
+                    .all(|entry| entry.text.trim().is_empty());
+                let advice = if empty {
+                    Ok(true)
+                } else {
+                    self.analyzer.needs_more_logs(&input).await
+                };
+                match advice {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(error) => {
+                        warn!(event = "collection_classifier_unavailable", run_id = %context.run_id,
+                            side = context.side, error = %error, "Proceeding with captured logs after advisory classifier failure");
+                        break;
+                    }
+                }
+                info!(event = "collecting_additional_startup_logs", run_id = %context.run_id,
+                    side = context.side, attempt = attempt + 1, "Startup is progressing; collecting another bounded log sample");
+                self.clock.sleep(Duration::from_secs(5)).await;
+                match tokio::time::timeout(
+                    Duration::from_secs(10),
+                    self.package_manager
+                        .get_package_logs(context.dnp_name, self.config.log_tail),
+                )
+                .await
+                {
+                    Ok(Ok(mut next)) => {
+                        for entry in &mut next.entries {
+                            entry.text = redact_and_bound_tail(&entry.text, 64 * 1024);
+                        }
+                        *current = next;
+                    }
+                    result => {
+                        log_error = Some(match result {
+                            Ok(Err(error)) => truncate_utf8(&error.to_string(), 300),
+                            _ => "additional log collection timed out; retained the earlier sample"
+                                .to_owned(),
+                        });
+                        break;
+                    }
+                }
+            }
+        }
         let log_blocks = logs.as_ref().map_or(0, |logs| logs.entries.len());
         let log_bytes = logs.as_ref().map_or(0, |logs| {
             logs.entries.iter().map(|entry| entry.text.len()).sum()
@@ -875,6 +941,20 @@ fn analysis_input(baseline: &CaptureEvidence, candidate: &CaptureEvidence) -> Lo
     LogAnalysisInput {
         baseline: logs_for_analysis(baseline),
         candidate: logs_for_analysis(candidate),
+        context: Some(LogCollectionContext {
+            baseline_stable: baseline.stabilization.passed,
+            candidate_stable: candidate.stabilization.passed,
+            baseline_expected_containers: baseline
+                .details
+                .as_ref()
+                .map_or(0, |details| details.containers.len()),
+            candidate_expected_containers: candidate
+                .details
+                .as_ref()
+                .map_or(0, |details| details.containers.len()),
+            baseline_log_error: baseline.log_error.clone(),
+            candidate_log_error: candidate.log_error.clone(),
+        }),
     }
 }
 
@@ -885,13 +965,7 @@ fn logs_for_analysis(capture: &CaptureEvidence) -> Vec<(Option<String>, String)>
         .map(|logs| {
             logs.entries
                 .iter()
-                .take(20)
-                .map(|entry| {
-                    (
-                        entry.container.clone(),
-                        redact_and_bound(&entry.text, 16 * 1024),
-                    )
-                })
+                .map(|entry| (entry.container.clone(), entry.text.clone()))
                 .collect()
         })
         .unwrap_or_default()

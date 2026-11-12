@@ -798,6 +798,7 @@ mod tests {
             nexus_api_key: None,
             nexus_base_url: "https://nexus.example/v1".to_owned(),
             nexus_model: "nexus/auto".to_owned(),
+            nexus_classifier_model: None,
             nexus_timeout: Duration::from_secs(1),
             nexus_max_input_bytes: 1_024,
             tropibot_url: "https://tropibot.example".to_owned(),

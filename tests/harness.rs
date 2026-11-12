@@ -22,9 +22,10 @@ use dappnode_package_harness::{
     },
     model::{
         CleanupStatus, ContainerLog, ContainerSnapshot, DnpName, ExecutionPhase, ExecutionStatus,
-        ExplicitPackageResolver, LogAnalysisInput, ManualRecoveryKind, PackageDetails, PackageLogs,
-        PackageRef, PackageSummary, PreviewSummary, ReasonCode, RunRecord, RunRequest,
-        RunRequestDto, TargetRecoveryPlan, Verdict, WorkerErrorCode, ipfs_cid,
+        ExplicitPackageResolver, LogAnalysisInput, LogAnalysisResult, ManualRecoveryKind,
+        PackageDetails, PackageLogs, PackageRef, PackageSummary, PreviewSummary, ReasonCode,
+        RunRecord, RunRequest, RunRequestDto, TargetRecoveryPlan, Verdict, WorkerErrorCode,
+        ipfs_cid,
     },
     package_manager::{PackageManager, PackageManagerError, REQUIRED_MCP_TOOLS, ToolAvailability},
     runner::{
@@ -80,6 +81,7 @@ struct ScriptedPackageManager {
     candidate_version: Option<String>,
     candidate_update_noop: bool,
     remove_delay: Duration,
+    log_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -94,6 +96,7 @@ struct ScriptedState {
     cleanup_calls: usize,
     signature_bypass_calls: usize,
     preview_requests: Vec<Option<String>>,
+    log_calls: usize,
 }
 
 impl ScriptedPackageManager {
@@ -118,6 +121,7 @@ impl ScriptedPackageManager {
             candidate_version: None,
             candidate_update_noop: false,
             remove_delay: Duration::ZERO,
+            log_text: None,
         }
     }
 
@@ -282,10 +286,14 @@ impl PackageManager for ScriptedPackageManager {
         _dnp_name: &DnpName,
         _tail: usize,
     ) -> Result<PackageLogs, PackageManagerError> {
+        self.state()?.log_calls += 1;
         Ok(PackageLogs {
             entries: vec![ContainerLog {
                 container: Some("service".to_owned()),
-                text: "service log".to_owned(),
+                text: self
+                    .log_text
+                    .clone()
+                    .unwrap_or_else(|| "service log".to_owned()),
             }],
         })
     }
@@ -1336,6 +1344,7 @@ async fn malformed_nexus_response_falls_back_to_heuristic() -> Result<(), Box<dy
     let composite = CompositeLogAnalyzer::new(nexus);
     let result = composite
         .analyze(&LogAnalysisInput {
+            context: None,
             baseline: Vec::new(),
             candidate: vec![(Some("service".to_owned()), "normal startup".to_owned())],
         })
@@ -1345,6 +1354,86 @@ async fn malformed_nexus_response_falls_back_to_heuristic() -> Result<(), Box<dy
         result.status,
         dappnode_package_harness::model::AnalyzerStatus::Clean
     );
+    Ok(())
+}
+
+struct CollectionAdviceAnalyzer {
+    advice: Result<bool, AnalyzerError>,
+    observed: Mutex<Option<LogAnalysisInput>>,
+}
+
+#[async_trait]
+impl LogAnalyzer for CollectionAdviceAnalyzer {
+    async fn needs_more_logs(&self, _: &LogAnalysisInput) -> Result<bool, AnalyzerError> {
+        self.advice.clone()
+    }
+
+    async fn analyze(&self, input: &LogAnalysisInput) -> Result<LogAnalysisResult, AnalyzerError> {
+        *self
+            .observed
+            .lock()
+            .map_err(|_| AnalyzerError::Transport("test observer poisoned".into()))? =
+            Some(input.clone());
+        HeuristicLogAnalyzer.analyze(input).await
+    }
+}
+
+#[tokio::test]
+async fn collection_advice_is_bounded_and_recent_logs_reach_analysis_without_a_second_cut()
+-> Result<(), Box<dyn Error>> {
+    for advice in [
+        Ok(true),
+        Ok(false),
+        Err(AnalyzerError::Transport("classifier offline".into())),
+    ] {
+        let expected_calls = if advice == Ok(true) { 6 } else { 2 };
+        let request = request("adaptive-collection")?;
+        let mut manager = ScriptedPackageManager::new(request.package.dnp_name.clone());
+        manager.log_text = Some(format!(
+            "{}\nAuthorization: Bearer temporary-secret\napplication ready",
+            "routine metric line\n".repeat(10_000)
+        ));
+        let manager = Arc::new(manager);
+        let analyzer = Arc::new(CollectionAdviceAnalyzer {
+            advice,
+            observed: Mutex::new(None),
+        });
+        let directory = tempfile::tempdir()?;
+        let store = Arc::new(FileRunStore::new(directory.path().to_path_buf()).await?);
+        store.create(&RunRecord::new(request.clone())).await?;
+        let controller = RunController::new(
+            manager.clone(),
+            analyzer.clone(),
+            store.clone(),
+            Arc::new(ExplicitPackageResolver),
+            Arc::new(ImmediateClock),
+            runner_config(),
+        );
+        controller
+            .execute(&request.run_id, &NoopRunProgress)
+            .await?;
+        assert_eq!(manager.state()?.log_calls, expected_calls);
+        let input = analyzer
+            .observed
+            .lock()
+            .map_err(|_| "observer poisoned")?
+            .clone()
+            .ok_or("analysis was skipped")?;
+        for (_, text) in input.baseline.iter().chain(&input.candidate) {
+            assert!(text.len() > 16 * 1024);
+            assert!(text.len() <= 64 * 1024);
+            assert!(text.ends_with("application ready"));
+            assert!(!text.contains("temporary-secret"));
+        }
+        let context = input.context.ok_or("collection facts missing")?;
+        assert!(context.baseline_stable && context.candidate_stable);
+        let record = store
+            .get(&request.run_id)
+            .await?
+            .ok_or("record disappeared")?;
+        assert_eq!(record.cleanup.status, CleanupStatus::Passed);
+        assert!(record.evidence.log_analysis.is_some());
+    }
     Ok(())
 }
 
@@ -1380,6 +1469,7 @@ async fn nexus_accepts_an_answer_wrapped_in_a_fence_or_prose() -> Result<(), Box
     })
     .to_string();
     let input = LogAnalysisInput {
+        context: None,
         baseline: Vec::new(),
         candidate: Vec::new(),
     };
@@ -1403,6 +1493,7 @@ async fn nexus_accepts_an_answer_wrapped_in_a_fence_or_prose() -> Result<(), Box
 #[tokio::test]
 async fn nexus_parse_errors_show_what_the_model_answered() -> Result<(), Box<dyn Error>> {
     let input = LogAnalysisInput {
+        context: None,
         baseline: Vec::new(),
         candidate: Vec::new(),
     };
@@ -1476,6 +1567,7 @@ async fn nexus_accepts_useful_responses_over_the_original_bounds() -> Result<(),
 
     let result = nexus
         .analyze(&LogAnalysisInput {
+            context: None,
             baseline: Vec::new(),
             candidate: Vec::new(),
         })
@@ -1513,6 +1605,7 @@ async fn oversized_nexus_http_response_is_rejected() -> Result<(), Box<dyn Error
 
     let error = match nexus
         .analyze(&LogAnalysisInput {
+            context: None,
             baseline: Vec::new(),
             candidate: Vec::new(),
         })
@@ -1550,6 +1643,7 @@ async fn slow_nexus_response_is_reported_as_timeout() -> Result<(), Box<dyn Erro
 
     let error = match nexus
         .analyze(&LogAnalysisInput {
+            context: None,
             baseline: Vec::new(),
             candidate: Vec::new(),
         })

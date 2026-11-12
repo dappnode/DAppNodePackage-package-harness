@@ -32,6 +32,7 @@ services:
       NEXUS_API_KEY: ""
       NEXUS_BASE_URL: "https://nexus-api.dappnode.com/v1"
       NEXUS_MODEL: nexus/auto
+      NEXUS_CLASSIFIER_MODEL: jev
       NEXUS_TIMEOUT_MS: "300000"
       NEXUS_MAX_INPUT_BYTES: "65536"
       RUST_LOG: dappnode_package_harness=info,tower_http=info

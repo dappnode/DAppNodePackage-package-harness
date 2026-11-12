@@ -43,6 +43,8 @@ pub struct Config {
     pub nexus_api_key: Option<String>,
     pub nexus_base_url: String,
     pub nexus_model: String,
+    /// Optional advisory startup-evidence classifier on the System One API.
+    pub nexus_classifier_model: Option<String>,
     pub nexus_timeout: Duration,
     pub nexus_max_input_bytes: usize,
     pub tropibot_url: String,
@@ -160,6 +162,10 @@ impl Config {
             nexus_base_url: env::var("NEXUS_BASE_URL")
                 .unwrap_or_else(|_| "https://nexus-api.dappnode.com/v1".to_owned()),
             nexus_model: env::var("NEXUS_MODEL").unwrap_or_else(|_| "nexus/auto".to_owned()),
+            nexus_classifier_model: {
+                let value = env::var("NEXUS_CLASSIFIER_MODEL").unwrap_or_else(|_| "jev".to_owned());
+                (!value.trim().is_empty()).then_some(value)
+            },
             nexus_timeout: millis("NEXUS_TIMEOUT_MS", 300_000)?,
             nexus_max_input_bytes,
             tropibot_url,
@@ -207,6 +213,16 @@ impl Config {
                 return Err(invalid(
                     "NEXUS_MODEL",
                     "must be nonempty without surrounding whitespace",
+                ));
+            }
+            if self
+                .nexus_classifier_model
+                .as_ref()
+                .is_some_and(|model| model.trim().is_empty() || model.trim() != model)
+            {
+                return Err(invalid(
+                    "NEXUS_CLASSIFIER_MODEL",
+                    "must not contain surrounding whitespace",
                 ));
             }
         }

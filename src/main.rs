@@ -239,7 +239,8 @@ fn analyzer(config: &Config) -> Result<Arc<dyn LogAnalyzer>, Box<dyn Error>> {
                 config.nexus_model.clone(),
                 config.nexus_timeout,
                 config.nexus_max_input_bytes,
-            )?;
+            )?
+            .with_classifier_model(config.nexus_classifier_model.clone());
             Ok(Arc::new(CompositeLogAnalyzer::new(nexus)))
         }
         None => Ok(Arc::new(HeuristicLogAnalyzer)),

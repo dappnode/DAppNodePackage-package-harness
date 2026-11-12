@@ -77,10 +77,23 @@ pub struct AnalyzerComponent {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LogAnalysisInput {
     pub baseline: Vec<(Option<String>, String)>,
     pub candidate: Vec<(Option<String>, String)>,
+    pub context: Option<LogCollectionContext>,
+}
+
+/// Deterministic collection facts supplied alongside bounded log windows.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogCollectionContext {
+    pub baseline_stable: bool,
+    pub candidate_stable: bool,
+    pub baseline_expected_containers: usize,
+    pub candidate_expected_containers: usize,
+    pub baseline_log_error: Option<String>,
+    pub candidate_log_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

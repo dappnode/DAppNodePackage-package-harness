@@ -34,6 +34,7 @@ fn config() -> Result<Config, Box<dyn Error>> {
         nexus_api_key: None,
         nexus_base_url: "https://nexus.example/v1".into(),
         nexus_model: "nexus/auto".into(),
+        nexus_classifier_model: None,
         nexus_timeout: Duration::from_millis(500),
         nexus_max_input_bytes: 1024,
         tropibot_url: "https://tropibot.example".into(),

@@ -83,7 +83,8 @@ fields:
       service: package-harness
     title: Nexus API key (optional)
     description: >-
-      Enables one bounded advisory baseline-versus-candidate log analysis request.
+      Enables bounded advisory baseline-versus-candidate log analysis across all
+      collected container logs, plus optional startup-evidence classification.
       Deterministic container results never depend on Nexus.
     secret: true
     required: false
@@ -95,4 +96,13 @@ fields:
       service: package-harness
     title: Nexus model
     description: Optional Nexus model identifier. The default is nexus/auto.
+    required: false
+
+  - id: nexus-classifier-model
+    target:
+      type: environment
+      name: NEXUS_CLASSIFIER_MODEL
+      service: package-harness
+    title: Nexus collection classifier
+    description: Optional System One model for requesting extra startup log samples. Default is jev; clear the value to disable it.
     required: false

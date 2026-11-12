@@ -10,7 +10,7 @@
   "categories": [
     "Developer tools"
   ],
-  "description": "Polls Tropibot for deterministic baseline-to-candidate Dappnode package tests on a dedicated disposable node. It captures bounded evidence, performs advisory log analysis, cleans up the target package, and reliably delivers the result back to Tropibot.",
+  "description": "Validates its configuration and dependencies before polling Tropibot for baseline-to-candidate package tests on a dedicated disposable Dappnode. It captures bounded evidence from every container, performs advisory Nexus analysis with optional startup-evidence classification, restores the target package, and reliably delivers results back to Tropibot.",
   "exposable": [
     {
       "description": "Operator dashboard with package job status, cleanup recovery, health, and readiness.",

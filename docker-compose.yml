@@ -10,11 +10,11 @@ services:
       PORT: "8080"
       DATA_DIR: /data
       HARNESS_DNP_NAME: package-harness.dnp.dappnode.eth
-      ALLOW_DESTRUCTIVE_PACKAGE_TESTS: "true"
+      ALLOW_DESTRUCTIVE_PACKAGE_TESTS: "false"
       PACKAGE_MANAGER_MODE: mcp
       DAPPMANAGER_MCP_URL: "http://my.dappnode/mcp"
       DAPPMANAGER_MCP_TOKEN: ""
-      MCP_TIMEOUT_MS: "300000"
+      MCP_TIMEOUT_MS: "30000"
       MCP_MUTATION_TIMEOUT_MS: "1800000"
       MCP_MUTATION_ATTEMPTS: "3"
       MCP_MUTATION_RETRY_DELAY_MS: "5000"

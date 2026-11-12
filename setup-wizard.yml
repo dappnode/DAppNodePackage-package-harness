@@ -1,5 +1,19 @@
 version: "2"
 fields:
+  - id: allow-destructive-tests
+    target:
+      type: environment
+      name: ALLOW_DESTRUCTIVE_PACKAGE_TESTS
+      service: package-harness
+    title: Allow destructive package tests
+    description: >-
+      This dedicated disposable node will install, upgrade, and remove packages
+      and may delete their volumes. Enter true to acknowledge and enable testing.
+      Startup remains blocked until this acknowledgement is provided.
+    pattern: "^true$"
+    patternErrorMessage: Enter true to acknowledge destructive testing on this disposable node
+    required: true
+
   - id: tropibot-url
     target:
       type: environment
@@ -55,6 +69,7 @@ fields:
     title: Dappmanager MCP bearer token
     description: >-
       Bearer token authorized to use the required external read and mutation tools.
+      Enable external MCP mutating tools in Dappmanager System > Advanced.
     secret: true
     required: true
 
